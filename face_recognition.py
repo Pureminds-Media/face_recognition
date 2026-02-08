@@ -153,7 +153,7 @@ def detector_worker():
             w = max(1, min(w, W - x))
             h = max(1, min(h, H - y))
 
-            # --- filter out tiny / weird boxes (prevents tiny Unknown boxes) ---
+            # --- filter out tiny / weird boxes (prevents tiny unknown boxes) ---
             MIN_W, MIN_H = 90, 90          # tweak: try 70–120 depending on camera distance
             MAX_FRAC = 0.70                 # also prevents giant false positives
 
@@ -183,7 +183,7 @@ def detector_worker():
                 continue
 
             # 3) match
-            name = "Unknown"
+            name = "unknown"
             best = 1.0
             for known_name, emb_known in known_embeddings:
                 d = cosine_distance(emb_live, emb_known)
@@ -192,7 +192,7 @@ def detector_worker():
                     name = known_name
 
             if best > THRESHOLD:
-                name = "Unknown"
+                name = "unknown"
 
             results.append((x, y, w, h, name, best))
 
@@ -217,10 +217,19 @@ while True:
         break
 
     # 1) Update trackers every frame
+    Hf, Wf = frame.shape[:2]
     new_tracks = []
     for t in tracks:
         ok, bbox = t["tracker"].update(frame)
         if ok:
+            x, y, w, h = bbox
+
+            # kill trackers that drifted/exploded onto background
+            if w > 0.75 * Wf or h > 0.75 * Hf:
+                continue
+            if w < 20 or h < 20:
+                continue
+
             t["bbox"] = bbox
             new_tracks.append(t)
     tracks = new_tracks
@@ -251,7 +260,7 @@ while True:
 
         for x, y, w, h, name, best in results:
             det_bbox = (int(x), int(y), int(w), int(h))
-            if name == "Unknown":
+            if name == "unknown":
                 continue
 
             # find best matching existing track
@@ -272,14 +281,16 @@ while True:
                 t["tracker"] = create_tracker(TRACKER_TYPE)
                 t["tracker"].init(frame, det_bbox)
                 t["updated"] = True
+                t["last_seen"] = time.monotonic()
             else:
                 # new face => new track
                 tr = create_tracker(TRACKER_TYPE)
                 tr.init(frame, det_bbox)
-                tracks.append({"tracker": tr, "name": name, "best": best, "bbox": det_bbox, "updated": True})
+                tracks.append({"tracker": tr, "name": name, "best": best, "bbox": det_bbox, "updated": True, "last_seen": now})
 
         # optionally drop stale tracks that weren’t matched for a while
-        tracks = [t for t in tracks if t.get("updated", True)]
+        STALE_SECS = 2.0
+        tracks = [t for t in tracks if (now - t.get("last_seen", now)) < STALE_SECS]
 
     except Empty:
         pass
