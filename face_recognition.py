@@ -8,11 +8,11 @@ from queue import Full, Queue, Empty
 
 KNOWN_DIR = "faces"
 THRESHOLD = 0.4
-DETECTOR = "opencv"
-MODEL = "Facenet"
+DETECTOR = "retinaface"
+MODEL = "Facenet512"
 ALLOWED_EXTS = (".jpg", ".png", ".jpeg", ".webp")
 DETECT_EVERY = 1.0          # seconds
-DETECT_SCALE = 0.5          # detect on smaller frame (0.5 = 50% size). try 0.4–0.7
+DETECT_SCALE = 1.0          # detect on smaller frame (0.5 = 50% size)
 TRACKER_TYPE = "CSRT"        # "KCF" fast, "CSRT" slower but steadier
 
 def cosine_distance(a, b):
@@ -72,11 +72,7 @@ for person in os.listdir(KNOWN_DIR):
 
         path = os.path.join(person_dir, file)
         try:
-            faces = DeepFace.extract_faces(
-                img_path=path,
-                detector_backend=DETECTOR,
-                enforce_detection=True
-            )
+            faces = DeepFace.extract_faces(img_path=path, detector_backend=DETECTOR, enforce_detection=True)
             if not faces:
                 continue
 
@@ -118,12 +114,20 @@ def detector_worker():
         # 1) detect on downscaled frame
         small = cv2.resize(frame_full, None, fx=DETECT_SCALE, fy=DETECT_SCALE)
         try:
-            faces = DeepFace.extract_faces(img_path=small, detector_backend=DETECTOR, enforce_detection=True)
+            faces = DeepFace.extract_faces(img_path=small, detector_backend=DETECTOR, enforce_detection=False, align=True)
+
+            used_scale = DETECT_SCALE
+            if not faces:
+                faces = DeepFace.extract_faces(img_path=frame_full, detector_backend=DETECTOR, enforce_detection=False, align=True)
+                used_scale = 1.0
+
+            inv = 1.0 / used_scale
+
         except Exception:
             faces = []
+            inv = 1.0
 
         H, W = frame_full.shape[:2]
-        inv = 1.0 / DETECT_SCALE
 
         for face in faces:
             fa = face["facial_area"]
@@ -132,10 +136,39 @@ def detector_worker():
             w = int(fa["w"] * inv)
             h = int(fa["h"] * inv)
 
+            le = fa.get("left_eye")
+            re = fa.get("right_eye")
+            if le and re:
+                # eyes are in the same coordinate system as fa (small or full)
+                ex = int(((le[0] + re[0]) / 2.0) * inv)
+                ey = int(((le[1] + re[1]) / 2.0) * inv)
+
+                cx = ex
+                cy = ey + int(0.15 * h)  # shift down a bit (eyes -> face center)
+                x = int(cx - w / 2)
+                y = int(cy - h / 2)
+
             # clip to full frame
             x = max(0, x); y = max(0, y)
             w = max(1, min(w, W - x))
             h = max(1, min(h, H - y))
+
+            # --- filter out tiny / weird boxes (prevents tiny Unknown boxes) ---
+            MIN_W, MIN_H = 90, 90          # tweak: try 70–120 depending on camera distance
+            MAX_FRAC = 0.70                 # also prevents giant false positives
+
+            if w < MIN_W or h < MIN_H:
+                continue
+            if w > MAX_FRAC * W or h > MAX_FRAC * H:
+                continue
+
+            ar = w / float(h)
+            if ar < 0.6 or ar > 1.7:        # reject very thin/wide boxes
+                continue
+
+            conf = face.get("confidence", None)
+            if conf is not None and conf < 0.90:
+                continue
 
             face_img = face.get("face")  # <- DeepFace's cropped face
             if face_img is None or getattr(face_img, "size", 0) == 0:
@@ -218,6 +251,8 @@ while True:
 
         for x, y, w, h, name, best in results:
             det_bbox = (int(x), int(y), int(w), int(h))
+            if name == "Unknown":
+                continue
 
             # find best matching existing track
             best_iou = 0.0
@@ -256,7 +291,7 @@ while True:
         cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
         cv2.putText(frame, f"{t['name']} ({t['best']:.2f})", (x, max(0, y-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
 
-    cv2.imshow("Face Recognition (Smooth)", frame)
+    cv2.imshow("Face Recognition", frame)
     if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
         break
 
