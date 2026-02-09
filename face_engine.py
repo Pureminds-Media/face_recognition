@@ -67,8 +67,8 @@ class FaceEngine:
         detect_scale=1.0,
         tracker_type="CSRT",
         cam_index=0,
-        width=1280,
-        height=720,
+        width=1920,
+        height=1080,
         out_fps=15,
         jpeg_quality=80,
     ):
@@ -331,6 +331,7 @@ class FaceEngine:
         last_sent_t = 0.0
         last_encode_t = 0.0
         stale_secs = 2.0
+        unknown_stale_secs = 0.7
 
         while not self.stop_evt.is_set():
             if self._cap is None:
@@ -369,15 +370,13 @@ class FaceEngine:
             try:
                 results = self.out_q.get_nowait()
 
-                for t in self.tracks:
-                    t["updated"] = False
+                UNKNOWN_TO_FORGET = 3  # how many consecutive "unknown" hits before we downgrade a known track
+                unknown_stale_secs = max(1.2, self.detect_every * 1.2)  # must be >= detect_every to avoid flicker
 
                 for x, y, w, h, name, best in results:
-                    if name == "unknown":
-                        continue
-
                     det_bbox = (int(x), int(y), int(w), int(h))
 
+                    # find best track match (no type-gating)
                     best_i = -1
                     best_score = 0.0
                     for i, t in enumerate(self.tracks):
@@ -388,47 +387,63 @@ class FaceEngine:
 
                     if best_score > 0.3 and best_i >= 0:
                         t = self.tracks[best_i]
-                        t["name"] = name
-                        t["best"] = best
+
+                        # always refresh bbox/tracker/last_seen
                         t["bbox"] = det_bbox
                         t["tracker"] = create_tracker(self.tracker_type)
                         t["tracker"].init(frame, det_bbox)
                         t["updated"] = True
                         t["last_seen"] = now
+
+                        # label smoothing: unknown doesn't immediately clobber a known identity
+                        if name == "unknown":
+                            if t.get("name") != "unknown":
+                                t["unknown_hits"] = t.get("unknown_hits", 0) + 1
+                                if t["unknown_hits"] >= UNKNOWN_TO_FORGET:
+                                    t["name"] = "unknown"
+                                    t["best"] = float(best)
+                            else:
+                                t["best"] = float(best)
+                        else:
+                            t["name"] = name
+                            t["best"] = float(best)
+                            t["unknown_hits"] = 0
                     else:
+                        # new track
                         tr = create_tracker(self.tracker_type)
                         tr.init(frame, det_bbox)
                         self.tracks.append(
                             {
                                 "tracker": tr,
                                 "name": name,
-                                "best": best,
+                                "best": float(best),
                                 "bbox": det_bbox,
                                 "updated": True,
                                 "last_seen": now,
+                                "unknown_hits": 0 if name != "unknown" else 1,
                             }
                         )
 
-                # drop stale tracks after a short timeout
-                self.tracks = [t for t in self.tracks if (now - t.get("last_seen", now)) < stale_secs]
+                # drop stale tracks
+                self.tracks = [
+                    t for t in self.tracks
+                    if (now - t.get("last_seen", now)) < (unknown_stale_secs if t.get("name") == "unknown" else stale_secs)
+                ]
 
             except Empty:
                 pass
 
             # 4) draw
             for t in self.tracks:
-                x, y, w, h = t["bbox"]
-                x, y, w, h = int(x), int(y), int(w), int(h)
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                cv2.putText(
-                    frame,
-                    f"{t['name']} ({t['best']:.2f})",
-                    (x, max(0, y - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 255, 0),
-                    2,
-                )
+                x, y, w, h = map(int, t["bbox"])
+
+                is_unknown = (t["name"] == "unknown")
+                color = (0, 0, 255) if is_unknown else (0, 255, 0)  # red for unknown, green for known
+
+                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+
+                label = "unknown" if is_unknown else f"{t['name']} ({t['best']:.2f})"
+                cv2.putText(frame, label, (x, max(0, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2,)
 
             # 5) encode at limited FPS
             if now - last_encode_t >= (1.0 / max(1, self.out_fps)):
