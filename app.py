@@ -298,7 +298,6 @@ def api_reload_faces():
     engine.reload_faces()
     return jsonify({"ok": True, "identities": len(engine.known_embeddings)})
 
-
 @app.route("/api/upload_face", methods=["POST"])
 def api_upload_face():
     """
@@ -339,9 +338,11 @@ def api_upload_face():
     path = os.path.join(person_dir, filename)
     f.save(path)
 
+    # Add some delay before reloading faces to allow file save to complete
+    time.sleep(1)  # You can adjust this based on file sizes
+
     engine.reload_faces()
     return jsonify({"ok": True, "person": person, "saved": f"/faces/{person}/{filename}"})
-
 
 @app.route("/faces/<person>/<path:filename>")
 def faces_file(person, filename):

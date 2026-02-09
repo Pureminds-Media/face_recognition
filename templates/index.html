@@ -65,7 +65,9 @@
 
           <div class="flex flex-row w-full gap-2 mt-6">
             <!-- Attendace Tracker -->
-            <div class="rounded-xl border border-slate-800 bg-slate-900 w-[50%]">
+            <div
+              class="rounded-xl border border-slate-800 bg-slate-900 w-[50%]"
+            >
               <div class="px-4 py-3 border-b border-slate-800">
                 <div class="font-medium">Attendance</div>
                 <div class="text-xs text-slate-400" id="attendanceMeta">
@@ -77,7 +79,9 @@
             </div>
 
             <!-- Upload -->
-            <div class="rounded-xl border border-slate-800 bg-slate-900 w-[50%]">
+            <div
+              class="rounded-xl border border-slate-800 bg-slate-900 w-[50%]"
+            >
               <div class="px-4 py-3 border-b border-slate-800">
                 <div class="font-medium">Add image</div>
                 <div class="text-xs text-slate-400">
@@ -395,6 +399,8 @@
 
           if (uploadMsg)
             uploadMsg.textContent = `Saved to ${j.person}/ (reloaded embeddings)`;
+
+          // Refresh people list after successful upload
           await refreshPeople();
         };
       }

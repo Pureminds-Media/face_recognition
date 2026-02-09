@@ -208,7 +208,8 @@ class FaceEngine:
                     )
                     if rep and "embedding" in rep[0]:
                         embs.append(l2norm(rep[0]["embedding"]))
-                except Exception:
+                except Exception as e:
+                    print(f"Error processing {file}: {e}")
                     continue
 
             if embs:
