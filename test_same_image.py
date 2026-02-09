@@ -1,7 +1,7 @@
 from deepface import DeepFace
 import numpy as np
 
-img = "faces/fayyaz.jpeg"  # same image, twice
+img = "faces/Fayyaz/fayyaz.jpeg"  # same image, twice
 
 e1 = DeepFace.represent(
     img_path=img,
