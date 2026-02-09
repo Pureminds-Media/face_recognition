@@ -50,16 +50,27 @@ def _q_put_latest(q, item):
         q.put_nowait(item)
 
 def _attendance_roster():
-    roster = [
-        {
-            "name": name,
-            "attended": bool(s.get("attended", True)),
-            "present": bool(s.get("present", False)),
-            "first_seen_ts": float(s.get("first_seen_ts", 0.0)),
-        }
-        for name, s in attendance_state.items()
-    ]
-    roster.sort(key=lambda x: x.get("first_seen_ts", 0.0))
+    # include all known identities, even if not attended yet
+    names = set()
+
+    # from embeddings (loaded faces)
+    for name, _ in getattr(engine, "known_embeddings", []):
+        names.add(name)
+
+    # plus anyone already seen (safety)
+    names.update(attendance_state.keys())
+
+    roster = []
+    for name in sorted(names):
+        s = attendance_state.get(name)
+        roster.append(
+            {
+                "name": name,
+                "attended": bool(s.get("attended", False)) if s else False,
+                "present": bool(s.get("present", False)) if s else False,
+                "first_seen_ts": float(s.get("first_seen_ts", 0.0)) if s else 0.0,
+            }
+        )
     return roster
 
 def _attendance_loop():
@@ -72,7 +83,8 @@ def _attendance_loop():
 
         with attendance_lock:
             if running:
-                events = _update_attendance_from_tracks(engine.get_tracks())
+                events = _update_attendance_from_tracks(engine.get_tracks()) if running else []
+                roster = _attendance_roster()
             else:
                 if last_running:
                     _mark_all_absent()
@@ -191,19 +203,33 @@ def list_people():
 
 
 def mjpeg_generator():
-    # If camera stops mid-stream, exit generator
+    last_id = None
+    interval = 1.0 / max(1, getattr(engine, "out_fps", 15))
+
     while engine.is_running():
         frame = engine.get_jpeg()
         if frame is None:
             time.sleep(0.05)
             continue
 
-        yield (
-            b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n"
-            + frame
-            + b"\r\n"
-        )
+        # don't spam the same frame
+        fid = id(frame)
+        if fid == last_id:
+            time.sleep(0.005)
+            continue
+        last_id = fid
+
+        try:
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n"
+                + frame
+                + b"\r\n"
+            )
+        except (GeneratorExit, BrokenPipeError, ConnectionResetError):
+            break
+
+        time.sleep(interval)
 
 @app.route("/")
 def index():

@@ -34,7 +34,7 @@
         class="mx-auto max-w-6xl px-4 py-6 grid grid-cols-1 lg:grid-cols-3 gap-6"
       >
         <!-- Video -->
-        <div class="lg:col-span-2">
+        <div class="lg:col-span-3">
           <div
             class="rounded-xl border border-slate-800 bg-slate-900 overflow-hidden"
           >
@@ -43,113 +43,115 @@
             >
               <div class="font-medium">Live feed</div>
               <div class="text-xs text-slate-400" id="statusText">—</div>
-              <button
-                id="startBtn"
-                class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium"
-              >
-                Start
-              </button>
-              <button
-                id="stopBtn"
-                class="rounded-lg bg-rose-600 hover:bg-rose-500 px-3 py-2 text-sm font-medium"
-              >
-                Stop
-              </button>
+              <div>
+                <button
+                  id="startBtn"
+                  class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium"
+                >
+                  Start
+                </button>
+                <button
+                  id="stopBtn"
+                  class="rounded-lg bg-rose-600 hover:bg-rose-500 px-3 py-2 text-sm font-medium"
+                >
+                  Stop
+                </button>
+              </div>
             </div>
             <div class="p-3">
               <img id="videoFeed" class="w-full ..." src="" alt="video" />
             </div>
           </div>
 
-          <div class="mt-6 rounded-xl border border-slate-800 bg-slate-900">
-            <div class="px-4 py-3 border-b border-slate-800">
-              <div class="font-medium">Attendance</div>
-              <div class="text-xs text-slate-400" id="attendanceMeta">
-                Marks once per server run
-              </div>
-            </div>
-
-            <div id="attendanceList" class="p-4 space-y-2"></div>
-          </div>
-        </div>
-
-        <!-- Sidebar -->
-        <div class="space-y-6">
-          <!-- Upload -->
-          <div class="rounded-xl border border-slate-800 bg-slate-900">
-            <div class="px-4 py-3 border-b border-slate-800">
-              <div class="font-medium">Add training image</div>
-              <div class="text-xs text-slate-400">
-                Saves as 1.jpg, 2.jpg, … in faces/&lt;person&gt;/
-              </div>
-            </div>
-
-            <form
-              id="uploadForm"
-              class="p-4 space-y-4"
-              enctype="multipart/form-data"
-            >
-              <div class="space-y-2">
-                <div class="text-sm text-slate-300">Person</div>
-                <div class="flex items-center gap-3">
-                  <label class="flex items-center gap-2 text-sm">
-                    <input
-                      type="radio"
-                      name="mode"
-                      value="existing"
-                      checked
-                      class="accent-slate-200"
-                    />
-                    Existing
-                  </label>
-                  <label class="flex items-center gap-2 text-sm">
-                    <input
-                      type="radio"
-                      name="mode"
-                      value="new"
-                      class="accent-slate-200"
-                    />
-                    New
-                  </label>
+          <div class="flex flex-row w-full gap-2 mt-6">
+            <!-- Attendace Tracker -->
+            <div class="rounded-xl border border-slate-800 bg-slate-900 w-[50%]">
+              <div class="px-4 py-3 border-b border-slate-800">
+                <div class="font-medium">Attendance</div>
+                <div class="text-xs text-slate-400" id="attendanceMeta">
+                  Marks once per server run
                 </div>
+              </div>
 
-                <select
-                  id="existingName"
-                  name="existing_name"
-                  class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm"
-                ></select>
+              <div id="attendanceList" class="p-4 space-y-2"></div>
+            </div>
 
-                <input
-                  id="newName"
-                  name="new_name"
-                  placeholder="e.g. Ahmed_AlQahtani"
-                  class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm hidden"
-                />
+            <!-- Upload -->
+            <div class="rounded-xl border border-slate-800 bg-slate-900 w-[50%]">
+              <div class="px-4 py-3 border-b border-slate-800">
+                <div class="font-medium">Add training image</div>
                 <div class="text-xs text-slate-400">
-                  Folder names are sanitized (letters/numbers/_-).
+                  Saves as 1.jpg, 2.jpg, … in faces/&lt;person&gt;/
                 </div>
               </div>
 
-              <div class="space-y-2">
-                <div class="text-sm text-slate-300">Image</div>
-                <input
-                  name="file"
-                  type="file"
-                  accept="image/*"
-                  required
-                  class="w-full text-sm text-slate-200 file:mr-3 file:rounded-lg file:border-0 file:bg-slate-800 file:px-3 file:py-2 file:text-sm file:text-slate-100 hover:file:bg-slate-700"
-                />
-              </div>
-
-              <button
-                type="submit"
-                class="w-full rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium"
+              <form
+                id="uploadForm"
+                class="p-4 space-y-4"
+                enctype="multipart/form-data"
               >
-                Upload
-              </button>
+                <div class="space-y-2">
+                  <div class="text-sm text-slate-300">Person</div>
+                  <div class="flex items-center gap-3">
+                    <label class="flex items-center gap-2 text-sm">
+                      <input
+                        type="radio"
+                        name="mode"
+                        value="existing"
+                        checked
+                        class="accent-slate-200"
+                      />
+                      Existing
+                    </label>
+                    <label class="flex items-center gap-2 text-sm">
+                      <input
+                        type="radio"
+                        name="mode"
+                        value="new"
+                        class="accent-slate-200"
+                      />
+                      New
+                    </label>
+                  </div>
 
-              <div id="uploadMsg" class="text-xs text-slate-300"></div>
-            </form>
+                  <select
+                    id="existingName"
+                    name="existing_name"
+                    class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm"
+                  ></select>
+
+                  <input
+                    id="newName"
+                    name="new_name"
+                    placeholder="e.g. Ahmed_AlQahtani"
+                    class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm hidden"
+                  />
+                  <div class="text-xs text-slate-400">
+                    Folder names are sanitized (letters/numbers/_-).
+                  </div>
+                </div>
+
+                <div class="space-y-2">
+                  <div class="text-sm text-slate-300">Image</div>
+                  <input
+                    name="file"
+                    type="file"
+                    accept="image/*"
+                    required
+                    class="w-full text-sm text-slate-200 file:mr-3 file:rounded-lg file:border-0 file:bg-slate-800 file:px-3 file:py-2 file:text-sm file:text-slate-100 hover:file:bg-slate-700"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  class="w-full rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium"
+                >
+                  Upload
+                </button>
+
+                <div id="uploadMsg" class="text-xs text-slate-300"></div>
+              </form>
+            </div>
           </div>
         </div>
       </div>
@@ -214,9 +216,14 @@
       function renderAttendance(roster) {
         if (!attendanceListEl) return;
         roster = roster || [];
+
+        const attendedCount = roster.filter((r) => r.attended).length;
+        if (attendanceMetaEl)
+          attendanceMetaEl.textContent = `${attendedCount}/${roster.length} attended`;
+
         attendanceListEl.innerHTML = roster.length
           ? roster.map(renderAttendanceRow).join("")
-          : `<div class="text-sm text-slate-400">No attendance yet.</div>`;
+          : `<div class="text-sm text-slate-400">No people loaded.</div>`;
       }
 
       function connectAttendanceStream() {
@@ -283,20 +290,15 @@
       }
 
       function renderAttendanceRow(p) {
-        const present = !!p.present;
-        const dot = present
-          ? '<span class="inline-block h-2 w-2 rounded-full bg-emerald-400"></span>'
-          : '<span class="inline-block h-2 w-2 rounded-full bg-slate-600"></span>';
+        const val = p.attended ? "true" : "false";
+        const cls = p.attended ? "text-emerald-300" : "text-slate-400";
 
         return `
-          <div class="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-950 px-3 py-2">
-            <div class="flex items-center gap-3">
-              ${dot}
-              <div class="text-sm font-medium">${p.name}</div>
-            </div>
-            <div class="text-xs text-slate-400">First seen: ${fmtTime(p.first_seen_ts)}</div>
-          </div>
-        `;
+    <div class="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-950 px-3 py-2">
+      <div class="text-sm font-medium">${p.name}</div>
+      <div class="text-xs font-mono ${cls}">${val}</div>
+    </div>
+  `;
       }
 
       // --- Mode UI for upload ---
