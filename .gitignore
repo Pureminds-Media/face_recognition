@@ -182,3 +182,6 @@ cython_debug/
 
 # Ignore data
 /faces
+
+# Ignore .deb
+*.deb
