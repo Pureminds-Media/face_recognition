@@ -3,6 +3,13 @@
 
 A small Flask dashboard that streams a webcam feed (MJPEG) and does face recognition / tracking using DeepFace + OpenCV. Images live under `faces/<name>/` and can be uploaded via the web UI. The app also supports “attendance” marking over SSE.
 
+## <span style="color:red">**IMPORTANT!!!**</span>
+There are two branches: `main` and `ubuntu-dev`
+- `main` — Uses CPU for processing. Runs on both Windows and Ubuntu
+- `ubuntu-dev` — Uses GPU for processing. ONLY runs on Ubuntu
+
+`main` and `ubuntu-dev` should <span style="color:red">**NEVER**</span> be merged into each other since they are for different setups.
+
 ## Repo Structure
 
 - `app.py` — Flask server + API endpoints + MJPEG `/video`
