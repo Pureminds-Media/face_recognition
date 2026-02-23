@@ -97,6 +97,11 @@ class FaceEngine:
         self._latest_jpeg = None
         self._latest_tracks = []
         self._running = False
+        self._qr_detector = cv2.QRCodeDetector()
+        self.qr_scan_every = 0.5  # seconds (2 scans/sec). Increase if CPU is high.
+        self._last_qr_scan_t = 0.0
+        self._latest_qr = None  # last decoded QR string
+        self._latest_qr_t = 0.0 # monotonic time of last decoded QR
 
     # ---------- public ----------
     def start(self):
@@ -171,6 +176,16 @@ class FaceEngine:
     def get_tracks(self):
         with self._lock:
             return list(self._latest_tracks)
+    
+    def get_qr(self):
+        """Return latest decoded QR payload (string) or None."""
+        with self._lock:
+            return self._latest_qr
+
+    def get_qr_state(self):
+        """Return (latest_qr_payload, last_decoded_monotonic_ts)."""
+        with self._lock:
+            return self._latest_qr, float(self._latest_qr_t)
 
     def reload_faces(self):
         """Rebuild known embeddings from faces/{name}/*"""
@@ -345,6 +360,20 @@ class FaceEngine:
                 continue
 
             now = time.monotonic()
+            # --- QR scan (throttled) ---
+            if (now - self._last_qr_scan_t) >= self.qr_scan_every:
+                self._last_qr_scan_t = now
+                try:
+                    data, pts, _ = self._qr_detector.detectAndDecode(frame)
+                    data = (data or "").strip()
+                    if data:
+                        with self._lock:
+                            self._latest_qr = data
+                            self._latest_qr_t = now
+                except Exception:
+                    # QR scan is best-effort; ignore errors
+                    pass
+
             Hf, Wf = frame.shape[:2]
 
             # 1) update trackers

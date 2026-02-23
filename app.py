@@ -38,6 +38,13 @@ attendance_state = {}  # name -> {attended: bool, first_seen_ts: float, last_see
 attendance_events_q = Queue(maxsize=200)
 ATTENDANCE_LOOP_SECS = 0.3
 ATTENDANCE_DISAPPEAR_SECS = 2.0
+UNKNOWN_PROMPT_SECS = 10.0
+UNKNOWN_RESET_GRACE_SECS = 1.5
+qr_prompt_state = {
+    "unknown_first_mono": None,
+    "unknown_last_seen_mono": None,
+    "active": False,
+}
 
 def _q_put_latest(q, item):
     try:
@@ -80,24 +87,39 @@ def _attendance_loop():
     while True:
         running = engine.is_running()
         events = []
+        tracks = []
 
         with attendance_lock:
             if running:
-                events = _update_attendance_from_tracks(engine.get_tracks()) if running else []
-                roster = _attendance_roster()
+                tracks = engine.get_tracks()
+                events = _update_attendance_from_tracks(tracks)
             else:
                 if last_running:
                     _mark_all_absent()
 
+            _update_qr_prompt_from_tracks(tracks, running)
             roster = _attendance_roster()
+            prompt_payload = _get_qr_prompt_payload()
             sig = (
                 running,
+                prompt_payload["qr_prompt"],
                 tuple((r["name"], r["attended"], r["present"]) for r in roster),
             )
 
         # Emit state only if it changed OR if we have events
         if sig != last_sig or events:
-            _q_put_latest(attendance_events_q, {"event": "state", "data": {"running": running, "attendance": roster}})
+            _q_put_latest(
+                attendance_events_q,
+                {
+                    "event": "state",
+                    "data": {
+                        "running": running,
+                        "attendance": roster,
+                        "qr_prompt": prompt_payload["qr_prompt"],
+                        "unknown_elapsed_secs": prompt_payload["unknown_elapsed_secs"],
+                    },
+                },
+            )
             for ev in events:
                 _q_put_latest(attendance_events_q, {"event": ev["type"], "data": ev})
             last_sig = sig
@@ -149,8 +171,135 @@ def _mark_all_absent():
     for s in attendance_state.values():
         s["present"] = False
         s["last_seen_mono"] = now_mono
+    qr_prompt_state["unknown_first_mono"] = None
+    qr_prompt_state["unknown_last_seen_mono"] = None
+    qr_prompt_state["active"] = False
+
+
+def _update_qr_prompt_from_tracks(tracks, running: bool):
+    now_mono = time.monotonic()
+    has_unknown = any((t or {}).get("name") == "unknown" for t in (tracks or []))
+
+    if not running:
+        qr_prompt_state["unknown_first_mono"] = None
+        qr_prompt_state["unknown_last_seen_mono"] = None
+        qr_prompt_state["active"] = False
+        return
+
+    if has_unknown:
+        if qr_prompt_state["unknown_first_mono"] is None:
+            qr_prompt_state["unknown_first_mono"] = now_mono
+        qr_prompt_state["unknown_last_seen_mono"] = now_mono
+    else:
+        last_seen = qr_prompt_state.get("unknown_last_seen_mono")
+        if (last_seen is None) or ((now_mono - last_seen) > UNKNOWN_RESET_GRACE_SECS):
+            qr_prompt_state["unknown_first_mono"] = None
+            qr_prompt_state["unknown_last_seen_mono"] = None
+            qr_prompt_state["active"] = False
+            return
+
+    first_seen = qr_prompt_state.get("unknown_first_mono")
+    qr_prompt_state["active"] = bool(
+        first_seen is not None and (now_mono - first_seen) >= UNKNOWN_PROMPT_SECS
+    )
+
+
+def _get_qr_prompt_payload():
+    now_mono = time.monotonic()
+    first_seen = qr_prompt_state.get("unknown_first_mono")
+    unknown_elapsed_secs = 0.0
+    if first_seen is not None:
+        unknown_elapsed_secs = max(0.0, now_mono - first_seen)
+
+    return {
+        "qr_prompt": bool(qr_prompt_state.get("active", False)),
+        "unknown_elapsed_secs": round(unknown_elapsed_secs, 1),
+    }
+
+def _parse_qr_to_name(raw: str) -> str:
+    """
+    Accepts:
+      - JSON: {"name":"Ahmed_AlQahtani"}
+      - prefix: name:Ahmed_AlQahtani
+      - plain: Ahmed_AlQahtani
+    Returns sanitized person name or "".
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+
+    # JSON payload
+    if raw.startswith("{") and raw.endswith("}"):
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict) and "name" in obj:
+                return safe_person_name(str(obj.get("name", "")))
+        except Exception:
+            pass
+
+    # prefix payload
+    if raw.lower().startswith("name:"):
+        return safe_person_name(raw.split(":", 1)[1].strip())
+
+    # fallback: treat as direct name
+    return safe_person_name(raw)
+
+
+def _mark_attendance_from_qr(name: str, raw: str):
+    """Mark attendance and emit the same event types as face recognition."""
+    if not name:
+        return
+
+    now_mono = time.monotonic()
+    now_ts = time.time()
+    ev_type = None
+
+    with attendance_lock:
+        if not qr_prompt_state.get("active", False):
+            return
+
+        s = attendance_state.get(name)
+        if s is None:
+            attendance_state[name] = {
+                "attended": True,
+                "first_seen_ts": now_ts,
+                "last_seen_mono": now_mono,
+                "present": True,
+            }
+            ev_type = "new"
+        else:
+            ev_type = "repeat" if s.get("attended", False) else "new"
+            s["attended"] = True
+            s["present"] = True
+            s["last_seen_mono"] = now_mono
+        qr_prompt_state["unknown_first_mono"] = None
+        qr_prompt_state["unknown_last_seen_mono"] = None
+        qr_prompt_state["active"] = False
+
+    if ev_type:
+        _q_put_latest(attendance_events_q, {"event": ev_type, "data": {"name": name}})
+
+
+def _qr_loop():
+    """Poll FaceEngine QR state and mark attendance when a fresh QR appears."""
+    last_qr_t = 0.0
+    while True:
+        try:
+            raw, qr_t = engine.get_qr_state()
+        except Exception:
+            raw = None
+            qr_t = 0.0
+
+        raw = (raw or "").strip()
+        if raw and qr_t > last_qr_t:
+            last_qr_t = qr_t
+            name = _parse_qr_to_name(raw)
+            _mark_attendance_from_qr(name, raw)
+
+        time.sleep(0.1)
 
 threading.Thread(target=_attendance_loop, daemon=True).start()
+threading.Thread(target=_qr_loop, daemon=True).start()
 
 def safe_person_name(name: str) -> str:
     """
@@ -262,7 +411,10 @@ def api_attendance():
     running = engine.is_running()
 
     with attendance_lock:
-        events = _update_attendance_from_tracks(engine.get_tracks()) if running else []
+        tracks = engine.get_tracks() if running else []
+        events = _update_attendance_from_tracks(tracks) if running else []
+        _update_qr_prompt_from_tracks(tracks, running)
+        prompt_payload = _get_qr_prompt_payload()
         roster = [
             {
                 "name": name,
@@ -280,6 +432,8 @@ def api_attendance():
             "attendance": roster,
             "events": events,
             "identities": len(engine.known_embeddings),
+            "qr_prompt": prompt_payload["qr_prompt"],
+            "unknown_elapsed_secs": prompt_payload["unknown_elapsed_secs"],
         }
     )
 
@@ -384,7 +538,16 @@ def attendance_stream():
     def gen():
         # Send initial snapshot immediately
         with attendance_lock:
-            payload = {"running": engine.is_running(), "attendance": _attendance_roster()}
+            running = engine.is_running()
+            tracks = engine.get_tracks() if running else []
+            _update_qr_prompt_from_tracks(tracks, running)
+            prompt_payload = _get_qr_prompt_payload()
+            payload = {
+                "running": running,
+                "attendance": _attendance_roster(),
+                "qr_prompt": prompt_payload["qr_prompt"],
+                "unknown_elapsed_secs": prompt_payload["unknown_elapsed_secs"],
+            }
         yield f"event: state\ndata: {json.dumps(payload)}\n\n"
 
         while True:
