@@ -43,7 +43,17 @@
             >
               <div class="font-medium">Live feed</div>
               <div class="text-xs text-slate-400" id="statusText">—</div>
-              <div>
+              <div class="flex flex-wrap items-center gap-2">
+                <select
+                  id="cameraSelect"
+                  class="rounded-lg bg-slate-950 border border-slate-800 px-2 py-2 text-xs min-w-44"
+                ></select>
+                <button
+                  id="applyCameraBtn"
+                  class="rounded-lg bg-slate-700 hover:bg-slate-600 px-3 py-2 text-sm font-medium"
+                >
+                  Switch
+                </button>
                 <button
                   id="startBtn"
                   class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium"
@@ -59,6 +69,7 @@
               </div>
             </div>
             <div class="p-3 relative">
+              <div id="cameraMsg" class="mb-2 text-xs text-slate-400"></div>
               <img id="videoFeed" class="w-full ..." src="" alt="video" />
 
               <!-- QR prompt overlay -->
@@ -194,8 +205,13 @@
       const attendanceMetaEl = document.getElementById("attendanceMeta");
       const toastContainer = document.getElementById("toastContainer");
       const qrPrompt = document.getElementById("qrPrompt");
+      const cameraSelect = document.getElementById("cameraSelect");
+      const cameraSourceInput = document.getElementById("cameraSource");
+      const applyCameraBtn = document.getElementById("applyCameraBtn");
+      const cameraMsg = document.getElementById("cameraMsg");
 
       let attendanceES = null;
+      let cameraRunning = false;
 
       // --- stream control ---
       function startStream() {
@@ -211,6 +227,7 @@
 
       function setRunningUI(running) {
         running = !!running;
+        cameraRunning = running;
 
         if (statusText)
           statusText.textContent = running
@@ -232,6 +249,41 @@
         } else {
           if (videoFeed && videoFeed.getAttribute("src")) stopStream();
         }
+      }
+
+      async function loadCameraOptions() {
+        const r = await fetch("/api/camera");
+        const j = await r.json();
+        const devices = j.devices || [];
+        const currentSource = String(j.camera_source || "");
+
+        if (cameraSelect) {
+          cameraSelect.innerHTML = "";
+          devices.forEach((d) => {
+            const opt = document.createElement("option");
+            opt.value = String(d.value || "");
+            opt.textContent = d.label || `Camera ${d.value}`;
+            cameraSelect.appendChild(opt);
+          });
+
+          let hasCurrent = devices.some(
+            (d) => String(d.value || "") === currentSource,
+          );
+          if (currentSource && !hasCurrent) {
+            const opt = document.createElement("option");
+            opt.value = currentSource;
+            opt.textContent = `Custom source (${currentSource})`;
+            cameraSelect.appendChild(opt);
+            hasCurrent = true;
+          }
+          if (hasCurrent) cameraSelect.value = currentSource;
+        }
+
+        if (cameraSourceInput) cameraSourceInput.value = currentSource;
+        if (cameraMsg)
+          cameraMsg.textContent = currentSource
+            ? `Current source: ${currentSource}`
+            : "Current source: (not set)";
       }
 
       function renderAttendance(roster) {
@@ -388,6 +440,45 @@
         stopStream(); // close MJPEG immediately client-side
       };
 
+      if (cameraSelect && cameraSourceInput) {
+        cameraSelect.onchange = () => {
+          if (cameraSelect.value) cameraSourceInput.value = cameraSelect.value;
+        };
+      }
+
+      if (applyCameraBtn) {
+        applyCameraBtn.onclick = async () => {
+          const source = (cameraSourceInput?.value || cameraSelect?.value || "").trim();
+          if (!source) {
+            if (cameraMsg) cameraMsg.textContent = "Enter a camera index or stream URL.";
+            return;
+          }
+
+          applyCameraBtn.disabled = true;
+          try {
+            const r = await fetch("/api/camera", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ source, restart: cameraRunning }),
+            });
+            const j = await r.json();
+            if (!r.ok || !j.ok) {
+              if (cameraMsg)
+                cameraMsg.textContent = `Switch failed: ${j.error || "unknown error"}`;
+              return;
+            }
+            if (cameraMsg)
+              cameraMsg.textContent = `Current source: ${j.camera_source}`;
+            await loadCameraOptions();
+            toast(`Camera source set to ${j.camera_source}`, "success");
+          } catch (e) {
+            if (cameraMsg) cameraMsg.textContent = `Switch failed: ${String(e)}`;
+          } finally {
+            applyCameraBtn.disabled = false;
+          }
+        };
+      }
+
       // --- Reload faces ---
       const reloadBtn = document.getElementById("reloadBtn");
       if (reloadBtn) {
@@ -430,6 +521,7 @@
 
       // --- initial ---
       setModeUI();
+      loadCameraOptions();
       refreshPeople();
     </script>
   </body>

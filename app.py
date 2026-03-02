@@ -2,6 +2,8 @@ import os
 import time
 import re
 import json
+import glob
+import subprocess
 from queue import Queue, Empty, Full
 from flask import Flask, Response, render_template, request, jsonify, send_from_directory, stream_with_context
 from werkzeug.utils import secure_filename
@@ -18,7 +20,7 @@ engine = FaceEngine(
     detector="retinaface",
     model="Facenet512",
     threshold=0.4,
-    detect_every=1.0,
+    detect_every=0.3,
     detect_scale=1.0,
     tracker_type="CSRT",
     width=1280,
@@ -351,6 +353,75 @@ def list_people():
     return people
 
 
+def _camera_source_to_text(source):
+    return str(source) if source is not None else ""
+
+
+def _list_camera_devices():
+    labels = {}
+    try:
+        out = subprocess.check_output(
+            ["v4l2-ctl", "--list-devices"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+        current_label = ""
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            if line[:1].isspace():
+                node = line.strip()
+                m = re.fullmatch(r"/dev/video(\d+)", node)
+                if m and current_label:
+                    labels[int(m.group(1))] = current_label
+            else:
+                current_label = line.strip().rstrip(":")
+    except Exception:
+        pass
+
+    entries = []
+    nodes = sorted(
+        glob.glob("/dev/video[0-9]*"),
+        key=lambda p: int(re.search(r"(\d+)$", p).group(1)),
+    )
+    for path in nodes:
+        m = re.search(r"(\d+)$", path)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        entries.append(
+            {
+                "idx": idx,
+                "path": path,
+                "label": labels.get(idx),
+            }
+        )
+
+    devices = []
+    seen_labels = set()
+    for e in entries:
+        # Many cameras expose multiple /dev/video* nodes under one label.
+        # Keep only the first node for each labeled physical camera.
+        if e["label"]:
+            if e["label"] in seen_labels:
+                continue
+            seen_labels.add(e["label"])
+            label = e["label"]
+        else:
+            # Fallback when v4l2 label is unavailable.
+            label = f"Camera {e['idx']}"
+
+        devices.append(
+            {
+                "value": str(e["idx"]),
+                "label": f"{label} ({e['path']})",
+                "path": e["path"],
+            }
+        )
+    return devices
+
+
 def mjpeg_generator():
     last_id = None
     interval = 1.0 / max(1, getattr(engine, "out_fps", 15))
@@ -513,7 +584,79 @@ def api_status():
     return jsonify({
         "running": engine.is_running(),
         "identities": len(engine.known_embeddings),
+        "camera_source": _camera_source_to_text(engine.cam_index),
     })
+
+
+@app.route("/api/camera", methods=["GET"])
+def api_camera_get():
+    return jsonify(
+        {
+            "running": engine.is_running(),
+            "camera_source": _camera_source_to_text(engine.cam_index),
+            "devices": _list_camera_devices(),
+        }
+    )
+
+
+@app.route("/api/camera", methods=["POST"])
+def api_camera_set():
+    payload = request.get_json(silent=True) or {}
+    source_raw = payload.get("source", request.form.get("source", ""))
+    source_text = str(source_raw or "").strip()
+    if not source_text:
+        return jsonify({"ok": False, "error": "source is required"}), 400
+
+    restart = bool(payload.get("restart", True))
+    new_source = int(source_text) if re.fullmatch(r"\d+", source_text) else source_text
+
+    with state_lock:
+        old_source = engine.cam_index
+        was_running = engine.is_running()
+        source_changed = new_source != old_source
+
+        if source_changed and was_running:
+            engine.stop()
+        if source_changed:
+            engine.cam_index = new_source
+
+        should_start = (was_running or restart) and (not engine.is_running())
+        if should_start:
+            try:
+                engine.start()
+            except Exception as e:
+                if engine.is_running():
+                    engine.stop()
+                engine.cam_index = old_source
+                restored = False
+                if was_running:
+                    try:
+                        engine.start()
+                        restored = True
+                    except Exception:
+                        restored = False
+                return jsonify(
+                    {
+                        "ok": False,
+                        "error": f"failed to open camera source: {e}",
+                        "camera_source": _camera_source_to_text(engine.cam_index),
+                        "running": engine.is_running(),
+                        "restored_previous_source": restored,
+                    }
+                ), 500
+
+    if source_changed:
+        with attendance_lock:
+            _mark_all_absent()
+
+    return jsonify(
+        {
+            "ok": True,
+            "running": engine.is_running(),
+            "camera_source": _camera_source_to_text(engine.cam_index),
+            "devices": _list_camera_devices(),
+        }
+    )
 
 @app.route("/api/start", methods=["POST"])
 def api_start():

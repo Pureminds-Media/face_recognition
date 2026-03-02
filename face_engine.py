@@ -187,6 +187,99 @@ class FaceEngine:
         with self._lock:
             return self._latest_qr, float(self._latest_qr_t)
 
+    @staticmethod
+    def _center_dist_norm(a, b):
+        ax = float(a[0]) + float(a[2]) * 0.5
+        ay = float(a[1]) + float(a[3]) * 0.5
+        bx = float(b[0]) + float(b[2]) * 0.5
+        by = float(b[1]) + float(b[3]) * 0.5
+        dx = ax - bx
+        dy = ay - by
+        d = (dx * dx + dy * dy) ** 0.5
+        scale = max(
+            1.0,
+            float(max(a[2], a[3])) * 0.5 + float(max(b[2], b[3])) * 0.5,
+        )
+        return d / scale
+
+    def _dedupe_tracks(self, tracks, iou_thresh=0.45, center_dist_thresh=0.5):
+        """Drop overlapping duplicate tracks for the same person."""
+        if len(tracks) <= 1:
+            return tracks
+
+        def _area(b):
+            return float(max(0.0, b[2]) * max(0.0, b[3]))
+
+        def _rank(t):
+            known = 0 if t.get("name") == "unknown" else 1
+            return (known, float(t.get("last_seen", 0.0)), _area(t.get("bbox", (0, 0, 0, 0))))
+
+        def _can_merge(a, b):
+            a_bbox = a.get("bbox", (0, 0, 0, 0))
+            b_bbox = b.get("bbox", (0, 0, 0, 0))
+            ov = iou(a_bbox, b_bbox)
+            if ov < iou_thresh:
+                # Use center distance as a fallback only when identities are compatible.
+                an = a.get("name", "unknown")
+                bn = b.get("name", "unknown")
+                cd = self._center_dist_norm(a_bbox, b_bbox)
+                if an == bn and an != "unknown" and cd < center_dist_thresh:
+                    return True
+                if ((an == "unknown") ^ (bn == "unknown")) and cd < center_dist_thresh:
+                    return True
+                return False
+
+            an = a.get("name", "unknown")
+            bn = b.get("name", "unknown")
+            return (an == bn) or (an == "unknown") or (bn == "unknown")
+
+        kept = []
+        for t in sorted(tracks, key=_rank, reverse=True):
+            duplicate = False
+            for k in kept:
+                if _can_merge(t, k):
+                    duplicate = True
+                    break
+            if not duplicate:
+                kept.append(t)
+        return kept
+
+    def _dedupe_detections(self, detections, iou_thresh=0.45, center_dist_thresh=0.5):
+        """Collapse near-duplicate detections from the same detector pass."""
+        if len(detections) <= 1:
+            return detections
+
+        def _rank(det):
+            x, y, w, h, name, best = det
+            known = 1 if name != "unknown" else 0
+            quality = (1.0 - float(best)) if known else 0.0
+            area = int(w) * int(h)
+            return (known, quality, area)
+
+        kept = []
+        for det in sorted(detections, key=_rank, reverse=True):
+            x, y, w, h, name, _best = det
+            bbox = (int(x), int(y), int(w), int(h))
+            is_dup = False
+
+            for kd in kept:
+                kx, ky, kw, kh, kname, _kbest = kd
+                kbbox = (int(kx), int(ky), int(kw), int(kh))
+                compatible = (name == kname) or (name == "unknown") or (kname == "unknown")
+                if not compatible:
+                    continue
+
+                ov = iou(bbox, kbbox)
+                cd = self._center_dist_norm(bbox, kbbox)
+                if ov > iou_thresh or cd < center_dist_thresh:
+                    is_dup = True
+                    break
+
+            if not is_dup:
+                kept.append(det)
+
+        return kept
+
     def reload_faces(self):
         """Rebuild known embeddings from faces/{name}/*"""
         known = []
@@ -247,9 +340,18 @@ class FaceEngine:
     def _detector_worker(self):
         while not self.stop_evt.is_set():
             try:
-                frame_full = self.in_q.get(timeout=0.1)
+                det_input = self.in_q.get(timeout=0.1)
             except Empty:
                 continue
+
+            if (
+                isinstance(det_input, tuple)
+                and len(det_input) == 2
+            ):
+                frame_t, frame_full = det_input
+            else:
+                frame_t = time.monotonic()
+                frame_full = det_input
 
             H, W = frame_full.shape[:2]
             results = []
@@ -294,8 +396,10 @@ class FaceEngine:
                 h = max(1, min(h, H - y))
 
                 # filters to avoid tiny/huge junk
-                if w < 90 or h < 90:
+                # too small boxes
+                if w < 30 or h < 30:
                     continue
+                # too large boxes
                 if w > 0.70 * W or h > 0.70 * H:
                     continue
                 ar = w / float(h)
@@ -341,13 +445,14 @@ class FaceEngine:
                     self.out_q.get_nowait()
                 except Empty:
                     break
-            self.out_q.put(results)
+            self.out_q.put((float(frame_t), results))
 
     def _main_loop(self):
         last_sent_t = 0.0
         last_encode_t = 0.0
         stale_secs = 2.0
         unknown_stale_secs = 0.7
+        max_detection_lag = max(1.5, self.detect_every * 4.0)
 
         while not self.stop_evt.is_set():
             if self._cap is None:
@@ -394,29 +499,65 @@ class FaceEngine:
             # 2) send to detector (immediate if no tracks)
             if (not self.tracks) or (now - last_sent_t >= self.detect_every):
                 last_sent_t = now
-                self._push_latest(self.in_q, frame.copy())
+                self._push_latest(self.in_q, (now, frame.copy()))
 
             # 3) consume detections, update tracks by IoU
             try:
-                results = self.out_q.get_nowait()
+                det_out = self.out_q.get_nowait()
+                if (
+                    isinstance(det_out, tuple)
+                    and len(det_out) == 2
+                ):
+                    det_t, results = det_out
+                else:
+                    det_t, results = now, det_out
 
                 UNKNOWN_TO_FORGET = 3  # how many consecutive "unknown" hits before we downgrade a known track
                 unknown_stale_secs = max(1.2, self.detect_every * 1.2)  # must be >= detect_every to avoid flicker
+                # Ignore stale detector results only when we already have active tracks.
+                # This avoids losing bootstrap detections on slower hardware.
+                det_age = now - float(det_t)
+                if self.tracks and det_age > max_detection_lag:
+                    results = []
+                results = self._dedupe_detections(results)
+                matched_track_idx = set()
+                # Process larger faces first for more stable assignment.
+                results = sorted(results, key=lambda r: int(r[2]) * int(r[3]), reverse=True)
 
                 for x, y, w, h, name, best in results:
                     det_bbox = (int(x), int(y), int(w), int(h))
 
-                    # find best track match (no type-gating)
+                    # Find best track match (IoU first, center-distance fallback).
                     best_i = -1
-                    best_score = 0.0
+                    best_key = None
                     for i, t in enumerate(self.tracks):
+                        if i in matched_track_idx:
+                            continue
+                        t_name = t.get("name", "unknown")
+                        compatible = (t_name == name) or (t_name == "unknown") or (name == "unknown")
+                        if not compatible:
+                            continue
+
+                        t_bbox = t["bbox"]
+                        center_dist = self._center_dist_norm(t_bbox, det_bbox)
                         score = iou(t["bbox"], det_bbox)
-                        if score > best_score:
-                            best_score = score
+                        motion_match = (
+                            (t_name == name and name != "unknown" and center_dist < 0.75)
+                            or (((t_name == "unknown") ^ (name == "unknown")) and center_dist < 0.50)
+                            or (t_name == "unknown" and name == "unknown" and center_dist < 0.40)
+                        )
+                        if score <= 0.3 and not motion_match:
+                            continue
+
+                        # Prefer higher IoU, then known identity, then smaller center distance.
+                        cand_key = (score, 1 if t_name != "unknown" else 0, -center_dist)
+                        if (best_key is None) or (cand_key > best_key):
+                            best_key = cand_key
                             best_i = i
 
-                    if best_score > 0.3 and best_i >= 0:
+                    if best_i >= 0:
                         t = self.tracks[best_i]
+                        matched_track_idx.add(best_i)
 
                         # always refresh bbox/tracker/last_seen
                         t["bbox"] = det_bbox
@@ -439,6 +580,22 @@ class FaceEngine:
                             t["best"] = float(best)
                             t["unknown_hits"] = 0
                     else:
+                        # If this detection is very close to an existing track, treat it
+                        # as duplicate noise instead of creating a second box.
+                        near_existing = False
+                        for t in self.tracks:
+                            t_name = t.get("name", "unknown")
+                            compatible = (t_name == name) or (t_name == "unknown") or (name == "unknown")
+                            if not compatible:
+                                continue
+                            ov = iou(t["bbox"], det_bbox)
+                            cd = self._center_dist_norm(t["bbox"], det_bbox)
+                            if ov > 0.45 or cd < 0.32:
+                                near_existing = True
+                                break
+                        if near_existing:
+                            continue
+
                         # new track
                         tr = create_tracker(self.tracker_type)
                         tr.init(frame, det_bbox)
@@ -459,6 +616,7 @@ class FaceEngine:
                     t for t in self.tracks
                     if (now - t.get("last_seen", now)) < (unknown_stale_secs if t.get("name") == "unknown" else stale_secs)
                 ]
+                self.tracks = self._dedupe_tracks(self.tracks)
 
             except Empty:
                 pass
