@@ -1,0 +1,163 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Test Face Recognition</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+  <body class="bg-slate-950 text-slate-100">
+    <div class="min-h-screen">
+      <div class="border-b border-slate-800">
+        <div class="mx-auto max-w-5xl px-4 py-4 flex items-center justify-between">
+          <div>
+            <div class="text-xl font-semibold">Video Test</div>
+            <div class="text-slate-400 text-sm">Upload footage and review recognition output</div>
+          </div>
+          <a href="/" class="rounded-lg bg-slate-800 hover:bg-slate-700 px-3 py-2 text-sm">Back to Dashboard</a>
+        </div>
+      </div>
+
+      <div class="mx-auto max-w-5xl px-4 py-6 space-y-6">
+        <div class="rounded-xl border border-slate-800 bg-slate-900">
+          <div class="px-4 py-3 border-b border-slate-800">
+            <div class="font-medium">Upload Test Footage</div>
+            <div class="text-xs text-slate-400">Supported formats: mp4, mov, avi, mkv, webm, m4v</div>
+          </div>
+          <form id="testUploadForm" class="p-4 space-y-4" enctype="multipart/form-data">
+            <input
+              id="videoFile"
+              name="file"
+              type="file"
+              accept="video/*"
+              required
+              class="w-full text-sm text-slate-200 file:mr-3 file:rounded-lg file:border-0 file:bg-slate-800 file:px-3 file:py-2 file:text-sm file:text-slate-100 hover:file:bg-slate-700"
+            />
+            <button
+              id="uploadBtn"
+              type="submit"
+              class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-4 py-2 text-sm font-medium"
+            >
+              Upload and Process
+            </button>
+            <div id="testMsg" class="text-sm text-slate-300"></div>
+            <div class="w-full h-2 rounded bg-slate-800 overflow-hidden">
+              <div id="progressBar" class="h-full bg-emerald-500" style="width: 0%"></div>
+            </div>
+          </form>
+        </div>
+
+        <div class="rounded-xl border border-slate-800 bg-slate-900">
+          <div class="px-4 py-3 border-b border-slate-800">
+            <div class="font-medium">Processed Video</div>
+          </div>
+          <div class="p-4">
+            <video
+              id="resultVideo"
+              controls
+              class="w-full rounded-lg border border-slate-800 bg-black"
+            ></video>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const form = document.getElementById("testUploadForm");
+      const uploadBtn = document.getElementById("uploadBtn");
+      const msg = document.getElementById("testMsg");
+      const progressBar = document.getElementById("progressBar");
+      const resultVideo = document.getElementById("resultVideo");
+
+      let pollTimer = null;
+
+      function setProgress(v) {
+        const pct = Math.max(0, Math.min(100, Number(v || 0)));
+        progressBar.style.width = `${pct}%`;
+      }
+
+      async function pollStatus(jobId) {
+        if (pollTimer) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+        }
+
+        const check = async () => {
+          const r = await fetch(`/api/test/status/${jobId}`);
+          const j = await r.json();
+          if (!r.ok || !j.ok) {
+            msg.textContent = "Failed to read processing status.";
+            uploadBtn.disabled = false;
+            if (pollTimer) {
+              clearInterval(pollTimer);
+              pollTimer = null;
+            }
+            return;
+          }
+
+          const job = j.job || {};
+          setProgress(job.progress || 0);
+
+          if (job.status === "queued") {
+            msg.textContent = "Job queued...";
+            return;
+          }
+          if (job.status === "processing") {
+            msg.textContent = `Processing... ${job.progress || 0}%`;
+            return;
+          }
+          if (job.status === "error") {
+            msg.textContent = `Processing failed: ${job.error || "unknown error"}`;
+            uploadBtn.disabled = false;
+            if (pollTimer) {
+              clearInterval(pollTimer);
+              pollTimer = null;
+            }
+            return;
+          }
+          if (job.status === "done") {
+            msg.textContent = "Done. Playing processed video.";
+            setProgress(100);
+            if (job.result_url) {
+              resultVideo.src = `${job.result_url}?ts=${Date.now()}`;
+              resultVideo.load();
+            }
+            uploadBtn.disabled = false;
+            if (pollTimer) {
+              clearInterval(pollTimer);
+              pollTimer = null;
+            }
+          }
+        };
+
+        await check();
+        pollTimer = setInterval(check, 1000);
+      }
+
+      form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        uploadBtn.disabled = true;
+        setProgress(0);
+        msg.textContent = "Uploading...";
+        resultVideo.removeAttribute("src");
+        resultVideo.load();
+
+        const fd = new FormData(form);
+        const r = await fetch("/api/test/upload", {
+          method: "POST",
+          body: fd,
+        });
+        const j = await r.json();
+
+        if (!r.ok || !j.ok) {
+          msg.textContent = `Upload failed: ${j.error || "unknown error"}`;
+          uploadBtn.disabled = false;
+          return;
+        }
+
+        msg.textContent = "Uploaded. Starting processing...";
+        await pollStatus(j.job_id);
+      });
+    </script>
+  </body>
+</html>

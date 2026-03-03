@@ -187,6 +187,204 @@ class FaceEngine:
         with self._lock:
             return self._latest_qr, float(self._latest_qr_t)
 
+    def process_video_file(self, input_path, output_path, progress_cb=None):
+        """Run face recognition on a saved video and write an annotated output video.
+
+        Returns:
+            dict: {"output_path": str, "mime": str}
+        """
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            raise RuntimeError("Cannot open uploaded video")
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
+        if width <= 0 or height <= 0:
+            cap.release()
+            raise RuntimeError("Invalid video dimensions")
+
+        src_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        out_fps = src_fps if src_fps > 0 else float(max(1, self.out_fps))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        out_w = int(width - (width % 2))
+        out_h = int(height - (height % 2))
+        if out_w <= 0 or out_h <= 0:
+            cap.release()
+            raise RuntimeError("Invalid output video dimensions")
+
+        base_path, _ = os.path.splitext(output_path)
+        writer = None
+        selected_path = None
+        selected_mime = None
+        candidates = (
+            ("mp4", "avc1", "video/mp4"),
+            ("mp4", "H264", "video/mp4"),
+            ("webm", "VP80", "video/webm"),
+            ("webm", "VP90", "video/webm"),
+            ("mp4", "mp4v", "video/mp4"),
+        )
+        for ext, tag, mime in candidates:
+            candidate_path = f"{base_path}.{ext}"
+            try:
+                if os.path.exists(candidate_path):
+                    os.remove(candidate_path)
+            except Exception:
+                pass
+            w = cv2.VideoWriter(
+                candidate_path,
+                cv2.VideoWriter_fourcc(*tag),
+                out_fps,
+                (out_w, out_h),
+            )
+            if w.isOpened():
+                writer = w
+                selected_path = candidate_path
+                selected_mime = mime
+                break
+            w.release()
+
+        if writer is None or not selected_path or not selected_mime:
+            cap.release()
+            raise RuntimeError("Cannot create output video writer")
+
+        frame_idx = 0
+        video_tracks = []
+        track_max_misses = 5
+        bbox_smooth_alpha = 0.55
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                if frame.shape[1] != out_w or frame.shape[0] != out_h:
+                    frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
+
+                results = self._detect_and_match_faces(
+                    frame,
+                    min_face_size=12,
+                    keep_unembedded_unknown=True,
+                )
+                results = self._dedupe_detections(results)
+
+                for t in video_tracks:
+                    t["matched"] = False
+
+                results = sorted(results, key=lambda r: int(r[2]) * int(r[3]), reverse=True)
+                for x, y, w, h, name, best in results:
+                    det_bbox = (int(x), int(y), int(w), int(h))
+                    best_i = -1
+                    best_key = None
+                    for i, t in enumerate(video_tracks):
+                        if t.get("matched"):
+                            continue
+                        t_name = t.get("name", "unknown")
+                        compatible = (t_name == name) or (t_name == "unknown") or (name == "unknown")
+                        if not compatible:
+                            continue
+
+                        ov = iou(t.get("bbox", (0, 0, 0, 0)), det_bbox)
+                        cd = self._center_dist_norm(t.get("bbox", (0, 0, 0, 0)), det_bbox)
+                        if ov < 0.08 and cd > 0.95:
+                            continue
+                        key = (ov, -cd, 1 if t_name == name else 0)
+                        if best_key is None or key > best_key:
+                            best_key = key
+                            best_i = i
+
+                    if best_i >= 0:
+                        t = video_tracks[best_i]
+                        bx, by, bw, bh = t.get("bbox", det_bbox)
+                        nx, ny, nw, nh = det_bbox
+                        t["bbox"] = (
+                            int(round(bx * bbox_smooth_alpha + nx * (1.0 - bbox_smooth_alpha))),
+                            int(round(by * bbox_smooth_alpha + ny * (1.0 - bbox_smooth_alpha))),
+                            int(round(bw * bbox_smooth_alpha + nw * (1.0 - bbox_smooth_alpha))),
+                            int(round(bh * bbox_smooth_alpha + nh * (1.0 - bbox_smooth_alpha))),
+                        )
+                        if name != "unknown":
+                            t["name"] = name
+                            t["best"] = float(best)
+                            t["unknown_hits"] = 0
+                        else:
+                            t["unknown_hits"] = int(t.get("unknown_hits", 0)) + 1
+                            if t.get("name") == "unknown":
+                                t["best"] = float(best)
+                            elif t["unknown_hits"] >= 4:
+                                t["name"] = "unknown"
+                                t["best"] = float(best)
+                        t["matched"] = True
+                        t["misses"] = 0
+                    else:
+                        video_tracks.append(
+                            {
+                                "bbox": det_bbox,
+                                "name": name,
+                                "best": float(best),
+                                "matched": True,
+                                "misses": 0,
+                                "unknown_hits": 0 if name != "unknown" else 1,
+                            }
+                        )
+
+                kept_tracks = []
+                for t in video_tracks:
+                    if not t.get("matched"):
+                        t["misses"] = int(t.get("misses", 0)) + 1
+                    if int(t.get("misses", 0)) <= track_max_misses:
+                        kept_tracks.append(t)
+                video_tracks = self._dedupe_tracks(kept_tracks, iou_thresh=0.50, center_dist_thresh=0.65)
+
+                for t in video_tracks:
+                    x, y, w, h = map(int, t.get("bbox", (0, 0, 0, 0)))
+                    name = t.get("name", "unknown")
+                    best = float(t.get("best", 1.0))
+                    is_unknown = name == "unknown"
+                    color = (0, 0, 255) if is_unknown else (0, 255, 0)
+
+                    # Keep tiny CCTV detections visible in rendered output.
+                    dx, dy, dw, dh = int(x), int(y), int(w), int(h)
+                    min_vis = 28
+                    if dw < min_vis:
+                        pad = (min_vis - dw) // 2
+                        dx = max(0, dx - pad)
+                        dw = min(out_w - dx, max(dw, min_vis))
+                    if dh < min_vis:
+                        pad = (min_vis - dh) // 2
+                        dy = max(0, dy - pad)
+                        dh = min(out_h - dy, max(dh, min_vis))
+
+                    cv2.rectangle(frame, (dx, dy), (dx + dw, dy + dh), color, 2)
+                    label = "unknown" if is_unknown else f"{name} ({best:.2f})"
+                    cv2.putText(
+                        frame,
+                        label,
+                        (dx, max(0, dy - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        color,
+                        2,
+                    )
+
+                writer.write(frame)
+                frame_idx += 1
+
+                if progress_cb and (frame_idx % 5 == 0 or (total_frames and frame_idx == total_frames)):
+                    try:
+                        progress_cb(frame_idx, total_frames)
+                    except Exception:
+                        pass
+        finally:
+            cap.release()
+            writer.release()
+
+        if progress_cb:
+            try:
+                progress_cb(frame_idx, total_frames)
+            except Exception:
+                pass
+
+        return {"output_path": selected_path, "mime": selected_mime}
+
     @staticmethod
     def _center_dist_norm(a, b):
         ax = float(a[0]) + float(a[2]) * 0.5
@@ -326,6 +524,93 @@ class FaceEngine:
 
         self.known_embeddings = known
 
+    def _detect_and_match_faces(self, frame_full, min_face_size=30, keep_unembedded_unknown=False):
+        H, W = frame_full.shape[:2]
+        results = []
+
+        try:
+            used_scale = self.detect_scale
+            small = cv2.resize(frame_full, None, fx=used_scale, fy=used_scale)
+
+            faces = DeepFace.extract_faces(
+                img_path=small,
+                detector_backend=self.detector,
+                enforce_detection=False,
+                align=True,
+            )
+
+            if not faces:
+                faces = DeepFace.extract_faces(
+                    img_path=frame_full,
+                    detector_backend=self.detector,
+                    enforce_detection=False,
+                    align=True,
+                )
+                used_scale = 1.0
+
+            inv = 1.0 / used_scale
+        except Exception:
+            faces = []
+            inv = 1.0
+
+        for face in faces:
+            fa = face.get("facial_area", {})
+            x = int(fa.get("x", 0) * inv)
+            y = int(fa.get("y", 0) * inv)
+            w = int(fa.get("w", 0) * inv)
+            h = int(fa.get("h", 0) * inv)
+
+            x = max(0, x)
+            y = max(0, y)
+            w = max(1, min(w, W - x))
+            h = max(1, min(h, H - y))
+
+            if w < int(min_face_size) or h < int(min_face_size):
+                continue
+            if w > 0.70 * W or h > 0.70 * H:
+                continue
+            ar = w / float(h)
+            if ar < 0.6 or ar > 1.7:
+                continue
+            conf = face.get("confidence", None)
+            if conf is not None and conf < 0.90:
+                continue
+
+            face_img = face.get("face")
+            if face_img is None or getattr(face_img, "size", 0) == 0:
+                continue
+
+            try:
+                rep_live = DeepFace.represent(
+                    img_path=face_img,
+                    model_name=self.model,
+                    detector_backend="skip",
+                    enforce_detection=False,
+                )
+                if not rep_live:
+                    if keep_unembedded_unknown:
+                        results.append((x, y, w, h, "unknown", 1.0))
+                    continue
+                emb_live = l2norm(rep_live[0]["embedding"])
+            except Exception:
+                if keep_unembedded_unknown:
+                    results.append((x, y, w, h, "unknown", 1.0))
+                continue
+
+            name = "unknown"
+            best = 1.0
+            for known_name, emb_known in self.known_embeddings:
+                d = cosine_distance(emb_live, emb_known)
+                if d < best:
+                    best = d
+                    name = known_name
+            if best > self.threshold:
+                name = "unknown"
+
+            results.append((x, y, w, h, name, best))
+
+        return results
+
     # ---------- internal ----------
     def _push_latest(self, q, item):
         try:
@@ -353,91 +638,7 @@ class FaceEngine:
                 frame_t = time.monotonic()
                 frame_full = det_input
 
-            H, W = frame_full.shape[:2]
-            results = []
-
-            try:
-                used_scale = self.detect_scale
-                small = cv2.resize(frame_full, None, fx=used_scale, fy=used_scale)
-
-                faces = DeepFace.extract_faces(
-                    img_path=small,
-                    detector_backend=self.detector,
-                    enforce_detection=False,
-                    align=True,
-                )
-
-                if not faces:
-                    faces = DeepFace.extract_faces(
-                        img_path=frame_full,
-                        detector_backend=self.detector,
-                        enforce_detection=False,
-                        align=True,
-                    )
-                    used_scale = 1.0
-
-                inv = 1.0 / used_scale
-
-            except Exception:
-                faces = []
-                inv = 1.0
-
-            for face in faces:
-                fa = face.get("facial_area", {})
-                x = int(fa.get("x", 0) * inv)
-                y = int(fa.get("y", 0) * inv)
-                w = int(fa.get("w", 0) * inv)
-                h = int(fa.get("h", 0) * inv)
-
-                # clip
-                x = max(0, x)
-                y = max(0, y)
-                w = max(1, min(w, W - x))
-                h = max(1, min(h, H - y))
-
-                # filters to avoid tiny/huge junk
-                # too small boxes
-                if w < 30 or h < 30:
-                    continue
-                # too large boxes
-                if w > 0.70 * W or h > 0.70 * H:
-                    continue
-                ar = w / float(h)
-                if ar < 0.6 or ar > 1.7:
-                    continue
-                conf = face.get("confidence", None)
-                if conf is not None and conf < 0.90:
-                    continue
-
-                face_img = face.get("face")
-                if face_img is None or getattr(face_img, "size", 0) == 0:
-                    continue
-
-                # embed + match
-                try:
-                    rep_live = DeepFace.represent(
-                        img_path=face_img,
-                        model_name=self.model,
-                        detector_backend="skip",
-                        enforce_detection=False,
-                    )
-                    if not rep_live:
-                        continue
-                    emb_live = l2norm(rep_live[0]["embedding"])
-                except Exception:
-                    continue
-
-                name = "unknown"
-                best = 1.0
-                for known_name, emb_known in self.known_embeddings:
-                    d = cosine_distance(emb_live, emb_known)
-                    if d < best:
-                        best = d
-                        name = known_name
-                if best > self.threshold:
-                    name = "unknown"
-
-                results.append((x, y, w, h, name, best))
+            results = self._detect_and_match_faces(frame_full)
 
             # publish latest
             while True:

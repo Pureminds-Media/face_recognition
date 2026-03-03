@@ -3,6 +3,8 @@ import time
 import re
 import json
 import glob
+import uuid
+import mimetypes
 import subprocess
 from queue import Queue, Empty, Full
 from flask import Flask, Response, render_template, request, jsonify, send_from_directory, stream_with_context
@@ -14,6 +16,9 @@ app = Flask(__name__)
 
 ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 FACES_DIR = "faces"
+TEST_UPLOAD_DIR = os.path.join("test_runs", "uploads")
+TEST_OUTPUT_DIR = os.path.join("test_runs", "outputs")
+ALLOWED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
 engine = FaceEngine(
     known_dir=FACES_DIR,
@@ -47,6 +52,9 @@ qr_prompt_state = {
     "unknown_last_seen_mono": None,
     "active": False,
 }
+test_jobs_lock = threading.Lock()
+test_job_run_lock = threading.Lock()
+test_jobs = {}  # job_id -> {status, progress, error, result_url, ...}
 
 def _q_put_latest(q, item):
     try:
@@ -57,6 +65,49 @@ def _q_put_latest(q, item):
         except Empty:
             pass
         q.put_nowait(item)
+
+def _set_test_job(job_id: str, **fields):
+    with test_jobs_lock:
+        job = dict(test_jobs.get(job_id, {}))
+        job.update(fields)
+        job["updated_ts"] = time.time()
+        test_jobs[job_id] = job
+
+def _run_test_job(job_id: str, input_path: str):
+    out_path = os.path.join(TEST_OUTPUT_DIR, f"{job_id}.mp4")
+
+    def _progress(done: int, total: int):
+        progress = 0.0
+        if total and total > 0:
+            progress = min(100.0, round((float(done) / float(total)) * 100.0, 1))
+        _set_test_job(
+            job_id,
+            status="processing",
+            progress=progress,
+            frame_index=int(done),
+            total_frames=int(total) if total else None,
+        )
+
+    try:
+        _set_test_job(job_id, status="processing", progress=0.0)
+        os.makedirs(TEST_OUTPUT_DIR, exist_ok=True)
+
+        with test_job_run_lock:
+            engine.reload_faces()
+            out_info = engine.process_video_file(input_path, out_path, progress_cb=_progress)
+            final_output_path = out_info.get("output_path", out_path)
+            final_mime = out_info.get("mime") or mimetypes.guess_type(final_output_path)[0] or "application/octet-stream"
+            out_filename = os.path.basename(final_output_path)
+
+        _set_test_job(
+            job_id,
+            status="done",
+            progress=100.0,
+            result_url=f"/test/results/{out_filename}",
+            result_mime=final_mime,
+        )
+    except Exception as e:
+        _set_test_job(job_id, status="error", error=str(e))
 
 def _attendance_roster():
     # include all known identities, even if not attended yet
@@ -245,6 +296,10 @@ def _parse_qr_to_name(raw: str) -> str:
 
     # fallback: treat as direct name
     return safe_person_name(raw)
+
+def _allowed_video_ext(filename: str) -> str:
+    ext = os.path.splitext(filename or "")[1].lower()
+    return ext if ext in ALLOWED_VIDEO_EXTS else ""
 
 
 def _mark_attendance_from_qr(name: str, raw: str):
@@ -455,6 +510,10 @@ def mjpeg_generator():
 def index():
     return render_template("index.html")
 
+@app.route("/test")
+def test_page():
+    return render_template("test.html")
+
 @app.route("/video")
 def video():
     if not engine.is_running():
@@ -464,6 +523,48 @@ def video():
         mjpeg_generator(),
         mimetype="multipart/x-mixed-replace; boundary=frame",
     )
+
+@app.route("/api/test/upload", methods=["POST"])
+def api_test_upload():
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"ok": False, "error": "file is required"}), 400
+
+    original = secure_filename(f.filename or "")
+    ext = _allowed_video_ext(original)
+    if not ext:
+        return jsonify({"ok": False, "error": "unsupported video format"}), 400
+
+    os.makedirs(TEST_UPLOAD_DIR, exist_ok=True)
+    job_id = uuid.uuid4().hex
+    in_name = f"{job_id}{ext}"
+    in_path = os.path.join(TEST_UPLOAD_DIR, in_name)
+    f.save(in_path)
+
+    _set_test_job(
+        job_id,
+        status="queued",
+        progress=0.0,
+        filename=original or in_name,
+        result_url=None,
+        error=None,
+        created_ts=time.time(),
+    )
+    threading.Thread(target=_run_test_job, args=(job_id, in_path), daemon=True).start()
+    return jsonify({"ok": True, "job_id": job_id})
+
+@app.route("/api/test/status/<job_id>")
+def api_test_status(job_id):
+    with test_jobs_lock:
+        job = test_jobs.get(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "job not found"}), 404
+    return jsonify({"ok": True, "job": job})
+
+@app.route("/test/results/<path:filename>")
+def test_result_file(filename):
+    guessed = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return send_from_directory(TEST_OUTPUT_DIR, filename, mimetype=guessed)
 
 @app.route("/api/tracks")
 def api_tracks():
