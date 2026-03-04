@@ -409,7 +409,12 @@ def list_people():
 
 
 def _camera_source_to_text(source):
-    return str(source) if source is not None else ""
+    if source is None:
+        return ""
+    text = str(source)
+    if text.startswith("grid:"):
+        return "grid_3x2"
+    return text
 
 
 def _list_camera_devices():
@@ -473,6 +478,16 @@ def _list_camera_devices():
                 "label": f"{label} ({e['path']})",
                 "path": e["path"],
             }
+        )
+
+    if devices:
+        devices.insert(
+            0,
+            {
+                "value": "grid_3x2",
+                "label": "3x2 Grid (up to 6 cameras)",
+                "path": "",
+            },
         )
     return devices
 
@@ -709,7 +724,17 @@ def api_camera_set():
         return jsonify({"ok": False, "error": "source is required"}), 400
 
     restart = bool(payload.get("restart", True))
-    new_source = int(source_text) if re.fullmatch(r"\d+", source_text) else source_text
+    if source_text == "grid_3x2":
+        numeric_sources = []
+        for d in _list_camera_devices():
+            val = str(d.get("value", "")).strip()
+            if re.fullmatch(r"\d+", val):
+                numeric_sources.append(val)
+        if not numeric_sources:
+            return jsonify({"ok": False, "error": "no camera devices found for grid mode"}), 400
+        new_source = "grid:" + ",".join(numeric_sources[:6])
+    else:
+        new_source = int(source_text) if re.fullmatch(r"\d+", source_text) else source_text
 
     with state_lock:
         old_source = engine.cam_index

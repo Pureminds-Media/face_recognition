@@ -91,6 +91,12 @@ class FaceEngine:
         self.out_q = Queue(maxsize=1)
         self.stop_evt = threading.Event()
         self._cap = None
+        self._grid_workers = {}
+        self._grid_sources = []
+        self._grid_stop_evt = threading.Event()
+        self._grid_render_t = None
+        self._grid_layout = (3, 2)  # rows, cols
+        self._grid_qr_rr_idx = 0
         self._worker_t = None
         self._main_t = None
         self._lock = threading.Lock()
@@ -111,19 +117,22 @@ class FaceEngine:
         self.stop_evt.clear()
         self.reload_faces()
 
-        cap = cv2.VideoCapture(self.cam_index)
-        if not cap.isOpened():
-            raise RuntimeError("Cannot open webcam")
+        if self._is_grid_mode():
+            self._start_grid_mode()
+        else:
+            cap = cv2.VideoCapture(self.cam_index)
+            if not cap.isOpened():
+                raise RuntimeError("Cannot open webcam")
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self._cap = cap
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            self._cap = cap
 
-        self._worker_t = threading.Thread(target=self._detector_worker, daemon=True)
-        self._worker_t.start()
+            self._worker_t = threading.Thread(target=self._detector_worker, daemon=True)
+            self._worker_t.start()
 
-        self._main_t = threading.Thread(target=self._main_loop, daemon=True)
-        self._main_t.start()
+            self._main_t = threading.Thread(target=self._main_loop, daemon=True)
+            self._main_t.start()
 
         self._running = True
 
@@ -142,6 +151,7 @@ class FaceEngine:
             except Exception:
                 pass
             self._cap = None
+        self._cleanup_grid_mode()
 
         # Join threads
         if self._worker_t is not None:
@@ -647,6 +657,537 @@ class FaceEngine:
                 except Empty:
                     break
             self.out_q.put((float(frame_t), results))
+
+    def _is_grid_mode(self):
+        return isinstance(self.cam_index, str) and self.cam_index.startswith("grid:")
+
+    @staticmethod
+    def _parse_grid_sources(cam_index):
+        if not (isinstance(cam_index, str) and cam_index.startswith("grid:")):
+            return []
+        raw = cam_index.split(":", 1)[1].strip()
+        if not raw:
+            return []
+
+        out = []
+        for token in raw.split(","):
+            t = token.strip()
+            if not t:
+                continue
+            if t.isdigit():
+                out.append(int(t))
+            else:
+                out.append(t)
+        return out
+
+    def _start_grid_mode(self):
+        sources = self._parse_grid_sources(self.cam_index)
+        if not sources:
+            raise RuntimeError("No camera sources configured for grid mode")
+
+        rows, cols = self._grid_layout
+        tile_w = max(1, int(self.width // cols))
+        tile_h = max(1, int(self.height // rows))
+        max_slots = 6
+        workers = {}
+        ordered_sources = []
+        self._grid_stop_evt.clear()
+        self._grid_qr_rr_idx = 0
+
+        for source in sources[:max_slots]:
+            cap = cv2.VideoCapture(source)
+            if not cap.isOpened():
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                continue
+
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, tile_w)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, tile_h)
+            if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+                try:
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    pass
+
+            worker = {
+                "source": source,
+                "cap": cap,
+                "lock": threading.Lock(),
+                "stop_evt": threading.Event(),
+                "frame_q": Queue(maxsize=1),
+                "latest_frame": None,
+                "latest_frame_t": 0.0,
+                "last_good_frame_t": 0.0,
+                "tracks": [],
+                "latest_tracks": [],
+                "last_det_t": 0.0,
+                "track_max_misses": 6,
+                "bbox_smooth_alpha": 0.55,
+                "max_unknown_tracks": 3,
+                "capture_thread": None,
+                "detect_thread": None,
+            }
+            worker["capture_thread"] = threading.Thread(
+                target=self._grid_capture_loop,
+                args=(worker, tile_w, tile_h),
+                daemon=True,
+            )
+            worker["detect_thread"] = threading.Thread(
+                target=self._grid_detect_loop,
+                args=(worker,),
+                daemon=True,
+            )
+            workers[str(source)] = worker
+            ordered_sources.append(str(source))
+
+        if not workers:
+            self._cleanup_grid_mode()
+            raise RuntimeError("Cannot open any camera for grid mode")
+
+        self._grid_workers = workers
+        self._grid_sources = ordered_sources
+
+        for source in self._grid_sources:
+            w = self._grid_workers[source]
+            w["capture_thread"].start()
+            w["detect_thread"].start()
+
+        self._grid_render_t = threading.Thread(target=self._grid_render_loop, daemon=True)
+        self._grid_render_t.start()
+
+    def _cleanup_grid_mode(self):
+        self._grid_stop_evt.set()
+
+        for w in self._grid_workers.values():
+            try:
+                w["stop_evt"].set()
+            except Exception:
+                pass
+
+        for w in self._grid_workers.values():
+            cap = w.get("cap")
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+
+        for w in self._grid_workers.values():
+            t = w.get("capture_thread")
+            if t is not None:
+                t.join(timeout=2.0)
+            t = w.get("detect_thread")
+            if t is not None:
+                t.join(timeout=2.0)
+
+        if self._grid_render_t is not None:
+            self._grid_render_t.join(timeout=2.0)
+            self._grid_render_t = None
+
+        self._grid_workers = {}
+        self._grid_sources = []
+        self._grid_qr_rr_idx = 0
+        self._grid_stop_evt.clear()
+
+    def _draw_no_signal_tile(self, tile, source):
+        h, w = tile.shape[:2]
+        cv2.rectangle(tile, (0, 0), (w - 1, h - 1), (40, 40, 120), 2)
+        cv2.putText(
+            tile,
+            f"No Signal [{source}]",
+            (12, max(24, h // 2)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 255),
+            2,
+        )
+
+    def _draw_empty_tile(self, tile):
+        h, w = tile.shape[:2]
+        cv2.rectangle(tile, (0, 0), (w - 1, h - 1), (60, 60, 60), 1)
+        cv2.putText(
+            tile,
+            "Empty",
+            (12, max(24, h // 2)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (150, 150, 150),
+            2,
+        )
+
+    def _grid_capture_loop(self, worker, tile_w, tile_h):
+        cap = worker["cap"]
+        while not self.stop_evt.is_set() and not self._grid_stop_evt.is_set() and not worker["stop_evt"].is_set():
+            ok, frame = cap.read()
+            now = time.monotonic()
+            if not ok or frame is None:
+                with worker["lock"]:
+                    if (now - float(worker.get("last_good_frame_t", 0.0))) > 1.0:
+                        worker["latest_frame"] = None
+                time.sleep(0.02)
+                continue
+
+            try:
+                frame = cv2.resize(frame, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
+            except Exception:
+                time.sleep(0.01)
+                continue
+
+            with worker["lock"]:
+                worker["latest_frame"] = frame
+                worker["latest_frame_t"] = now
+                worker["last_good_frame_t"] = now
+
+            self._push_latest(worker["frame_q"], (now, frame.copy()))
+
+    def _grid_detect_loop(self, worker):
+        UNKNOWN_TO_FORGET = 3
+        detect_period = max(0.25, float(self.detect_every))
+        while not self.stop_evt.is_set() and not self._grid_stop_evt.is_set() and not worker["stop_evt"].is_set():
+            try:
+                _frame_t, frame = worker["frame_q"].get(timeout=0.1)
+            except Empty:
+                continue
+
+            now = time.monotonic()
+            with worker["lock"]:
+                last_det_t = float(worker.get("last_det_t", 0.0))
+            if (now - last_det_t) < detect_period:
+                continue
+
+            try:
+                dets = self._detect_and_match_faces(
+                    frame,
+                    min_face_size=20,
+                    keep_unembedded_unknown=True,
+                )
+                dets = self._dedupe_detections(dets)
+            except Exception:
+                dets = []
+
+            with worker["lock"]:
+                tracks = list(worker.get("tracks", []))
+                bbox_smooth_alpha = float(worker.get("bbox_smooth_alpha", 0.55))
+                track_max_misses = int(worker.get("track_max_misses", 6))
+                max_unknown_tracks = int(worker.get("max_unknown_tracks", 3))
+                matched_track_idx = set()
+                Hf, Wf = frame.shape[:2]
+
+                # Match larger detections first for more stable assignment.
+                dets = sorted(dets, key=lambda r: int(r[2]) * int(r[3]), reverse=True)
+                for x, y, w, h, name, best in dets:
+                    det_bbox = (int(x), int(y), int(w), int(h))
+                    if name == "unknown":
+                        # Suppress noisy unknowns (tiny boxes and edge-hugging false positives).
+                        if int(w) < 20 or int(h) < 20:
+                            continue
+                        margin_x = max(3, int(0.01 * Wf))
+                        margin_y = max(3, int(0.01 * Hf))
+                        if (x <= margin_x) or (y <= margin_y) or ((x + w) >= (Wf - margin_x)) or ((y + h) >= (Hf - margin_y)):
+                            continue
+                    best_i = -1
+                    best_key = None
+                    for i, t in enumerate(tracks):
+                        if i in matched_track_idx:
+                            continue
+                        t_name = t.get("name", "unknown")
+                        compatible = (t_name == name) or (t_name == "unknown") or (name == "unknown")
+                        if not compatible:
+                            continue
+
+                        t_bbox = t.get("bbox", (0, 0, 0, 0))
+                        center_dist = self._center_dist_norm(t_bbox, det_bbox)
+                        score = iou(t_bbox, det_bbox)
+                        motion_match = (
+                            (t_name == name and name != "unknown" and center_dist < 0.75)
+                            or (((t_name == "unknown") ^ (name == "unknown")) and center_dist < 0.50)
+                            or (t_name == "unknown" and name == "unknown" and center_dist < 0.40)
+                        )
+                        if score <= 0.3 and not motion_match:
+                            continue
+
+                        cand_key = (score, 1 if t_name != "unknown" else 0, -center_dist)
+                        if (best_key is None) or (cand_key > best_key):
+                            best_key = cand_key
+                            best_i = i
+
+                    if best_i >= 0:
+                        t = tracks[best_i]
+                        matched_track_idx.add(best_i)
+                        bx, by, bw, bh = t.get("bbox", det_bbox)
+                        nx, ny, nw, nh = det_bbox
+                        smooth_bbox = (
+                            int(round(bx * bbox_smooth_alpha + nx * (1.0 - bbox_smooth_alpha))),
+                            int(round(by * bbox_smooth_alpha + ny * (1.0 - bbox_smooth_alpha))),
+                            int(round(bw * bbox_smooth_alpha + nw * (1.0 - bbox_smooth_alpha))),
+                            int(round(bh * bbox_smooth_alpha + nh * (1.0 - bbox_smooth_alpha))),
+                        )
+                        t["bbox"] = smooth_bbox
+                        try:
+                            tr = create_tracker(self.tracker_type)
+                            tr.init(frame, smooth_bbox)
+                            t["tracker"] = tr
+                        except Exception:
+                            pass
+                        t["updated"] = True
+                        t["last_seen"] = now
+                        t["last_detect_t"] = now
+                        t["misses"] = 0
+
+                        if name == "unknown":
+                            if t.get("name") != "unknown":
+                                t["unknown_hits"] = int(t.get("unknown_hits", 0)) + 1
+                                if t["unknown_hits"] >= UNKNOWN_TO_FORGET:
+                                    t["name"] = "unknown"
+                                    t["best"] = float(best)
+                            else:
+                                t["best"] = float(best)
+                        else:
+                            t["name"] = name
+                            t["best"] = float(best)
+                            t["unknown_hits"] = 0
+                    else:
+                        near_existing = False
+                        for t in tracks:
+                            t_name = t.get("name", "unknown")
+                            compatible = (t_name == name) or (t_name == "unknown") or (name == "unknown")
+                            if not compatible:
+                                continue
+                            ov = iou(t.get("bbox", (0, 0, 0, 0)), det_bbox)
+                            cd = self._center_dist_norm(t.get("bbox", (0, 0, 0, 0)), det_bbox)
+                            if ov > 0.45 or cd < 0.32:
+                                near_existing = True
+                                break
+                        if near_existing:
+                            continue
+                        if name == "unknown":
+                            unknown_count = sum(1 for t in tracks if t.get("name") == "unknown")
+                            if unknown_count >= max_unknown_tracks:
+                                continue
+
+                        try:
+                            tr = create_tracker(self.tracker_type)
+                            tr.init(frame, det_bbox)
+                        except Exception:
+                            continue
+                        tracks.append(
+                            {
+                                "tracker": tr,
+                                "name": name,
+                                "best": float(best),
+                                "bbox": det_bbox,
+                                "updated": True,
+                                "last_seen": now,
+                                "last_detect_t": now,
+                                "misses": 0,
+                                "unknown_hits": 0 if name != "unknown" else 1,
+                            }
+                        )
+
+                for i, t in enumerate(tracks):
+                    if i not in matched_track_idx:
+                        t["misses"] = int(t.get("misses", 0)) + 1
+
+                tracks = [t for t in tracks if int(t.get("misses", 0)) <= track_max_misses]
+                tracks = self._dedupe_tracks(tracks)
+                worker["tracks"] = tracks
+                worker["latest_tracks"] = [
+                    {
+                        "name": t.get("name", "unknown"),
+                        "best": float(t.get("best", 1.0)),
+                        "bbox": [
+                            int(t.get("bbox", (0, 0, 0, 0))[0]),
+                            int(t.get("bbox", (0, 0, 0, 0))[1]),
+                            int(t.get("bbox", (0, 0, 0, 0))[2]),
+                            int(t.get("bbox", (0, 0, 0, 0))[3]),
+                        ],
+                    }
+                    for t in tracks
+                ]
+                worker["last_det_t"] = now
+
+    def _grid_render_loop(self):
+        rows, cols = self._grid_layout
+        tile_w = max(1, int(self.width // cols))
+        tile_h = max(1, int(self.height // rows))
+        grid_w = tile_w * cols
+        grid_h = tile_h * rows
+        last_encode_t = 0.0
+        stale_secs = 1.6
+        unknown_stale_secs = max(0.8, self.detect_every * 1.0)
+        # Unknown tracks must be periodically reconfirmed by detector; tracker-only
+        # unknown boxes are aggressively expired to avoid ghost boxes.
+        unknown_reconfirm_secs = max(1.2, self.detect_every * 2.8)
+
+        while not self.stop_evt.is_set() and not self._grid_stop_evt.is_set():
+            now = time.monotonic()
+            canvas = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)
+            aggregated_tracks = []
+
+            for slot in range(rows * cols):
+                r = slot // cols
+                c = slot % cols
+                ox = c * tile_w
+                oy = r * tile_h
+
+                tile = np.zeros((tile_h, tile_w, 3), dtype=np.uint8)
+                if slot >= len(self._grid_sources):
+                    self._draw_empty_tile(tile)
+                    canvas[oy:oy + tile_h, ox:ox + tile_w] = tile
+                    continue
+
+                source = self._grid_sources[slot]
+                worker = self._grid_workers.get(source)
+                if worker is None:
+                    self._draw_no_signal_tile(tile, source)
+                    canvas[oy:oy + tile_h, ox:ox + tile_w] = tile
+                    continue
+
+                with worker["lock"]:
+                    frame = worker.get("latest_frame")
+                    tracks = list(worker.get("tracks", []))
+                    track_max_misses = int(worker.get("track_max_misses", 6))
+                    max_unknown_tracks = int(worker.get("max_unknown_tracks", 3))
+
+                if frame is None:
+                    self._draw_no_signal_tile(tile, source)
+                    canvas[oy:oy + tile_h, ox:ox + tile_w] = tile
+                    continue
+
+                tile = frame.copy()
+                updated_tracks = []
+                for t in tracks:
+                    tr = t.get("tracker")
+                    if tr is None:
+                        continue
+                    ok, bbox = tr.update(tile)
+                    if ok:
+                        x, y, w, h = bbox
+                        if w > 0.75 * tile_w or h > 0.75 * tile_h:
+                            t["misses"] = int(t.get("misses", 0)) + 1
+                        elif w < 12 or h < 12:
+                            t["misses"] = int(t.get("misses", 0)) + 1
+                        else:
+                            t["bbox"] = (int(x), int(y), int(w), int(h))
+                            t["last_seen"] = now
+                            t["misses"] = 0
+                    else:
+                        t["misses"] = int(t.get("misses", 0)) + 1
+
+                    this_track_max_misses = 3 if t.get("name") == "unknown" else track_max_misses
+                    if int(t.get("misses", 0)) <= this_track_max_misses:
+                        updated_tracks.append(t)
+
+                updated_tracks = [
+                    t for t in updated_tracks
+                    if (now - t.get("last_seen", now)) < (unknown_stale_secs if t.get("name") == "unknown" else stale_secs)
+                ]
+                updated_tracks = [
+                    t for t in updated_tracks
+                    if (t.get("name") != "unknown")
+                    or ((now - float(t.get("last_detect_t", 0.0))) <= unknown_reconfirm_secs)
+                ]
+                updated_tracks = self._dedupe_tracks(updated_tracks)
+                unknown_seen = 0
+                limited_tracks = []
+                for t in updated_tracks:
+                    if t.get("name") == "unknown":
+                        unknown_seen += 1
+                        if unknown_seen > max_unknown_tracks:
+                            continue
+                    limited_tracks.append(t)
+                updated_tracks = limited_tracks
+
+                with worker["lock"]:
+                    worker["tracks"] = updated_tracks
+                    worker["latest_tracks"] = [
+                        {
+                            "name": t.get("name", "unknown"),
+                            "best": float(t.get("best", 1.0)),
+                            "bbox": [
+                                int(t.get("bbox", (0, 0, 0, 0))[0]),
+                                int(t.get("bbox", (0, 0, 0, 0))[1]),
+                                int(t.get("bbox", (0, 0, 0, 0))[2]),
+                                int(t.get("bbox", (0, 0, 0, 0))[3]),
+                            ],
+                        }
+                        for t in updated_tracks
+                    ]
+
+                for t in updated_tracks:
+                    x, y, w, h = map(int, t.get("bbox", (0, 0, 0, 0)))
+                    name = str(t.get("name", "unknown"))
+                    best = float(t.get("best", 1.0))
+                    x = max(0, int(x))
+                    y = max(0, int(y))
+                    w = max(1, int(w))
+                    h = max(1, int(h))
+                    if x + w > tile_w:
+                        w = tile_w - x
+                    if y + h > tile_h:
+                        h = tile_h - y
+                    if w <= 0 or h <= 0:
+                        continue
+
+                    is_unknown = name == "unknown"
+                    color = (0, 0, 255) if is_unknown else (0, 255, 0)
+                    cv2.rectangle(tile, (x, y), (x + w, y + h), color, 2)
+                    label = "unknown" if is_unknown else f"{name} ({float(best):.2f})"
+                    cv2.putText(tile, label, (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
+                    aggregated_tracks.append(
+                        {
+                            "name": name,
+                            "best": float(best),
+                            "bbox": [ox + x, oy + y, w, h],
+                            "camera_source": str(source),
+                        }
+                    )
+
+                cv2.putText(
+                    tile,
+                    f"Cam {source}",
+                    (8, tile_h - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 255),
+                    2,
+                )
+                cv2.rectangle(tile, (0, 0), (tile_w - 1, tile_h - 1), (80, 80, 80), 1)
+                canvas[oy:oy + tile_h, ox:ox + tile_w] = tile
+
+            if self._grid_sources and (now - self._last_qr_scan_t) >= self.qr_scan_every:
+                self._last_qr_scan_t = now
+                source = self._grid_sources[self._grid_qr_rr_idx % len(self._grid_sources)]
+                self._grid_qr_rr_idx += 1
+                worker = self._grid_workers.get(source)
+                if worker is not None:
+                    with worker["lock"]:
+                        qr_frame = worker.get("latest_frame")
+                    if qr_frame is not None:
+                        try:
+                            data, _pts, _ = self._qr_detector.detectAndDecode(qr_frame)
+                            data = (data or "").strip()
+                            if data:
+                                with self._lock:
+                                    self._latest_qr = data
+                                    self._latest_qr_t = now
+                        except Exception:
+                            pass
+
+            if now - last_encode_t >= (1.0 / max(1, self.out_fps)):
+                last_encode_t = now
+                ok, buf = cv2.imencode(
+                    ".jpg", canvas, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)]
+                )
+                if ok:
+                    with self._lock:
+                        self._latest_jpeg = buf.tobytes()
+                        self._latest_tracks = aggregated_tracks
+
+            time.sleep(0.001)
 
     def _main_loop(self):
         last_sent_t = 0.0
