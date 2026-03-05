@@ -112,6 +112,11 @@ class FaceEngine:
         self._last_qr_scan_t = 0.0
         self._latest_qr = None  # last decoded QR string
         self._latest_qr_t = 0.0 # monotonic time of last decoded QR
+        # Snapshot buffer: (person_name, camera_source) -> JPEG bytes
+        # Holds the latest annotated tile/frame for each person/camera pair.
+        # Consumed by app.py when opening a new visit.
+        self._snapshot_buf = {}
+        self._snapshot_lock = threading.Lock()
 
     # ---------- public ----------
     def start(self):
@@ -191,6 +196,16 @@ class FaceEngine:
         with self._lock:
             return list(self._latest_tracks)
     
+    def get_snapshot(self, person_name, camera_source=None):
+        """Pop and return buffered JPEG bytes for a person/camera, or None.
+
+        In grid mode, camera_source is required to identify which tile.
+        In single-camera mode, camera_source can be None.
+        """
+        key = (person_name, str(camera_source) if camera_source is not None else None)
+        with self._snapshot_lock:
+            return self._snapshot_buf.pop(key, None)
+
     def get_qr(self):
         """Return latest decoded QR payload (string) or None."""
         with self._lock:
@@ -705,6 +720,26 @@ class FaceEngine:
         self._grid_layout = (rows, cols)
 
     @staticmethod
+    def _normalize_slot(val):
+        """Normalize a slot value to ``{"source": str, "name": str} | None``.
+
+        Handles both old format (plain string) and new format (dict with
+        ``source`` and ``name`` keys).
+        """
+        if val is None:
+            return None
+        if isinstance(val, dict):
+            src = val.get("source")
+            if src is None or str(src).strip() == "":
+                return None
+            return {"source": str(src).strip(), "name": str(val.get("name") or f"Camera {src}")}
+        # Old format: plain string
+        val = str(val).strip()
+        if not val:
+            return None
+        return {"source": val, "name": f"Camera {val}"}
+
+    @staticmethod
     def save_grid_config(layout, slots, path=None):
         """Persist grid configuration to JSON.
 
@@ -712,15 +747,19 @@ class FaceEngine:
         ----------
         layout : tuple[int, int]
             (rows, cols)
-        slots : dict[str, str | None]
-            Mapping of slot index (as str) to camera source (str) or None.
+        slots : dict[str, dict | str | None]
+            Mapping of slot index (as str) to ``{"source": str, "name": str}``
+            or a plain source string (auto-wrapped) or None.
         path : str | None
             File path; defaults to ``GRID_CONFIG_PATH``.
         """
         path = path or GRID_CONFIG_PATH
+        normalized = {}
+        for k, v in slots.items():
+            normalized[str(k)] = FaceEngine._normalize_slot(v)
         data = {
             "layout": list(layout),
-            "slots": {str(k): v for k, v in slots.items()},
+            "slots": normalized,
         }
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
@@ -729,10 +768,13 @@ class FaceEngine:
     def load_grid_config(path=None):
         """Load grid configuration from JSON.
 
+        Handles both old format (slot values are plain strings) and new format
+        (slot values are ``{"source": ..., "name": ...}`` dicts).
+
         Returns
         -------
         dict | None
-            ``{"layout": (rows, cols), "slots": {str: str|None}, "cam_index": str}``
+            ``{"layout": (rows, cols), "slots": {str: dict|None}, "cam_index": str}``
             or ``None`` if the file does not exist or is invalid.
         """
         path = path or GRID_CONFIG_PATH
@@ -745,15 +787,15 @@ class FaceEngine:
             if len(layout) != 2:
                 return None
             layout = (int(layout[0]), int(layout[1]))
-            slots = data.get("slots", {})
+            raw_slots = data.get("slots", {})
 
-            # Build cam_index string from slots dict
-            max_slot = max((int(k) for k in slots), default=-1)
-            parts = []
-            for i in range(max_slot + 1):
-                val = slots.get(str(i))
-                parts.append(str(val) if val is not None else "")
-            cam_index = "grid:" + ",".join(parts)
+            # Normalize all slots to new format
+            slots = {}
+            for k, v in raw_slots.items():
+                slots[str(k)] = FaceEngine._normalize_slot(v)
+
+            # Build cam_index string from slots
+            cam_index = FaceEngine.build_grid_cam_index(slots)
             return {"layout": layout, "slots": slots, "cam_index": cam_index}
         except Exception:
             return None
@@ -764,8 +806,8 @@ class FaceEngine:
 
         Parameters
         ----------
-        slots : dict[str, str | None]
-            Slot index -> camera source.
+        slots : dict[str, dict | str | None]
+            Slot index -> ``{"source": ..., "name": ...}`` or plain source string or None.
 
         Returns
         -------
@@ -778,8 +820,36 @@ class FaceEngine:
         parts = []
         for i in range(max_slot + 1):
             val = slots.get(str(i))
-            parts.append(str(val) if val is not None else "")
+            if val is None:
+                parts.append("")
+            elif isinstance(val, dict):
+                src = val.get("source", "")
+                parts.append(str(src) if src else "")
+            else:
+                parts.append(str(val) if val else "")
         return "grid:" + ",".join(parts)
+
+    @staticmethod
+    def get_slot_locations(slots):
+        """Extract a mapping of camera_source -> location name from slots.
+
+        Returns
+        -------
+        dict[str, str]
+            e.g. ``{"0": "Front Entrance", "2": "Lobby"}``
+        """
+        locations = {}
+        if not slots:
+            return locations
+        for v in slots.values():
+            if v is None:
+                continue
+            if isinstance(v, dict):
+                src = v.get("source")
+                name = v.get("name")
+                if src:
+                    locations[str(src)] = str(name or f"Camera {src}")
+        return locations
 
     def _start_grid_mode(self):
         sources = self._parse_grid_sources(self.cam_index)
@@ -1135,9 +1205,10 @@ class FaceEngine:
         last_encode_t = 0.0
         stale_secs = 1.6
         unknown_stale_secs = max(0.8, self.detect_every * 1.0)
-        # Unknown tracks must be periodically reconfirmed by detector; tracker-only
-        # unknown boxes are aggressively expired to avoid ghost boxes.
+        # Tracks must be periodically reconfirmed by the face detector;
+        # tracker-only boxes drift and create ghost boxes when person leaves.
         unknown_reconfirm_secs = max(1.2, self.detect_every * 2.8)
+        known_reconfirm_secs = max(3.0, self.detect_every * 5.0)
 
         while not self.stop_evt.is_set() and not self._grid_stop_evt.is_set():
             now = time.monotonic()
@@ -1210,8 +1281,9 @@ class FaceEngine:
                 ]
                 updated_tracks = [
                     t for t in updated_tracks
-                    if (t.get("name") != "unknown")
-                    or ((now - float(t.get("last_detect_t", 0.0))) <= unknown_reconfirm_secs)
+                    if (now - float(t.get("last_detect_t", 0.0))) <= (
+                        unknown_reconfirm_secs if t.get("name") == "unknown" else known_reconfirm_secs
+                    )
                 ]
                 updated_tracks = self._dedupe_tracks(updated_tracks)
                 unknown_seen = 0
@@ -1280,6 +1352,23 @@ class FaceEngine:
                     2,
                 )
                 cv2.rectangle(tile, (0, 0), (tile_w - 1, tile_h - 1), (80, 80, 80), 1)
+
+                # Buffer annotated tile snapshot for each known person on this camera.
+                # app.py consumes these when opening a new visit.
+                known_on_tile = [
+                    t.get("name") for t in updated_tracks
+                    if t.get("name") and t.get("name") != "unknown"
+                ]
+                if known_on_tile:
+                    ok_snap, snap_buf = cv2.imencode(
+                        ".jpg", tile, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+                    )
+                    if ok_snap:
+                        snap_bytes = snap_buf.tobytes()
+                        with self._snapshot_lock:
+                            for pname in known_on_tile:
+                                self._snapshot_buf[(pname, str(source))] = snap_bytes
+
                 canvas[oy:oy + tile_h, ox:ox + tile_w] = tile
 
             # QR scan round-robin (skip None/empty slots)
@@ -1500,6 +1589,22 @@ class FaceEngine:
 
                 label = "unknown" if is_unknown else f"{t['name']} ({t['best']:.2f})"
                 cv2.putText(frame, label, (x, max(0, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2,)
+
+            # 4b) buffer snapshot for each known person (single-camera mode)
+            known_on_frame = [
+                t["name"] for t in self.tracks
+                if t.get("name") and t["name"] != "unknown"
+            ]
+            if known_on_frame:
+                ok_snap, snap_buf = cv2.imencode(
+                    ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+                )
+                if ok_snap:
+                    snap_bytes = snap_buf.tobytes()
+                    cam_src = str(self.cam_index)
+                    with self._snapshot_lock:
+                        for pname in known_on_frame:
+                            self._snapshot_buf[(pname, cam_src)] = snap_bytes
 
             # 5) encode at limited FPS
             if now - last_encode_t >= (1.0 / max(1, self.out_fps)):

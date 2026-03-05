@@ -21,6 +21,12 @@
 
           <div class="flex gap-2">
             <a
+              href="/history"
+              class="rounded-lg bg-slate-800 hover:bg-slate-700 px-3 py-2 text-sm"
+            >
+              History
+            </a>
+            <a
               href="/test"
               class="rounded-lg bg-slate-800 hover:bg-slate-700 px-3 py-2 text-sm"
             >
@@ -577,6 +583,18 @@
         }
       }
 
+      // Helper: get the camera source from a slot value (object or null)
+      function slotSource(slot) {
+        if (!slot) return "";
+        if (typeof slot === "object") return slot.source || "";
+        return String(slot);
+      }
+      function slotName(slot) {
+        if (!slot) return "";
+        if (typeof slot === "object") return slot.name || "";
+        return "";
+      }
+
       function renderGridSlots() {
         if (!gridSlotsContainer) return;
         const [rows, cols] = gridCurrentLayout;
@@ -586,44 +604,67 @@
         gridSlotsContainer.innerHTML = "";
 
         for (let i = 0; i < totalSlots; i++) {
-          const currentVal = gridSlots[String(i)] || "";
+          const slotVal = gridSlots[String(i)];
+          const currentSource = slotSource(slotVal);
+          const currentName = slotName(slotVal);
 
           const cell = document.createElement("div");
           cell.className =
-            "rounded-lg border border-slate-700 bg-slate-950 p-2";
+            "rounded-lg border border-slate-700 bg-slate-950 p-2 space-y-1";
 
           const label = document.createElement("div");
           label.className = "text-xs text-slate-400 mb-1";
           label.textContent = `Slot ${i + 1}`;
           cell.appendChild(label);
 
+          // Camera select
           const select = document.createElement("select");
           select.className =
             "w-full rounded bg-slate-900 border border-slate-700 px-2 py-1 text-xs";
           select.dataset.slot = String(i);
 
-          // Empty option
           let html = `<option value="">Empty</option>`;
-
-          // Camera options — flag cameras already assigned to another slot
           gridAvailableCameras.forEach((cam) => {
             const usedElsewhere = Object.entries(gridSlots).some(
-              ([k, v]) => k !== String(i) && v === cam.value,
+              ([k, v]) => k !== String(i) && slotSource(v) === cam.value,
             );
-            const selected = currentVal === cam.value ? "selected" : "";
+            const selected = currentSource === cam.value ? "selected" : "";
             const disabled = usedElsewhere && !selected ? "disabled" : "";
             html += `<option value="${cam.value}" ${selected} ${disabled}>${cam.label}${usedElsewhere && !selected ? " (in use)" : ""}</option>`;
           });
-
           select.innerHTML = html;
           select.addEventListener("change", (e) => {
             const slot = e.target.dataset.slot;
             const val = e.target.value;
-            gridSlots[slot] = val || null;
-            renderGridSlots(); // re-render to update "in use" markers
+            if (val) {
+              const existing = gridSlots[slot];
+              gridSlots[slot] = { source: val, name: slotName(existing) || `Camera ${val}` };
+            } else {
+              gridSlots[slot] = null;
+            }
+            renderGridSlots();
           });
-
           cell.appendChild(select);
+
+          // Location name input (only shown if a camera is selected)
+          if (currentSource) {
+            const nameInput = document.createElement("input");
+            nameInput.type = "text";
+            nameInput.placeholder = "Location name";
+            nameInput.value = currentName;
+            nameInput.className =
+              "w-full rounded bg-slate-900 border border-slate-700 px-2 py-1 text-xs mt-1";
+            nameInput.dataset.slot = String(i);
+            nameInput.addEventListener("input", (e) => {
+              const slot = e.target.dataset.slot;
+              const existing = gridSlots[slot];
+              if (existing && typeof existing === "object") {
+                existing.name = e.target.value;
+              }
+            });
+            cell.appendChild(nameInput);
+          }
+
           gridSlotsContainer.appendChild(cell);
         }
       }
@@ -651,13 +692,15 @@
 
       if (applyGridBtn) {
         applyGridBtn.addEventListener("click", async () => {
-          // Client-side duplicate check
-          const assigned = Object.values(gridSlots).filter((v) => v != null && v !== "");
+          // Client-side duplicate check (compare source values)
+          const sources = Object.values(gridSlots)
+            .map((v) => slotSource(v))
+            .filter((s) => s);
           const seen = new Set();
           const dupes = new Set();
-          assigned.forEach((v) => {
-            if (seen.has(v)) dupes.add(v);
-            seen.add(v);
+          sources.forEach((s) => {
+            if (seen.has(s)) dupes.add(s);
+            seen.add(s);
           });
           if (dupes.size > 0) {
             if (gridMsg)

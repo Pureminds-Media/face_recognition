@@ -69,6 +69,7 @@ Pygments==2.19.2
 pyparsing==3.3.2
 PySocks==1.7.1
 python-dateutil==2.9.0.post0
+psycopg2-binary==2.9.10
 python-dotenv==1.2.1
 requests==2.32.5
 retina-face==0.0.17

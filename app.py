@@ -1,16 +1,24 @@
 import os
+import atexit
 import time
 import re
 import json
 import glob
 import uuid
+import logging
 import mimetypes
 import subprocess
+from datetime import datetime, date, timezone, timedelta
 from queue import Queue, Empty, Full
 from flask import Flask, Response, render_template, request, jsonify, send_from_directory, stream_with_context
 from werkzeug.utils import secure_filename
 import threading
+from dotenv import load_dotenv
 from face_engine import FaceEngine, AVAILABLE_LAYOUTS
+import db
+
+load_dotenv()
+log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -18,7 +26,10 @@ ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 FACES_DIR = "faces"
 TEST_UPLOAD_DIR = os.path.join("test_runs", "uploads")
 TEST_OUTPUT_DIR = os.path.join("test_runs", "outputs")
+SCREENSHOTS_DIR = "screenshots"
 ALLOWED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+
+os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 
 engine = FaceEngine(
     known_dir=FACES_DIR,
@@ -55,6 +66,9 @@ ATTENDANCE_LOOP_SECS = 0.3
 ATTENDANCE_DISAPPEAR_SECS = 2.0
 UNKNOWN_PROMPT_SECS = 10.0
 UNKNOWN_RESET_GRACE_SECS = 1.5
+VISIT_TIMEOUT_MINUTES = int(os.getenv("VISIT_TIMEOUT_MINUTES", "10"))
+VISIT_STALE_CHECK_SECS = 30.0  # how often to check for stale visits
+VISIT_TRANSITION_SECS = 8.0    # person must disappear from current camera for this long before transitioning to a new location
 qr_prompt_state = {
     "unknown_first_mono": None,
     "unknown_last_seen_mono": None,
@@ -63,6 +77,39 @@ qr_prompt_state = {
 test_jobs_lock = threading.Lock()
 test_job_run_lock = threading.Lock()
 test_jobs = {}  # job_id -> {status, progress, error, result_url, ...}
+
+# --- Database init ---
+db.init_db()
+_current_session_id = None
+if db.is_available():
+    _current_session_id = db.create_session(
+        camera_source=str(engine.cam_index) if engine.cam_index is not None else None
+    )
+    # Sync locations from grid config
+    _saved_grid = FaceEngine.load_grid_config()
+    if _saved_grid and _saved_grid.get("slots"):
+        for _src, _name in FaceEngine.get_slot_locations(_saved_grid["slots"]).items():
+            db.upsert_location(_src, _name)
+    # Ensure single-camera source has a location too
+    if not engine._is_grid_mode():
+        _src = str(engine.cam_index)
+        db.upsert_location(_src, f"Camera {_src}")
+
+    log.info("DB session started: %s", _current_session_id)
+
+# In-memory visit tracking state: person_name -> {location_id, visit_id, camera_source}
+_active_visits = {}
+_last_stale_check = time.monotonic()
+
+
+def _shutdown_db():
+    if db.is_available():
+        db.close_all_open_visits()
+        db.end_session(_current_session_id)
+        db.close_db()
+
+atexit.register(_shutdown_db)
+
 
 def _q_put_latest(q, item):
     try:
@@ -190,11 +237,13 @@ def _attendance_loop():
 
 
 def _update_attendance_from_tracks(tracks):
-    """Update attendance_state based on current recognized tracks.
+    """Update attendance_state and DB visits based on current recognized tracks.
 
     - First time a person is seen: mark attended once and emit a 'new' event
     - If person disappears (not seen for ATTENDANCE_DISAPPEAR_SECS) and later reappears: emit a 'repeat' event
+    - DB: open/update/close visits per person per location
     """
+    global _last_stale_check
     now_mono = time.monotonic()
     now_ts = time.time()
     events = []
@@ -203,6 +252,10 @@ def _update_attendance_from_tracks(tracks):
         name = (t or {}).get("name")
         if not name or name == "unknown":
             continue
+
+        # Determine camera source for this track
+        camera_source = str((t or {}).get("camera_source", engine.cam_index))
+        confidence = (t or {}).get("best")
 
         s = attendance_state.get(name)
         if s is None:
@@ -220,12 +273,103 @@ def _update_attendance_from_tracks(tracks):
                 events.append({"type": "repeat", "name": name})
             s["last_seen_mono"] = now_mono
 
+        # --- DB visit tracking ---
+        if db.is_available():
+            _update_visit_for_person(name, camera_source, confidence)
+
     # Mark disappeared after a grace period (avoid flicker)
     for name, s in list(attendance_state.items()):
         if s.get("present", False) and (now_mono - s.get("last_seen_mono", now_mono)) > ATTENDANCE_DISAPPEAR_SECS:
             s["present"] = False
 
+    # Periodically close stale visits in DB
+    if db.is_available() and (now_mono - _last_stale_check) >= VISIT_STALE_CHECK_SECS:
+        _last_stale_check = now_mono
+        closed = db.close_stale_visits(VISIT_TIMEOUT_MINUTES)
+        if closed:
+            # Remove from in-memory tracking
+            for name in list(_active_visits.keys()):
+                v = _active_visits[name]
+                if v.get("visit_id"):
+                    # Check if this visit was closed
+                    open_v = db.get_open_visit(name, v["location_id"])
+                    if open_v is None:
+                        del _active_visits[name]
+
     return events
+
+
+def _save_visit_screenshot(visit_id, person_name, camera_source):
+    """Grab the buffered snapshot from the engine and save it for a visit."""
+    try:
+        snap = engine.get_snapshot(person_name, camera_source)
+        if snap is None:
+            return
+        fname = f"visit_{visit_id}.jpg"
+        fpath = os.path.join(SCREENSHOTS_DIR, fname)
+        with open(fpath, "wb") as f:
+            f.write(snap)
+        db.update_visit_screenshot(visit_id, fname)
+    except Exception as e:
+        log.debug("Failed to save visit screenshot: %s", e)
+
+
+def _update_visit_for_person(name, camera_source, confidence=None):
+    """Open, update, or transition a visit for a person at a camera/location.
+
+    Flip-flop prevention: when a person appears on a *different* camera than
+    their current active visit, we do NOT immediately transition.  Instead we
+    check how recently they were seen on the *original* camera:
+
+      - If within VISIT_TRANSITION_SECS (8 s): they are likely in an overlap
+        zone — keep the existing visit, just refresh its DB timestamp.
+      - If older than VISIT_TRANSITION_SECS: they have genuinely left the
+        original camera — close old visit, open new one at the new location.
+    """
+    now_mono = time.monotonic()
+
+    loc = db.get_location_by_source(camera_source)
+    if loc is None:
+        # Auto-create location for unknown camera sources
+        loc_id = db.upsert_location(camera_source, f"Camera {camera_source}")
+        loc = {"id": loc_id, "camera_source": camera_source, "name": f"Camera {camera_source}"}
+    loc_id = loc["id"]
+
+    active = _active_visits.get(name)
+
+    if active is None:
+        # No active visit — open a new one
+        vid = db.open_visit(name, loc_id, confidence=confidence, session_id=_current_session_id)
+        _active_visits[name] = {
+            "location_id": loc_id,
+            "visit_id": vid,
+            "camera_source": camera_source,
+            "last_seen_mono": now_mono,
+        }
+        _save_visit_screenshot(vid, name, camera_source)
+    elif active["location_id"] == loc_id:
+        # Same location — update last_seen in DB and refresh monotonic clock
+        db.update_visit_seen(active["visit_id"], confidence=confidence)
+        active["last_seen_mono"] = now_mono
+    else:
+        # Different location — check whether person has left original camera
+        elapsed = now_mono - active.get("last_seen_mono", 0)
+        if elapsed < VISIT_TRANSITION_SECS:
+            # Still recently seen on original camera (overlap zone) — do NOT
+            # transition; just keep the existing visit alive.
+            db.update_visit_seen(active["visit_id"], confidence=confidence)
+        else:
+            # Person has been absent from original camera long enough —
+            # genuine transition: close old visit, open new one.
+            db.close_visit(active["visit_id"])
+            vid = db.open_visit(name, loc_id, confidence=confidence, session_id=_current_session_id)
+            _active_visits[name] = {
+                "location_id": loc_id,
+                "visit_id": vid,
+                "camera_source": camera_source,
+                "last_seen_mono": now_mono,
+            }
+            _save_visit_screenshot(vid, name, camera_source)
 
 def _mark_all_absent():
     now_mono = time.monotonic()
@@ -706,6 +850,11 @@ def faces_file(person, filename):
     # serve actual file
     return send_from_directory(os.path.join(FACES_DIR, person), filename)
 
+@app.route("/screenshots/<path:filename>")
+def screenshot_file(filename):
+    """Serve visit screenshot images."""
+    return send_from_directory(SCREENSHOTS_DIR, filename)
+
 @app.route("/api/status")
 def api_status():
     return jsonify({
@@ -827,7 +976,7 @@ def api_grid_config_get():
         if engine._is_grid_mode():
             sources = FaceEngine._parse_grid_sources(engine.cam_index)
             for i, src in enumerate(sources[:max_slots]):
-                slots[str(i)] = str(src) if src is not None else None
+                slots[str(i)] = FaceEngine._normalize_slot(src)
         # Pad remaining slots
         for i in range(max_slots):
             if str(i) not in slots:
@@ -868,17 +1017,15 @@ def api_grid_config_set():
         return jsonify({"ok": False, "error": str(e)}), 400
 
     max_slots = rows * cols
-    # Validate and clean slots
+    # Validate and clean slots (new format: {source, name} objects)
     clean_slots = {}
     for i in range(max_slots):
         val = slots.get(str(i))
-        if val is not None and str(val).strip():
-            clean_slots[str(i)] = str(val).strip()
-        else:
-            clean_slots[str(i)] = None
+        normalized = FaceEngine._normalize_slot(val)
+        clean_slots[str(i)] = normalized
 
-    # Reject duplicate camera assignments
-    assigned = [v for v in clean_slots.values() if v is not None]
+    # Reject duplicate camera assignments (compare source values)
+    assigned = [v["source"] for v in clean_slots.values() if v is not None]
     dupes = [v for v in assigned if assigned.count(v) > 1]
     if dupes:
         seen = set(dupes)
@@ -892,6 +1039,11 @@ def api_grid_config_set():
         FaceEngine.save_grid_config((rows, cols), clean_slots)
     except Exception as e:
         return jsonify({"ok": False, "error": f"failed to save config: {e}"}), 500
+
+    # Sync locations to DB
+    if db.is_available():
+        for src, name in FaceEngine.get_slot_locations(clean_slots).items():
+            db.upsert_location(src, name)
 
     # Build cam_index and restart
     cam_index = FaceEngine.build_grid_cam_index(clean_slots)
@@ -921,6 +1073,201 @@ def api_grid_config_set():
         "slots": clean_slots,
         "camera_source": _camera_source_to_text(engine.cam_index),
     })
+
+
+# ---------------------------------------------------------------------------
+# History / report endpoints
+# ---------------------------------------------------------------------------
+
+@app.route("/history")
+def history_page():
+    return render_template("history.html")
+
+
+def _to_dt(val):
+    """Convert a value to datetime — handles both datetime objects and ISO strings."""
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, str):
+        return datetime.fromisoformat(val)
+    return val
+
+
+def _serialize_visit(v):
+    """Convert a visit row (dict) to a JSON-safe dict with duration."""
+    first = _to_dt(v["first_seen"])
+    last = _to_dt(v["last_seen"])
+    duration_secs = (last - first).total_seconds() if first and last else 0
+    return {
+        "id": v.get("id"),
+        "person_name": v.get("person_name", ""),
+        "location_name": v.get("location_name", ""),
+        "camera_source": v.get("camera_source", ""),
+        "first_seen": first.isoformat() if first else None,
+        "last_seen": last.isoformat() if last else None,
+        "duration_secs": round(duration_secs, 1),
+        "duration_fmt": _fmt_duration(duration_secs),
+        "ended": bool(v.get("ended", False)),
+        "confidence": round(float(v["confidence"]), 3) if v.get("confidence") else None,
+        "screenshot_url": f"/screenshots/{v['screenshot']}" if v.get("screenshot") else None,
+    }
+
+
+def _fmt_duration(secs):
+    """Format seconds into 'Xh Ym' or 'Xm Ys'."""
+    secs = max(0, int(secs))
+    if secs < 60:
+        return f"{secs}s"
+    mins = secs // 60
+    rem_secs = secs % 60
+    if mins < 60:
+        return f"{mins}m {rem_secs}s"
+    hours = mins // 60
+    rem_mins = mins % 60
+    return f"{hours}h {rem_mins}m"
+
+
+@app.route("/api/history/daily")
+def api_history_daily():
+    """Daily summary. Query param: ?date=YYYY-MM-DD (defaults to today)."""
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+    date_str = request.args.get("date")
+    try:
+        day = datetime.strptime(date_str, "%Y-%m-%d").date() if date_str else date.today()
+    except ValueError:
+        return jsonify({"ok": False, "error": "invalid date format, use YYYY-MM-DD"}), 400
+
+    visits = db.get_daily_summary(day)
+    rows = [_serialize_visit(v) for v in visits]
+
+    # Group by person for the summary
+    person_totals = {}
+    for r in rows:
+        name = r["person_name"]
+        if name not in person_totals:
+            person_totals[name] = 0.0
+        person_totals[name] += r["duration_secs"]
+
+    return jsonify({
+        "ok": True,
+        "date": day.isoformat(),
+        "visits": rows,
+        "person_totals": {k: {"total_secs": v, "total_fmt": _fmt_duration(v)} for k, v in person_totals.items()},
+    })
+
+
+@app.route("/api/history/person/<name>")
+def api_history_person(name):
+    """All visits for a person. Query params: ?from=YYYY-MM-DD&to=YYYY-MM-DD"""
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+    date_from = request.args.get("from")
+    date_to = request.args.get("to")
+    try:
+        df = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc) if date_from else None
+        dt = (datetime.strptime(date_to, "%Y-%m-%d") + timedelta(days=1)).replace(tzinfo=timezone.utc) if date_to else None
+    except ValueError:
+        return jsonify({"ok": False, "error": "invalid date format"}), 400
+
+    visits = db.get_person_visits(name, date_from=df, date_to=dt)
+    rows = [_serialize_visit(v) for v in visits]
+    total_secs = sum(r["duration_secs"] for r in rows)
+    return jsonify({
+        "ok": True,
+        "person_name": name,
+        "visits": rows,
+        "total_secs": round(total_secs, 1),
+        "total_fmt": _fmt_duration(total_secs),
+    })
+
+
+@app.route("/api/history/location/<int:location_id>")
+def api_history_location(location_id):
+    """All visits at a location. Query params: ?from=YYYY-MM-DD&to=YYYY-MM-DD"""
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+    date_from = request.args.get("from")
+    date_to = request.args.get("to")
+    try:
+        df = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc) if date_from else None
+        dt = (datetime.strptime(date_to, "%Y-%m-%d") + timedelta(days=1)).replace(tzinfo=timezone.utc) if date_to else None
+    except ValueError:
+        return jsonify({"ok": False, "error": "invalid date format"}), 400
+
+    visits = db.get_location_visits(location_id, date_from=df, date_to=dt)
+    rows = [_serialize_visit(v) for v in visits]
+    return jsonify({"ok": True, "location_id": location_id, "visits": rows})
+
+
+@app.route("/api/history/locations")
+def api_history_locations():
+    """List all known locations."""
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+    locs = db.get_locations()
+    return jsonify({"ok": True, "locations": locs})
+
+
+@app.route("/api/history/persons")
+def api_history_persons():
+    """List all known person names with visits."""
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+    return jsonify({"ok": True, "persons": db.get_known_persons()})
+
+
+@app.route("/api/history/sessions")
+def api_history_sessions():
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+    sessions = db.get_sessions()
+    rows = []
+    for s in sessions:
+        started = s["started_at"]
+        ended = s["ended_at"]
+        # Handle both datetime objects (Postgres) and ISO strings (SQLite)
+        if isinstance(started, str):
+            started_dt = datetime.fromisoformat(started) if started else None
+        else:
+            started_dt = started
+        if isinstance(ended, str):
+            ended_dt = datetime.fromisoformat(ended) if ended else None
+        else:
+            ended_dt = ended
+        duration = (ended_dt - started_dt).total_seconds() if started_dt and ended_dt else None
+        rows.append({
+            "id": str(s["id"]),
+            "started_at": started_dt.isoformat() if started_dt else None,
+            "ended_at": ended_dt.isoformat() if ended_dt else None,
+            "duration_fmt": _fmt_duration(duration) if duration else "running",
+            "camera_source": s.get("camera_source") if isinstance(s, dict) else None,
+        })
+    return jsonify({"ok": True, "sessions": rows})
+
+
+@app.route("/api/history/clear", methods=["POST"])
+def api_history_clear():
+    """Delete all visits and sessions, reset in-memory tracking state."""
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+    global _current_session_id
+    visit_count = db.clear_all_data()
+    _active_visits.clear()
+    attendance_state.clear()
+    # Clear screenshot files
+    for f in os.listdir(SCREENSHOTS_DIR):
+        try:
+            os.remove(os.path.join(SCREENSHOTS_DIR, f))
+        except Exception:
+            pass
+    # Start a fresh session
+    _current_session_id = db.create_session(
+        camera_source=str(engine.cam_index) if engine.cam_index is not None else None
+    )
+    return jsonify({"ok": True, "deleted_visits": visit_count})
 
 
 @app.route("/api/start", methods=["POST"])

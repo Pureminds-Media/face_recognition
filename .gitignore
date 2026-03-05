@@ -189,3 +189,12 @@ cython_debug/
 
 # Grid config (machine-specific camera assignments)
 grid_config.json
+
+# SQLite database
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+
+# Visit screenshots
+screenshots/
