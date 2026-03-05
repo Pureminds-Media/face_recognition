@@ -10,7 +10,7 @@ from queue import Queue, Empty, Full
 from flask import Flask, Response, render_template, request, jsonify, send_from_directory, stream_with_context
 from werkzeug.utils import secure_filename
 import threading
-from face_engine import FaceEngine
+from face_engine import FaceEngine, AVAILABLE_LAYOUTS
 
 app = Flask(__name__)
 
@@ -33,6 +33,14 @@ engine = FaceEngine(
     out_fps=15,
     jpeg_quality=80,
 )
+
+# Load saved grid config (if any) before starting
+_saved_grid = FaceEngine.load_grid_config()
+if _saved_grid is not None:
+    try:
+        engine.set_grid_layout(*_saved_grid["layout"])
+    except ValueError:
+        pass  # invalid layout in config, keep default
 
 # Start engine once (avoid double-start in debug reloader)
 engine.start()
@@ -413,7 +421,8 @@ def _camera_source_to_text(source):
         return ""
     text = str(source)
     if text.startswith("grid:"):
-        return "grid_3x2"
+        rows, cols = engine._grid_layout
+        return f"grid_{rows}x{cols}"
     return text
 
 
@@ -481,14 +490,16 @@ def _list_camera_devices():
         )
 
     if devices:
-        devices.insert(
-            0,
-            {
-                "value": "grid_3x2",
-                "label": "3x2 Grid (up to 6 cameras)",
-                "path": "",
-            },
-        )
+        # Insert grid options for each supported layout
+        for idx, (r, c) in enumerate(reversed(AVAILABLE_LAYOUTS)):
+            devices.insert(
+                0,
+                {
+                    "value": f"grid_{r}x{c}",
+                    "label": f"{r}x{c} Grid ({r * c} slots)",
+                    "path": "",
+                },
+            )
     return devices
 
 
@@ -724,15 +735,31 @@ def api_camera_set():
         return jsonify({"ok": False, "error": "source is required"}), 400
 
     restart = bool(payload.get("restart", True))
-    if source_text == "grid_3x2":
-        numeric_sources = []
-        for d in _list_camera_devices():
-            val = str(d.get("value", "")).strip()
-            if re.fullmatch(r"\d+", val):
-                numeric_sources.append(val)
-        if not numeric_sources:
-            return jsonify({"ok": False, "error": "no camera devices found for grid mode"}), 400
-        new_source = "grid:" + ",".join(numeric_sources[:6])
+
+    # Match grid_RxC patterns (e.g. grid_3x2, grid_4x4)
+    grid_match = re.fullmatch(r"grid_(\d+)x(\d+)", source_text)
+    if grid_match:
+        rows, cols = int(grid_match.group(1)), int(grid_match.group(2))
+        try:
+            engine.set_grid_layout(rows, cols)
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
+
+        # Check if we have a saved grid config for this layout
+        saved = FaceEngine.load_grid_config()
+        if saved and tuple(saved["layout"]) == (rows, cols):
+            new_source = saved["cam_index"]
+        else:
+            # Auto-fill: discover devices and fill slots sequentially
+            numeric_sources = []
+            for d in _list_camera_devices():
+                val = str(d.get("value", "")).strip()
+                if re.fullmatch(r"\d+", val):
+                    numeric_sources.append(val)
+            if not numeric_sources:
+                return jsonify({"ok": False, "error": "no camera devices found for grid mode"}), 400
+            max_slots = rows * cols
+            new_source = "grid:" + ",".join(numeric_sources[:max_slots])
     else:
         new_source = int(source_text) if re.fullmatch(r"\d+", source_text) else source_text
 
@@ -783,6 +810,118 @@ def api_camera_set():
             "devices": _list_camera_devices(),
         }
     )
+
+@app.route("/api/grid/config", methods=["GET"])
+def api_grid_config_get():
+    """Return current grid layout, slot assignments, and available options."""
+    saved = FaceEngine.load_grid_config()
+    rows, cols = engine._grid_layout
+    max_slots = rows * cols
+
+    # Build current slots from saved config or from the live cam_index
+    if saved and tuple(saved["layout"]) == (rows, cols):
+        slots = saved["slots"]
+    else:
+        # Derive from current cam_index if in grid mode
+        slots = {}
+        if engine._is_grid_mode():
+            sources = FaceEngine._parse_grid_sources(engine.cam_index)
+            for i, src in enumerate(sources[:max_slots]):
+                slots[str(i)] = str(src) if src is not None else None
+        # Pad remaining slots
+        for i in range(max_slots):
+            if str(i) not in slots:
+                slots[str(i)] = None
+
+    # Available cameras (exclude grid options)
+    cameras = []
+    for d in _list_camera_devices():
+        val = str(d.get("value", "")).strip()
+        if val.startswith("grid_"):
+            continue
+        cameras.append({"value": val, "label": d.get("label", val)})
+
+    return jsonify({
+        "layout": [rows, cols],
+        "slots": slots,
+        "available_layouts": [[r, c] for r, c in AVAILABLE_LAYOUTS],
+        "available_cameras": cameras,
+    })
+
+
+@app.route("/api/grid/config", methods=["POST"])
+def api_grid_config_set():
+    """Set grid layout and slot assignments, save to disk, and restart."""
+    payload = request.get_json(silent=True) or {}
+    layout = payload.get("layout")
+    slots = payload.get("slots")
+
+    if not layout or not isinstance(layout, (list, tuple)) or len(layout) != 2:
+        return jsonify({"ok": False, "error": "layout must be [rows, cols]"}), 400
+    if not isinstance(slots, dict):
+        return jsonify({"ok": False, "error": "slots must be an object"}), 400
+
+    rows, cols = int(layout[0]), int(layout[1])
+    try:
+        engine.set_grid_layout(rows, cols)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+    max_slots = rows * cols
+    # Validate and clean slots
+    clean_slots = {}
+    for i in range(max_slots):
+        val = slots.get(str(i))
+        if val is not None and str(val).strip():
+            clean_slots[str(i)] = str(val).strip()
+        else:
+            clean_slots[str(i)] = None
+
+    # Reject duplicate camera assignments
+    assigned = [v for v in clean_slots.values() if v is not None]
+    dupes = [v for v in assigned if assigned.count(v) > 1]
+    if dupes:
+        seen = set(dupes)
+        return jsonify({
+            "ok": False,
+            "error": f"Each camera can only be assigned to one slot. Duplicates: {', '.join(sorted(seen))}",
+        }), 400
+
+    # Save to disk
+    try:
+        FaceEngine.save_grid_config((rows, cols), clean_slots)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"failed to save config: {e}"}), 500
+
+    # Build cam_index and restart
+    cam_index = FaceEngine.build_grid_cam_index(clean_slots)
+
+    with state_lock:
+        was_running = engine.is_running()
+        if was_running:
+            engine.stop()
+        engine.cam_index = cam_index
+        if was_running:
+            try:
+                engine.start()
+            except Exception as e:
+                return jsonify({
+                    "ok": False,
+                    "error": f"failed to start with new grid config: {e}",
+                    "running": engine.is_running(),
+                }), 500
+
+    with attendance_lock:
+        _mark_all_absent()
+
+    return jsonify({
+        "ok": True,
+        "running": engine.is_running(),
+        "layout": [rows, cols],
+        "slots": clean_slots,
+        "camera_source": _camera_source_to_text(engine.cam_index),
+    })
+
 
 @app.route("/api/start", methods=["POST"])
 def api_start():

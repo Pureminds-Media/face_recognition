@@ -1,10 +1,14 @@
 import os
+import json
 import time
 import threading
 from queue import Queue, Empty, Full
 import cv2
 import numpy as np
 from deepface import DeepFace
+
+GRID_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grid_config.json")
+AVAILABLE_LAYOUTS = [(2, 2), (3, 2), (2, 3), (3, 3), (4, 4)]
 
 
 def l2norm(v):
@@ -95,7 +99,7 @@ class FaceEngine:
         self._grid_sources = []
         self._grid_stop_evt = threading.Event()
         self._grid_render_t = None
-        self._grid_layout = (3, 2)  # rows, cols
+        self._grid_layout = (3, 2)  # rows, cols  (may be overridden by load_grid_config)
         self._grid_qr_rr_idx = 0
         self._worker_t = None
         self._main_t = None
@@ -663,6 +667,14 @@ class FaceEngine:
 
     @staticmethod
     def _parse_grid_sources(cam_index):
+        """Parse ``cam_index`` string into an ordered list of sources.
+
+        Supports empty slots encoded as empty tokens between commas::
+
+            "grid:0,,2,4,1,"  ->  [0, None, 2, 4, 1, None]
+
+        ``None`` entries represent deliberately empty grid slots.
+        """
         if not (isinstance(cam_index, str) and cam_index.startswith("grid:")):
             return []
         raw = cam_index.split(":", 1)[1].strip()
@@ -673,12 +685,101 @@ class FaceEngine:
         for token in raw.split(","):
             t = token.strip()
             if not t:
-                continue
-            if t.isdigit():
+                out.append(None)  # empty slot
+            elif t.isdigit():
                 out.append(int(t))
             else:
                 out.append(t)
         return out
+
+    # ---------- grid config persistence ----------
+
+    def set_grid_layout(self, rows, cols):
+        """Validate and set the grid layout (rows, cols)."""
+        rows, cols = int(rows), int(cols)
+        if (rows, cols) not in AVAILABLE_LAYOUTS:
+            raise ValueError(
+                f"Unsupported grid layout ({rows}, {cols}). "
+                f"Supported: {AVAILABLE_LAYOUTS}"
+            )
+        self._grid_layout = (rows, cols)
+
+    @staticmethod
+    def save_grid_config(layout, slots, path=None):
+        """Persist grid configuration to JSON.
+
+        Parameters
+        ----------
+        layout : tuple[int, int]
+            (rows, cols)
+        slots : dict[str, str | None]
+            Mapping of slot index (as str) to camera source (str) or None.
+        path : str | None
+            File path; defaults to ``GRID_CONFIG_PATH``.
+        """
+        path = path or GRID_CONFIG_PATH
+        data = {
+            "layout": list(layout),
+            "slots": {str(k): v for k, v in slots.items()},
+        }
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    @staticmethod
+    def load_grid_config(path=None):
+        """Load grid configuration from JSON.
+
+        Returns
+        -------
+        dict | None
+            ``{"layout": (rows, cols), "slots": {str: str|None}, "cam_index": str}``
+            or ``None`` if the file does not exist or is invalid.
+        """
+        path = path or GRID_CONFIG_PATH
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            layout = tuple(data.get("layout", [3, 2]))
+            if len(layout) != 2:
+                return None
+            layout = (int(layout[0]), int(layout[1]))
+            slots = data.get("slots", {})
+
+            # Build cam_index string from slots dict
+            max_slot = max((int(k) for k in slots), default=-1)
+            parts = []
+            for i in range(max_slot + 1):
+                val = slots.get(str(i))
+                parts.append(str(val) if val is not None else "")
+            cam_index = "grid:" + ",".join(parts)
+            return {"layout": layout, "slots": slots, "cam_index": cam_index}
+        except Exception:
+            return None
+
+    @staticmethod
+    def build_grid_cam_index(slots):
+        """Build a ``grid:...`` cam_index string from a slots dict.
+
+        Parameters
+        ----------
+        slots : dict[str, str | None]
+            Slot index -> camera source.
+
+        Returns
+        -------
+        str
+            e.g. ``"grid:0,,2,4,1,"``
+        """
+        if not slots:
+            return "grid:"
+        max_slot = max((int(k) for k in slots), default=-1)
+        parts = []
+        for i in range(max_slot + 1):
+            val = slots.get(str(i))
+            parts.append(str(val) if val is not None else "")
+        return "grid:" + ",".join(parts)
 
     def _start_grid_mode(self):
         sources = self._parse_grid_sources(self.cam_index)
@@ -686,21 +787,35 @@ class FaceEngine:
             raise RuntimeError("No camera sources configured for grid mode")
 
         rows, cols = self._grid_layout
+        max_slots = rows * cols
         tile_w = max(1, int(self.width // cols))
         tile_h = max(1, int(self.height // rows))
-        max_slots = 6
         workers = {}
+        # Ordered list with None entries preserved so each slot index
+        # maps directly to a grid position.
         ordered_sources = []
         self._grid_stop_evt.clear()
         self._grid_qr_rr_idx = 0
 
         for source in sources[:max_slots]:
+            # None means an intentionally empty slot — no worker needed
+            if source is None:
+                ordered_sources.append(None)
+                continue
+
+            # Skip duplicate sources — a camera can only be opened once
+            src_key = str(source)
+            if src_key in workers:
+                ordered_sources.append(None)
+                continue
+
             cap = cv2.VideoCapture(source)
             if not cap.isOpened():
                 try:
                     cap.release()
                 except Exception:
                     pass
+                ordered_sources.append(None)  # treat as empty if can't open
                 continue
 
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, tile_w)
@@ -739,8 +854,8 @@ class FaceEngine:
                 args=(worker,),
                 daemon=True,
             )
-            workers[str(source)] = worker
-            ordered_sources.append(str(source))
+            workers[src_key] = worker
+            ordered_sources.append(src_key)
 
         if not workers:
             self._cleanup_grid_mode()
@@ -750,9 +865,12 @@ class FaceEngine:
         self._grid_sources = ordered_sources
 
         for source in self._grid_sources:
-            w = self._grid_workers[source]
-            w["capture_thread"].start()
-            w["detect_thread"].start()
+            if source is None:
+                continue
+            w = self._grid_workers.get(source)
+            if w is not None:
+                w["capture_thread"].start()
+                w["detect_thread"].start()
 
         self._grid_render_t = threading.Thread(target=self._grid_render_loop, daemon=True)
         self._grid_render_t.start()
@@ -1039,6 +1157,12 @@ class FaceEngine:
                     continue
 
                 source = self._grid_sources[slot]
+                # None means intentionally empty slot
+                if source is None:
+                    self._draw_empty_tile(tile)
+                    canvas[oy:oy + tile_h, ox:ox + tile_w] = tile
+                    continue
+
                 worker = self._grid_workers.get(source)
                 if worker is None:
                     self._draw_no_signal_tile(tile, source)
@@ -1158,9 +1282,11 @@ class FaceEngine:
                 cv2.rectangle(tile, (0, 0), (tile_w - 1, tile_h - 1), (80, 80, 80), 1)
                 canvas[oy:oy + tile_h, ox:ox + tile_w] = tile
 
-            if self._grid_sources and (now - self._last_qr_scan_t) >= self.qr_scan_every:
+            # QR scan round-robin (skip None/empty slots)
+            active_sources = [s for s in self._grid_sources if s is not None]
+            if active_sources and (now - self._last_qr_scan_t) >= self.qr_scan_every:
                 self._last_qr_scan_t = now
-                source = self._grid_sources[self._grid_qr_rr_idx % len(self._grid_sources)]
+                source = active_sources[self._grid_qr_rr_idx % len(active_sources)]
                 self._grid_qr_rr_idx += 1
                 worker = self._grid_workers.get(source)
                 if worker is not None:

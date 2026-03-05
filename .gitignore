@@ -186,3 +186,6 @@ cython_debug/
 
 # Ignore .deb
 *.deb
+
+# Grid config (machine-specific camera assignments)
+grid_config.json

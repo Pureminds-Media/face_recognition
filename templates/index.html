@@ -96,6 +96,41 @@
             </div>
           </div>
 
+          <!-- Grid Configurator Panel (shown when a grid mode is selected) -->
+          <div id="gridConfigPanel" class="hidden mt-4">
+            <div
+              class="rounded-xl border border-slate-800 bg-slate-900 overflow-hidden"
+            >
+              <div
+                class="px-4 py-3 border-b border-slate-800 flex items-center justify-between"
+              >
+                <div class="font-medium">Grid Configuration</div>
+                <div class="flex items-center gap-2">
+                  <label class="text-xs text-slate-400">Layout:</label>
+                  <select
+                    id="gridLayoutSelect"
+                    class="rounded-lg bg-slate-950 border border-slate-800 px-2 py-1 text-xs"
+                  ></select>
+                </div>
+              </div>
+              <div class="p-4">
+                <div
+                  id="gridSlotsContainer"
+                  class="grid gap-2"
+                ></div>
+                <div class="mt-3 flex items-center gap-2">
+                  <button
+                    id="applyGridBtn"
+                    class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-4 py-2 text-sm font-medium"
+                  >
+                    Apply Grid
+                  </button>
+                  <div id="gridMsg" class="text-xs text-slate-400"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
           <div class="flex flex-row w-full gap-2 mt-6">
             <!-- Attendace Tracker -->
             <div
@@ -290,6 +325,11 @@
           cameraMsg.textContent = currentSource
             ? `Current source: ${currentSource}`
             : "Current source: (not set)";
+
+        // Show/hide grid panel based on current source
+        if (typeof updateGridPanelVisibility === "function") {
+          updateGridPanelVisibility();
+        }
       }
 
       function renderAttendance(roster) {
@@ -446,9 +486,12 @@
         stopStream(); // close MJPEG immediately client-side
       };
 
-      if (cameraSelect && cameraSourceInput) {
+      if (cameraSelect) {
         cameraSelect.onchange = () => {
-          if (cameraSelect.value) cameraSourceInput.value = cameraSelect.value;
+          if (cameraSourceInput && cameraSelect.value)
+            cameraSourceInput.value = cameraSelect.value;
+          if (typeof updateGridPanelVisibility === "function")
+            updateGridPanelVisibility();
         };
       }
 
@@ -483,6 +526,203 @@
             applyCameraBtn.disabled = false;
           }
         };
+      }
+
+      // --- Grid configurator ---
+      const gridConfigPanel = document.getElementById("gridConfigPanel");
+      const gridLayoutSelect = document.getElementById("gridLayoutSelect");
+      const gridSlotsContainer = document.getElementById("gridSlotsContainer");
+      const applyGridBtn = document.getElementById("applyGridBtn");
+      const gridMsg = document.getElementById("gridMsg");
+
+      let gridAvailableCameras = [];
+      let gridCurrentLayout = [3, 2];
+      let gridSlots = {};
+
+      function isGridSource(val) {
+        return val && /^grid_\d+x\d+$/.test(val);
+      }
+
+      function showGridPanel(show) {
+        if (gridConfigPanel) {
+          gridConfigPanel.classList.toggle("hidden", !show);
+        }
+      }
+
+      async function loadGridConfig() {
+        try {
+          const r = await fetch("/api/grid/config");
+          const j = await r.json();
+          gridAvailableCameras = j.available_cameras || [];
+          gridCurrentLayout = j.layout || [3, 2];
+          gridSlots = j.slots || {};
+
+          // Populate layout selector
+          if (gridLayoutSelect) {
+            const layouts = j.available_layouts || [];
+            gridLayoutSelect.innerHTML = layouts
+              .map(
+                ([r, c]) =>
+                  `<option value="${r}x${c}" ${
+                    r === gridCurrentLayout[0] && c === gridCurrentLayout[1]
+                      ? "selected"
+                      : ""
+                  }>${r}x${c} (${r * c} slots)</option>`,
+              )
+              .join("");
+          }
+          renderGridSlots();
+        } catch (e) {
+          console.error("Failed to load grid config:", e);
+        }
+      }
+
+      function renderGridSlots() {
+        if (!gridSlotsContainer) return;
+        const [rows, cols] = gridCurrentLayout;
+        const totalSlots = rows * cols;
+
+        gridSlotsContainer.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+        gridSlotsContainer.innerHTML = "";
+
+        for (let i = 0; i < totalSlots; i++) {
+          const currentVal = gridSlots[String(i)] || "";
+
+          const cell = document.createElement("div");
+          cell.className =
+            "rounded-lg border border-slate-700 bg-slate-950 p-2";
+
+          const label = document.createElement("div");
+          label.className = "text-xs text-slate-400 mb-1";
+          label.textContent = `Slot ${i + 1}`;
+          cell.appendChild(label);
+
+          const select = document.createElement("select");
+          select.className =
+            "w-full rounded bg-slate-900 border border-slate-700 px-2 py-1 text-xs";
+          select.dataset.slot = String(i);
+
+          // Empty option
+          let html = `<option value="">Empty</option>`;
+
+          // Camera options — flag cameras already assigned to another slot
+          gridAvailableCameras.forEach((cam) => {
+            const usedElsewhere = Object.entries(gridSlots).some(
+              ([k, v]) => k !== String(i) && v === cam.value,
+            );
+            const selected = currentVal === cam.value ? "selected" : "";
+            const disabled = usedElsewhere && !selected ? "disabled" : "";
+            html += `<option value="${cam.value}" ${selected} ${disabled}>${cam.label}${usedElsewhere && !selected ? " (in use)" : ""}</option>`;
+          });
+
+          select.innerHTML = html;
+          select.addEventListener("change", (e) => {
+            const slot = e.target.dataset.slot;
+            const val = e.target.value;
+            gridSlots[slot] = val || null;
+            renderGridSlots(); // re-render to update "in use" markers
+          });
+
+          cell.appendChild(select);
+          gridSlotsContainer.appendChild(cell);
+        }
+      }
+
+      if (gridLayoutSelect) {
+        gridLayoutSelect.addEventListener("change", (e) => {
+          const parts = e.target.value.split("x");
+          const newRows = parseInt(parts[0], 10);
+          const newCols = parseInt(parts[1], 10);
+          const oldTotal = gridCurrentLayout[0] * gridCurrentLayout[1];
+          const newTotal = newRows * newCols;
+
+          gridCurrentLayout = [newRows, newCols];
+
+          // Preserve existing assignments, trim or pad
+          const newSlots = {};
+          for (let i = 0; i < newTotal; i++) {
+            newSlots[String(i)] =
+              i < oldTotal ? gridSlots[String(i)] || null : null;
+          }
+          gridSlots = newSlots;
+          renderGridSlots();
+        });
+      }
+
+      if (applyGridBtn) {
+        applyGridBtn.addEventListener("click", async () => {
+          // Client-side duplicate check
+          const assigned = Object.values(gridSlots).filter((v) => v != null && v !== "");
+          const seen = new Set();
+          const dupes = new Set();
+          assigned.forEach((v) => {
+            if (seen.has(v)) dupes.add(v);
+            seen.add(v);
+          });
+          if (dupes.size > 0) {
+            if (gridMsg)
+              gridMsg.textContent = `Each camera can only be assigned to one slot.`;
+            return;
+          }
+
+          applyGridBtn.disabled = true;
+          if (gridMsg) gridMsg.textContent = "Applying...";
+
+          try {
+            const r = await fetch("/api/grid/config", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                layout: gridCurrentLayout,
+                slots: gridSlots,
+              }),
+            });
+            const j = await r.json();
+            if (!r.ok || !j.ok) {
+              if (gridMsg)
+                gridMsg.textContent = `Error: ${j.error || "unknown error"}`;
+              return;
+            }
+            if (gridMsg) gridMsg.textContent = "Grid applied.";
+            if (cameraMsg)
+              cameraMsg.textContent = `Current source: ${j.camera_source}`;
+            toast("Grid configuration applied", "success");
+            await loadCameraOptions();
+          } catch (e) {
+            if (gridMsg) gridMsg.textContent = `Error: ${String(e)}`;
+          } finally {
+            applyGridBtn.disabled = false;
+          }
+        });
+      }
+
+      // Show/hide grid panel when camera source changes
+      function updateGridPanelVisibility() {
+        const val = cameraSelect ? cameraSelect.value : "";
+        const shouldShow = isGridSource(val);
+        showGridPanel(shouldShow);
+        if (shouldShow) {
+          // Parse layout from the selected value
+          const parts = val.replace("grid_", "").split("x");
+          const newRows = parseInt(parts[0], 10);
+          const newCols = parseInt(parts[1], 10);
+          if (
+            newRows !== gridCurrentLayout[0] ||
+            newCols !== gridCurrentLayout[1]
+          ) {
+            gridCurrentLayout = [newRows, newCols];
+            if (gridLayoutSelect) gridLayoutSelect.value = `${newRows}x${newCols}`;
+            // Reset slots for new layout
+            const newTotal = newRows * newCols;
+            const newSlots = {};
+            for (let i = 0; i < newTotal; i++) {
+              newSlots[String(i)] = gridSlots[String(i)] || null;
+            }
+            gridSlots = newSlots;
+            renderGridSlots();
+          }
+          loadGridConfig();
+        }
       }
 
       // --- Reload faces ---
