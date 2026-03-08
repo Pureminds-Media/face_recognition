@@ -631,7 +631,7 @@
       const gridMsg = document.getElementById("gridMsg");
 
       let gridAvailableCameras = [];
-      let gridCurrentLayout = [3, 2];
+      let gridCurrentLayout = [2, 2];
       let gridSlots = {};
 
       function showGridPanel(show) {
@@ -645,7 +645,7 @@
           const r = await fetch("/api/grid/config");
           const j = await r.json();
           gridAvailableCameras = j.available_cameras || [];
-          gridCurrentLayout = j.layout || [3, 2];
+          gridCurrentLayout = j.layout || [2, 2];
           gridSlots = j.slots || {};
 
           // Populate layout selector

@@ -10,7 +10,7 @@ import numpy as np
 from deepface import DeepFace
 
 GRID_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grid_config.json")
-AVAILABLE_LAYOUTS = [(2, 2), (3, 2), (2, 3), (3, 3), (4, 4)]
+AVAILABLE_LAYOUTS = [(2, 2), (3, 3), (4, 4)]
 
 
 def l2norm(v):
@@ -209,7 +209,7 @@ class FaceEngine:
         self._grid_sources = []
         self._grid_stop_evt = threading.Event()
         self._grid_render_t = None
-        self._grid_layout = (3, 2)  # rows, cols  (may be overridden by load_grid_config)
+        self._grid_layout = (2, 2)  # rows, cols  (may be overridden by load_grid_config)
         self._grid_qr_rr_idx = 0
         self._worker_t = None
         self._main_t = None
@@ -405,20 +405,21 @@ class FaceEngine:
                 "h": h,
                 "fps": fps,
                 "start_time": now,
-                "frame_count": 0,      # reset on each resume (throttle pacing)
-                "total_frames": 0,     # never reset (actual frames in file)
+                "frame_count": 0,      # frames written so far (throttle pacing)
+                "total_frames": 0,     # same as frame_count (no pause/resume)
             }
         return True, fname
 
     def _feed_active_writers(self, camera_source, frame, visible_persons):
-        """Write the current frame to active VideoWriters for visible persons.
+        """Write the current frame to every active VideoWriter on this camera.
 
-        Only writes if the writer's person is in *visible_persons* (set of
-        person names currently tracked on this camera).  Uses frame-count
-        throttle so playback duration matches wall-clock time exactly.
+        Records continuously from visit start to visit end regardless of
+        whether the person is currently detected — this avoids jumpy cuts
+        when someone turns around or is briefly occluded.
 
-        When a person disappears and reappears, the frame-count clock is
-        reset so there is no burst of catch-up frames.
+        Uses a frame-count throttle with duplicate-frame padding so the
+        video plays back at real-time speed even when the render loop is
+        slower than the target FPS.
         """
         cam_key = str(camera_source) if camera_source is not None else None
         now = time.monotonic()
@@ -426,20 +427,8 @@ class FaceEngine:
             for vid, rec in list(self._active_writers.items()):
                 if rec["cam"] != cam_key:
                     continue
-                is_visible = rec["person"] in visible_persons
-                if not is_visible:
-                    rec["paused"] = True
-                    continue
-                # Person just reappeared — reset frame-count clock to avoid burst
-                if rec.get("paused"):
-                    rec["start_time"] = now
-                    rec["frame_count"] = 0
-                    rec["paused"] = False
                 # Frame-count throttle: write enough frames so that
                 # frame_count stays in sync with wall-clock time.
-                # When the render loop is slower than target fps, we
-                # duplicate the current frame to fill the gap so the
-                # video plays back at real-time speed.
                 fps = rec["fps"]
                 elapsed = now - rec["start_time"]
                 target_frames = int(elapsed * fps) + 1  # where we should be
@@ -1079,7 +1068,7 @@ class FaceEngine:
         try:
             with open(path) as f:
                 data = json.load(f)
-            layout = tuple(data.get("layout", [3, 2]))
+            layout = tuple(data.get("layout", [2, 2]))
             if len(layout) != 2:
                 return None
             layout = (int(layout[0]), int(layout[1]))
