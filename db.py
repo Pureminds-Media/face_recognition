@@ -58,7 +58,9 @@ CREATE TABLE IF NOT EXISTS visits (
     ended           INTEGER DEFAULT 0,
     confidence      REAL,
     session_id      TEXT REFERENCES sessions(id),
-    screenshot      TEXT
+    screenshot      TEXT,
+    footage         TEXT,
+    visible_duration REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_visits_person     ON visits (person_name);
@@ -91,7 +93,9 @@ CREATE TABLE IF NOT EXISTS visits (
     ended           BOOLEAN DEFAULT FALSE,
     confidence      FLOAT,
     session_id      UUID REFERENCES sessions(id),
-    screenshot      TEXT
+    screenshot      TEXT,
+    footage         TEXT,
+    visible_duration FLOAT
 );
 
 CREATE INDEX IF NOT EXISTS idx_visits_person     ON visits (person_name);
@@ -131,6 +135,16 @@ def init_db(dsn=None):
                     cur.execute("ALTER TABLE visits ADD COLUMN screenshot TEXT")
                 except Exception:
                     pass  # column already exists
+                # Migration: add footage column to existing databases
+                try:
+                    cur.execute("ALTER TABLE visits ADD COLUMN footage TEXT")
+                except Exception:
+                    pass  # column already exists
+                # Migration: add visible_duration column to existing databases
+                try:
+                    cur.execute("ALTER TABLE visits ADD COLUMN visible_duration FLOAT")
+                except Exception:
+                    pass  # column already exists
             _backend = "postgres"
             log.info("Database initialised (PostgreSQL)")
             return
@@ -146,6 +160,18 @@ def init_db(dsn=None):
         # Migration: add screenshot column to existing databases
         try:
             conn.execute("ALTER TABLE visits ADD COLUMN screenshot TEXT")
+            conn.commit()
+        except Exception:
+            pass  # column already exists
+        # Migration: add footage column to existing databases
+        try:
+            conn.execute("ALTER TABLE visits ADD COLUMN footage TEXT")
+            conn.commit()
+        except Exception:
+            pass  # column already exists
+        # Migration: add visible_duration column to existing databases
+        try:
+            conn.execute("ALTER TABLE visits ADD COLUMN visible_duration REAL")
             conn.commit()
         except Exception:
             pass  # column already exists
@@ -431,10 +457,24 @@ def update_visit_screenshot(visit_id, screenshot):
         cur.execute(sql, (screenshot, visit_id))
 
 
+def update_visit_footage(visit_id, footage):
+    """Set the footage filename for a visit."""
+    sql = _param("UPDATE visits SET footage = %s WHERE id = %s")
+    with _cursor(commit=True) as cur:
+        cur.execute(sql, (footage, visit_id))
+
+
+def update_visit_visible_duration(visit_id, visible_duration):
+    """Set the visible duration (seconds on camera) for a visit."""
+    sql = _param("UPDATE visits SET visible_duration = %s WHERE id = %s")
+    with _cursor(commit=True) as cur:
+        cur.execute(sql, (visible_duration, visit_id))
+
+
 def get_open_visit(person_name, location_id):
     """Return the open visit for a person at a location, or None."""
     sql = _param("""
-        SELECT id, person_name, location_id, first_seen, last_seen, confidence, screenshot
+        SELECT id, person_name, location_id, first_seen, last_seen, confidence, screenshot, footage, visible_duration
         FROM visits
         WHERE person_name = %s AND location_id = %s AND NOT ended
         ORDER BY first_seen DESC LIMIT 1
@@ -449,7 +489,8 @@ def get_all_open_visits():
     with _cursor() as cur:
         cur.execute("""
             SELECT v.id, v.person_name, v.location_id, v.first_seen, v.last_seen,
-                   v.confidence, v.screenshot, l.name as location_name, l.camera_source
+                   v.confidence, v.screenshot, v.footage, v.visible_duration,
+                   l.name as location_name, l.camera_source
             FROM visits v
             JOIN locations l ON l.id = v.location_id
             WHERE NOT v.ended
@@ -501,7 +542,8 @@ def get_person_visits(person_name, date_from=None, date_to=None, limit=200):
 
     sql = f"""
         SELECT v.id, v.person_name, v.first_seen, v.last_seen, v.ended,
-               v.confidence, v.screenshot, l.name as location_name, l.camera_source
+               v.confidence, v.screenshot, v.footage, v.visible_duration,
+               l.name as location_name, l.camera_source
         FROM visits v
         JOIN locations l ON l.id = v.location_id
         WHERE {' AND '.join(clauses)}
@@ -528,7 +570,8 @@ def get_location_visits(location_id, date_from=None, date_to=None, limit=200):
 
     sql = f"""
         SELECT v.id, v.person_name, v.first_seen, v.last_seen, v.ended,
-               v.confidence, v.screenshot, l.name as location_name
+               v.confidence, v.screenshot, v.footage, v.visible_duration,
+               l.name as location_name
         FROM visits v
         JOIN locations l ON l.id = v.location_id
         WHERE {' AND '.join(clauses)}
@@ -561,7 +604,8 @@ def get_daily_summary(date):
     ph = "?" if _backend == "sqlite" else "%s"
     sql = f"""
         SELECT v.id, v.person_name, v.first_seen, v.last_seen, v.ended,
-               v.confidence, v.screenshot, l.name as location_name, l.camera_source
+               v.confidence, v.screenshot, v.footage, v.visible_duration,
+               l.name as location_name, l.camera_source
         FROM visits v
         JOIN locations l ON l.id = v.location_id
         WHERE v.first_seen >= {ph} AND v.first_seen < {ph}

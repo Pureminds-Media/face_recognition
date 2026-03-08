@@ -48,24 +48,49 @@
         <!-- Video -->
         <div class="lg:col-span-3">
           <div
-            class="rounded-xl border border-slate-800 bg-slate-900 overflow-hidden"
+            class="rounded-xl border border-slate-800 bg-slate-900"
           >
             <div
-              class="px-4 py-3 border-b border-slate-800 flex items-center justify-between"
+              class="px-4 py-3 border-b border-slate-800 flex items-center justify-between rounded-t-xl"
             >
               <div class="font-medium">Live feed</div>
               <div class="text-xs text-slate-400" id="statusText">—</div>
               <div class="flex flex-wrap items-center gap-2">
-                <select
-                  id="cameraSelect"
-                  class="rounded-lg bg-slate-950 border border-slate-800 px-2 py-2 text-xs min-w-44"
-                ></select>
-                <button
-                  id="applyCameraBtn"
-                  class="rounded-lg bg-slate-700 hover:bg-slate-600 px-3 py-2 text-sm font-medium"
-                >
-                  Switch
-                </button>
+                <!-- Single / Multi cam mode selector -->
+                <div class="relative" id="camModeGroup">
+                  <div class="flex rounded-lg overflow-hidden border border-slate-700">
+                    <!-- Single camera button -->
+                    <button id="singleCamBtn" type="button" title="Single camera"
+                      class="flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors bg-slate-800 hover:bg-slate-700">
+                      <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="2" y="5" width="20" height="14" rx="2"/>
+                        <circle cx="12" cy="12" r="3"/>
+                      </svg>
+                      <span class="text-xs">Single</span>
+                    </button>
+                    <!-- Multi camera button -->
+                    <button id="multiCamBtn" type="button" title="Multi camera grid"
+                      class="flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors bg-slate-800 hover:bg-slate-700 border-l border-slate-700">
+                      <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="2" y="2" width="9" height="9" rx="1"/>
+                        <rect x="13" y="2" width="9" height="9" rx="1"/>
+                        <rect x="2" y="13" width="9" height="9" rx="1"/>
+                        <rect x="13" y="13" width="9" height="9" rx="1"/>
+                      </svg>
+                      <span class="text-xs">Multi</span>
+                    </button>
+                  </div>
+                  <!-- Single camera dropdown -->
+                  <div id="singleCamDropdown"
+                    class="hidden absolute top-full left-0 mt-1 z-50 min-w-52 rounded-lg border border-slate-700 bg-slate-900 shadow-xl overflow-hidden">
+                    <div id="singleCamList" class="max-h-60 overflow-y-auto"></div>
+                  </div>
+                  <!-- Multi camera dropdown -->
+                  <div id="multiCamDropdown"
+                    class="hidden absolute top-full left-0 mt-1 z-50 min-w-52 rounded-lg border border-slate-700 bg-slate-900 shadow-xl overflow-hidden">
+                    <div id="multiCamList" class="max-h-60 overflow-y-auto"></div>
+                  </div>
+                </div>
                 <button
                   id="startBtn"
                   class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium"
@@ -252,10 +277,17 @@
       const attendanceMetaEl = document.getElementById("attendanceMeta");
       const toastContainer = document.getElementById("toastContainer");
       const qrPrompt = document.getElementById("qrPrompt");
-      const cameraSelect = document.getElementById("cameraSelect");
-      const cameraSourceInput = document.getElementById("cameraSource");
-      const applyCameraBtn = document.getElementById("applyCameraBtn");
+      const singleCamBtn = document.getElementById("singleCamBtn");
+      const multiCamBtn = document.getElementById("multiCamBtn");
+      const singleCamDropdown = document.getElementById("singleCamDropdown");
+      const multiCamDropdown = document.getElementById("multiCamDropdown");
+      const singleCamList = document.getElementById("singleCamList");
+      const multiCamList = document.getElementById("multiCamList");
       const cameraMsg = document.getElementById("cameraMsg");
+
+      let currentCamMode = "single"; // "single" or "multi"
+      let singleCamDevices = [];
+      let multiCamLayouts = [];
 
       let attendanceES = null;
       let cameraRunning = false;
@@ -290,9 +322,9 @@
           stopBtn.classList.toggle("opacity-50", !running);
         }
 
-        // Keep MJPEG aligned
+        // Keep MJPEG aligned — always restart to pick up new camera source
         if (running) {
-          if (videoFeed && !videoFeed.getAttribute("src")) startStream();
+          if (videoFeed) startStream();
         } else {
           if (videoFeed && videoFeed.getAttribute("src")) stopStream();
         }
@@ -304,29 +336,53 @@
         const devices = j.devices || [];
         const currentSource = String(j.camera_source || "");
 
-        if (cameraSelect) {
-          cameraSelect.innerHTML = "";
-          devices.forEach((d) => {
-            const opt = document.createElement("option");
-            opt.value = String(d.value || "");
-            opt.textContent = d.label || `Camera ${d.value}`;
-            cameraSelect.appendChild(opt);
-          });
+        // Split devices into single cameras vs grid layouts
+        singleCamDevices = devices.filter(d => !String(d.value || "").startsWith("grid_"));
+        multiCamLayouts = devices.filter(d => String(d.value || "").startsWith("grid_"));
 
-          let hasCurrent = devices.some(
-            (d) => String(d.value || "") === currentSource,
-          );
-          if (currentSource && !hasCurrent) {
-            const opt = document.createElement("option");
-            opt.value = currentSource;
-            opt.textContent = `Custom source (${currentSource})`;
-            cameraSelect.appendChild(opt);
-            hasCurrent = true;
+        // Detect current mode
+        const isGrid = /^grid_\d+x\d+$/.test(currentSource);
+        currentCamMode = isGrid ? "multi" : "single";
+
+        // Render single camera list
+        if (singleCamList) {
+          let html = "";
+          singleCamDevices.forEach(d => {
+            const val = String(d.value || "");
+            const active = !isGrid && val === currentSource;
+            html += `<button type="button" data-source="${val}"
+              class="w-full text-left px-3 py-2 text-xs hover:bg-slate-800 transition-colors flex items-center justify-between ${active ? 'bg-slate-800 text-emerald-400' : 'text-slate-300'}">
+              <span>${d.label || 'Camera ' + val}</span>
+              ${active ? '<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"/></svg>' : ''}
+            </button>`;
+          });
+          if (!singleCamDevices.length) {
+            html = '<div class="px-3 py-2 text-xs text-slate-500">No cameras detected</div>';
           }
-          if (hasCurrent) cameraSelect.value = currentSource;
+          singleCamList.innerHTML = html;
         }
 
-        if (cameraSourceInput) cameraSourceInput.value = currentSource;
+        // Render multi camera list
+        if (multiCamList) {
+          let html = "";
+          multiCamLayouts.forEach(d => {
+            const val = String(d.value || "");
+            const active = isGrid && val === currentSource;
+            html += `<button type="button" data-source="${val}"
+              class="w-full text-left px-3 py-2 text-xs hover:bg-slate-800 transition-colors flex items-center justify-between ${active ? 'bg-slate-800 text-emerald-400' : 'text-slate-300'}">
+              <span>${d.label || val}</span>
+              ${active ? '<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"/></svg>' : ''}
+            </button>`;
+          });
+          if (!multiCamLayouts.length) {
+            html = '<div class="px-3 py-2 text-xs text-slate-500">No cameras for grid</div>';
+          }
+          multiCamList.innerHTML = html;
+        }
+
+        // Update mode button styling
+        updateCamModeButtons();
+
         if (cameraMsg)
           cameraMsg.textContent = currentSource
             ? `Current source: ${currentSource}`
@@ -335,6 +391,45 @@
         // Show/hide grid panel based on current source
         if (typeof updateGridPanelVisibility === "function") {
           updateGridPanelVisibility();
+        }
+      }
+
+      function updateCamModeButtons() {
+        const onClasses = ["bg-emerald-600", "hover:bg-emerald-500", "text-white"];
+        const offClasses = ["bg-slate-800", "hover:bg-slate-700"];
+        [singleCamBtn, multiCamBtn].forEach((btn, i) => {
+          if (!btn) return;
+          const isActive = (i === 0 && currentCamMode === "single") || (i === 1 && currentCamMode === "multi");
+          onClasses.forEach(c => btn.classList.toggle(c, isActive));
+          offClasses.forEach(c => btn.classList.toggle(c, !isActive));
+        });
+      }
+
+      function closeAllDropdowns() {
+        if (singleCamDropdown) singleCamDropdown.classList.add("hidden");
+        if (multiCamDropdown) multiCamDropdown.classList.add("hidden");
+      }
+
+      async function switchCamera(source) {
+        closeAllDropdowns();
+        if (cameraMsg) cameraMsg.textContent = "Switching...";
+        try {
+          const r = await fetch("/api/camera", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ source, restart: cameraRunning }),
+          });
+          const j = await r.json();
+          if (!r.ok || !j.ok) {
+            if (cameraMsg) cameraMsg.textContent = `Switch failed: ${j.error || "unknown error"}`;
+            return;
+          }
+          if (cameraMsg) cameraMsg.textContent = `Current source: ${j.camera_source}`;
+          await loadCameraOptions();
+          if (j.running && videoFeed) startStream();
+          toast(`Camera source set to ${j.camera_source}`, "success");
+        } catch (e) {
+          if (cameraMsg) cameraMsg.textContent = `Switch failed: ${String(e)}`;
         }
       }
 
@@ -492,47 +587,41 @@
         stopStream(); // close MJPEG immediately client-side
       };
 
-      if (cameraSelect) {
-        cameraSelect.onchange = () => {
-          if (cameraSourceInput && cameraSelect.value)
-            cameraSourceInput.value = cameraSelect.value;
-          if (typeof updateGridPanelVisibility === "function")
-            updateGridPanelVisibility();
+      // --- Single / Multi cam mode buttons ---
+      if (singleCamBtn) {
+        singleCamBtn.onclick = () => {
+          const wasOpen = !singleCamDropdown.classList.contains("hidden");
+          closeAllDropdowns();
+          if (!wasOpen) singleCamDropdown.classList.remove("hidden");
+        };
+      }
+      if (multiCamBtn) {
+        multiCamBtn.onclick = () => {
+          const wasOpen = !multiCamDropdown.classList.contains("hidden");
+          closeAllDropdowns();
+          if (!wasOpen) multiCamDropdown.classList.remove("hidden");
         };
       }
 
-      if (applyCameraBtn) {
-        applyCameraBtn.onclick = async () => {
-          const source = (cameraSourceInput?.value || cameraSelect?.value || "").trim();
-          if (!source) {
-            if (cameraMsg) cameraMsg.textContent = "Enter a camera index or stream URL.";
-            return;
-          }
-
-          applyCameraBtn.disabled = true;
-          try {
-            const r = await fetch("/api/camera", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ source, restart: cameraRunning }),
-            });
-            const j = await r.json();
-            if (!r.ok || !j.ok) {
-              if (cameraMsg)
-                cameraMsg.textContent = `Switch failed: ${j.error || "unknown error"}`;
-              return;
-            }
-            if (cameraMsg)
-              cameraMsg.textContent = `Current source: ${j.camera_source}`;
-            await loadCameraOptions();
-            toast(`Camera source set to ${j.camera_source}`, "success");
-          } catch (e) {
-            if (cameraMsg) cameraMsg.textContent = `Switch failed: ${String(e)}`;
-          } finally {
-            applyCameraBtn.disabled = false;
-          }
+      // Delegate clicks within dropdown lists
+      if (singleCamList) {
+        singleCamList.onclick = (e) => {
+          const btn = e.target.closest("[data-source]");
+          if (btn) switchCamera(btn.dataset.source);
         };
       }
+      if (multiCamList) {
+        multiCamList.onclick = (e) => {
+          const btn = e.target.closest("[data-source]");
+          if (btn) switchCamera(btn.dataset.source);
+        };
+      }
+
+      // Close dropdowns on outside click
+      document.addEventListener("click", (e) => {
+        const group = document.getElementById("camModeGroup");
+        if (group && !group.contains(e.target)) closeAllDropdowns();
+      });
 
       // --- Grid configurator ---
       const gridConfigPanel = document.getElementById("gridConfigPanel");
@@ -544,10 +633,6 @@
       let gridAvailableCameras = [];
       let gridCurrentLayout = [3, 2];
       let gridSlots = {};
-
-      function isGridSource(val) {
-        return val && /^grid_\d+x\d+$/.test(val);
-      }
 
       function showGridPanel(show) {
         if (gridConfigPanel) {
@@ -731,6 +816,8 @@
               cameraMsg.textContent = `Current source: ${j.camera_source}`;
             toast("Grid configuration applied", "success");
             await loadCameraOptions();
+            // Force-restart stream so we don't wait for SSE to notice
+            if (j.running && videoFeed) startStream();
           } catch (e) {
             if (gridMsg) gridMsg.textContent = `Error: ${String(e)}`;
           } finally {
@@ -739,31 +826,11 @@
         });
       }
 
-      // Show/hide grid panel when camera source changes
+      // Show/hide grid panel based on current mode
       function updateGridPanelVisibility() {
-        const val = cameraSelect ? cameraSelect.value : "";
-        const shouldShow = isGridSource(val);
+        const shouldShow = currentCamMode === "multi";
         showGridPanel(shouldShow);
         if (shouldShow) {
-          // Parse layout from the selected value
-          const parts = val.replace("grid_", "").split("x");
-          const newRows = parseInt(parts[0], 10);
-          const newCols = parseInt(parts[1], 10);
-          if (
-            newRows !== gridCurrentLayout[0] ||
-            newCols !== gridCurrentLayout[1]
-          ) {
-            gridCurrentLayout = [newRows, newCols];
-            if (gridLayoutSelect) gridLayoutSelect.value = `${newRows}x${newCols}`;
-            // Reset slots for new layout
-            const newTotal = newRows * newCols;
-            const newSlots = {};
-            for (let i = 0; i < newTotal; i++) {
-              newSlots[String(i)] = gridSlots[String(i)] || null;
-            }
-            gridSlots = newSlots;
-            renderGridSlots();
-          }
           loadGridConfig();
         }
       }

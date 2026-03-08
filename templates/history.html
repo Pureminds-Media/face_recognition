@@ -85,7 +85,7 @@
             <table class="w-full text-sm">
               <thead>
                 <tr class="border-b border-slate-800 text-slate-400 text-xs">
-                  <th class="px-4 py-3 text-left">Photo</th>
+                  <th class="px-4 py-3 text-left">Footage</th>
                   <th class="px-4 py-3 text-left">Person</th>
                   <th class="px-4 py-3 text-left">Location</th>
                   <th class="px-4 py-3 text-left">Arrived</th>
@@ -141,7 +141,7 @@
             <table class="w-full text-sm">
               <thead>
                 <tr class="border-b border-slate-800 text-slate-400 text-xs">
-                  <th class="px-4 py-3 text-left">Photo</th>
+                  <th class="px-4 py-3 text-left">Footage</th>
                   <th class="px-4 py-3 text-left">Date</th>
                   <th class="px-4 py-3 text-left">Location</th>
                   <th class="px-4 py-3 text-left">Arrived</th>
@@ -195,7 +195,7 @@
             <table class="w-full text-sm">
               <thead>
                 <tr class="border-b border-slate-800 text-slate-400 text-xs">
-                  <th class="px-4 py-3 text-left">Photo</th>
+                  <th class="px-4 py-3 text-left">Footage</th>
                   <th class="px-4 py-3 text-left">Person</th>
                   <th class="px-4 py-3 text-left">Date</th>
                   <th class="px-4 py-3 text-left">Arrived</th>
@@ -260,10 +260,15 @@
         const showDate = opts.showDate || false;
         const showPerson = opts.showPerson !== false;
         const showLocation = opts.showLocation !== false;
-        const photo = v.screenshot_url
-          ? `<a href="${v.screenshot_url}" target="_blank"><img src="${v.screenshot_url}" class="w-20 h-14 rounded object-cover border border-slate-700 hover:border-emerald-500 transition-colors"></a>`
-          : `<span class="text-slate-600 text-xs">--</span>`;
-        let cols = `<td class="px-4 py-2">${photo}</td>`;
+        let media;
+        if (v.footage_url) {
+          media = `<video src="${v.footage_url}" class="w-28 h-20 rounded object-cover border border-slate-700 hover:border-emerald-500 transition-colors cursor-pointer" muted loop preload="metadata" onmouseenter="this.play()" onmouseleave="this.pause();this.currentTime=0" onclick="openVideoModal(this.src)" title="Click to enlarge"></video>`;
+        } else if (v.screenshot_url) {
+          media = `<a href="${v.screenshot_url}" target="_blank"><img src="${v.screenshot_url}" class="w-28 h-20 rounded object-cover border border-slate-700 hover:border-emerald-500 transition-colors"></a>`;
+        } else {
+          media = `<span class="text-slate-600 text-xs">--</span>`;
+        }
+        let cols = `<td class="px-4 py-2">${media}</td>`;
         if (showPerson) cols += `<td class="px-4 py-2 font-medium">${v.person_name}</td>`;
         if (showLocation) cols += `<td class="px-4 py-2 text-slate-300">${v.location_name}</td>`;
         if (showDate) cols += `<td class="px-4 py-2 text-slate-400">${fmtDate(v.first_seen)}</td>`;
@@ -439,9 +444,33 @@
         }
       }
 
+      // --- Video Modal ---
+      function openVideoModal(src) {
+        const modal = document.getElementById('videoModal');
+        const video = document.getElementById('modalVideo');
+        video.src = src;
+        video.load();
+        modal.classList.remove('hidden');
+      }
+      function closeVideoModal() {
+        const modal = document.getElementById('videoModal');
+        const video = document.getElementById('modalVideo');
+        video.pause();
+        video.src = '';
+        modal.classList.add('hidden');
+      }
+
       // --- Init ---
       loadPersons();
       loadLocations();
     </script>
+
+    <!-- Video Modal Overlay -->
+    <div id="videoModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm" onclick="closeVideoModal()">
+      <div class="relative max-w-3xl w-full mx-4" onclick="event.stopPropagation()">
+        <button onclick="closeVideoModal()" class="absolute -top-10 right-0 text-white hover:text-red-400 text-2xl font-bold transition-colors">&times;</button>
+        <video id="modalVideo" class="w-full rounded-xl border border-slate-700 shadow-2xl" controls autoplay loop muted></video>
+      </div>
+    </div>
   </body>
 </html>

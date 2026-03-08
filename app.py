@@ -13,6 +13,7 @@ from queue import Queue, Empty, Full
 from flask import Flask, Response, render_template, request, jsonify, send_from_directory, stream_with_context
 from werkzeug.utils import secure_filename
 import threading
+import cv2
 from dotenv import load_dotenv
 from face_engine import FaceEngine, AVAILABLE_LAYOUTS
 import db
@@ -27,9 +28,11 @@ FACES_DIR = "faces"
 TEST_UPLOAD_DIR = os.path.join("test_runs", "uploads")
 TEST_OUTPUT_DIR = os.path.join("test_runs", "outputs")
 SCREENSHOTS_DIR = "screenshots"
+FOOTAGE_DIR = "footage"
 ALLOWED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
 os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
+os.makedirs(FOOTAGE_DIR, exist_ok=True)
 
 engine = FaceEngine(
     known_dir=FACES_DIR,
@@ -53,8 +56,8 @@ if _saved_grid is not None:
     except ValueError:
         pass  # invalid layout in config, keep default
 
-# Start engine once (avoid double-start in debug reloader)
-engine.start()
+# Engine stays stopped until user clicks Start in the UI
+# engine.start()
 # To allow starting/stopping of camera
 state_lock = threading.Lock()
 
@@ -68,7 +71,7 @@ UNKNOWN_PROMPT_SECS = 10.0
 UNKNOWN_RESET_GRACE_SECS = 1.5
 VISIT_TIMEOUT_MINUTES = int(os.getenv("VISIT_TIMEOUT_MINUTES", "10"))
 VISIT_STALE_CHECK_SECS = 30.0  # how often to check for stale visits
-VISIT_TRANSITION_SECS = 8.0    # person must disappear from current camera for this long before transitioning to a new location
+VISIT_TRANSITION_SECS = float(os.getenv("VISIT_TRANSITION_SECS", "2.0"))  # seconds absent from current camera before transitioning to a new location
 qr_prompt_state = {
     "unknown_first_mono": None,
     "unknown_last_seen_mono": None,
@@ -103,7 +106,15 @@ _last_stale_check = time.monotonic()
 
 
 def _shutdown_db():
+    footage_results = engine.stop_all_footage()
     if db.is_available():
+        # Save visible_duration for all visits that had active footage writers
+        for vid, (fname, visible_secs) in footage_results.items():
+            if visible_secs > 0:
+                try:
+                    db.update_visit_visible_duration(vid, visible_secs)
+                except Exception:
+                    pass
         db.close_all_open_visits()
         db.end_session(_current_session_id)
         db.close_db()
@@ -256,6 +267,7 @@ def _update_attendance_from_tracks(tracks):
         # Determine camera source for this track
         camera_source = str((t or {}).get("camera_source", engine.cam_index))
         confidence = (t or {}).get("best")
+        last_detect_t = float((t or {}).get("last_detect_t", 0.0))
 
         s = attendance_state.get(name)
         if s is None:
@@ -275,7 +287,7 @@ def _update_attendance_from_tracks(tracks):
 
         # --- DB visit tracking ---
         if db.is_available():
-            _update_visit_for_person(name, camera_source, confidence)
+            _update_visit_for_person(name, camera_source, confidence, last_detect_t)
 
     # Mark disappeared after a grace period (avoid flicker)
     for name, s in list(attendance_state.items()):
@@ -287,13 +299,14 @@ def _update_attendance_from_tracks(tracks):
         _last_stale_check = now_mono
         closed = db.close_stale_visits(VISIT_TIMEOUT_MINUTES)
         if closed:
-            # Remove from in-memory tracking
+            # Remove from in-memory tracking and close footage writers
             for name in list(_active_visits.keys()):
                 v = _active_visits[name]
                 if v.get("visit_id"):
                     # Check if this visit was closed
                     open_v = db.get_open_visit(name, v["location_id"])
                     if open_v is None:
+                        _stop_visit_footage(v["visit_id"])
                         del _active_visits[name]
 
     return events
@@ -314,19 +327,60 @@ def _save_visit_screenshot(visit_id, person_name, camera_source):
         log.debug("Failed to save visit screenshot: %s", e)
 
 
-def _update_visit_for_person(name, camera_source, confidence=None):
+def _start_visit_footage(visit_id, person_name, camera_source):
+    """Open a streaming VideoWriter for a visit.
+
+    The writer receives frames from the engine's render loop only while the
+    person is visible on the camera.
+    """
+    try:
+        fname = f"visit_{visit_id}.webm"
+        ok, actual_fname = engine.start_footage(
+            visit_id, person_name, camera_source, FOOTAGE_DIR, fname
+        )
+        if ok:
+            db.update_visit_footage(visit_id, actual_fname)
+            log.debug("Started footage writer for visit %s -> %s", visit_id, actual_fname)
+        else:
+            log.debug("Failed to open footage writer for visit %s", visit_id)
+    except Exception as e:
+        log.debug("Failed to start footage recording: %s", e)
+
+
+def _stop_visit_footage(visit_id):
+    """Close the footage VideoWriter for a visit and save visible_duration."""
+    try:
+        fname, visible_secs = engine.stop_footage(visit_id)
+        if fname:
+            log.debug("Closed footage writer for visit %s -> %s (%.1fs visible)",
+                       visit_id, fname, visible_secs)
+            if visible_secs > 0:
+                db.update_visit_visible_duration(visit_id, visible_secs)
+    except Exception as e:
+        log.debug("Failed to stop footage for visit %s: %s", visit_id, e)
+
+
+def _update_visit_for_person(name, camera_source, confidence=None, last_detect_t=0.0):
     """Open, update, or transition a visit for a person at a camera/location.
 
     Flip-flop prevention: when a person appears on a *different* camera than
     their current active visit, we do NOT immediately transition.  Instead we
     check how recently they were seen on the *original* camera:
 
-      - If within VISIT_TRANSITION_SECS (8 s): they are likely in an overlap
+      - If within VISIT_TRANSITION_SECS: they are likely in an overlap
         zone — keep the existing visit, just refresh its DB timestamp.
       - If older than VISIT_TRANSITION_SECS: they have genuinely left the
         original camera — close old visit, open new one at the new location.
+
+    Ghost-box prevention: only detector-confirmed tracks (fresh last_detect_t)
+    refresh last_seen_mono.  Tracker-only ghost boxes still bump DB last_seen
+    but do NOT prevent visit transitions.
     """
     now_mono = time.monotonic()
+    # A track is "detector-confirmed" if the face detector saw it recently
+    # (within 2x detect_every).  Ghost boxes from CSRT have stale last_detect_t.
+    detect_freshness = getattr(engine, "detect_every", 1.0) * 2.0
+    is_detector_confirmed = (now_mono - last_detect_t) < detect_freshness
 
     loc = db.get_location_by_source(camera_source)
     if loc is None:
@@ -347,10 +401,15 @@ def _update_visit_for_person(name, camera_source, confidence=None):
             "last_seen_mono": now_mono,
         }
         _save_visit_screenshot(vid, name, camera_source)
+        _start_visit_footage(vid, name, camera_source)
     elif active["location_id"] == loc_id:
-        # Same location — update last_seen in DB and refresh monotonic clock
+        # Same location — update last_seen in DB
         db.update_visit_seen(active["visit_id"], confidence=confidence)
-        active["last_seen_mono"] = now_mono
+        # Only refresh the monotonic clock if the face detector recently
+        # confirmed this track.  Tracker-only ghost boxes must NOT keep
+        # the timer alive, or they block visit transitions to other cameras.
+        if is_detector_confirmed:
+            active["last_seen_mono"] = now_mono
     else:
         # Different location — check whether person has left original camera
         elapsed = now_mono - active.get("last_seen_mono", 0)
@@ -358,9 +417,14 @@ def _update_visit_for_person(name, camera_source, confidence=None):
             # Still recently seen on original camera (overlap zone) — do NOT
             # transition; just keep the existing visit alive.
             db.update_visit_seen(active["visit_id"], confidence=confidence)
+            log.debug("Visit overlap: %s seen on cam %s but active on loc %s (%.1fs ago, need %.1fs)",
+                       name, camera_source, active["location_id"], elapsed, VISIT_TRANSITION_SECS)
         else:
             # Person has been absent from original camera long enough —
             # genuine transition: close old visit, open new one.
+            log.info("Visit transition: %s from loc %s -> cam %s (absent %.1fs >= %.1fs)",
+                      name, active["location_id"], camera_source, elapsed, VISIT_TRANSITION_SECS)
+            _stop_visit_footage(active["visit_id"])
             db.close_visit(active["visit_id"])
             vid = db.open_visit(name, loc_id, confidence=confidence, session_id=_current_session_id)
             _active_visits[name] = {
@@ -370,6 +434,7 @@ def _update_visit_for_person(name, camera_source, confidence=None):
                 "last_seen_mono": now_mono,
             }
             _save_visit_screenshot(vid, name, camera_source)
+            _start_visit_footage(vid, name, camera_source)
 
 def _mark_all_absent():
     now_mono = time.monotonic()
@@ -855,6 +920,11 @@ def screenshot_file(filename):
     """Serve visit screenshot images."""
     return send_from_directory(SCREENSHOTS_DIR, filename)
 
+@app.route("/footage/<path:filename>")
+def footage_file(filename):
+    """Serve visit footage video clips (supports Range requests for streaming)."""
+    return send_from_directory(FOOTAGE_DIR, filename, conditional=True)
+
 @app.route("/api/status")
 def api_status():
     return jsonify({
@@ -1112,6 +1182,7 @@ def _serialize_visit(v):
         "ended": bool(v.get("ended", False)),
         "confidence": round(float(v["confidence"]), 3) if v.get("confidence") else None,
         "screenshot_url": f"/screenshots/{v['screenshot']}" if v.get("screenshot") else None,
+        "footage_url": f"/footage/{v['footage']}" if v.get("footage") else None,
     }
 
 
@@ -1254,6 +1325,7 @@ def api_history_clear():
     if not db.is_available():
         return jsonify({"ok": False, "error": "database not available"}), 503
     global _current_session_id
+    engine.stop_all_footage()
     visit_count = db.clear_all_data()
     _active_visits.clear()
     attendance_state.clear()
@@ -1261,6 +1333,12 @@ def api_history_clear():
     for f in os.listdir(SCREENSHOTS_DIR):
         try:
             os.remove(os.path.join(SCREENSHOTS_DIR, f))
+        except Exception:
+            pass
+    # Clear footage files
+    for f in os.listdir(FOOTAGE_DIR):
+        try:
+            os.remove(os.path.join(FOOTAGE_DIR, f))
         except Exception:
             pass
     # Start a fresh session

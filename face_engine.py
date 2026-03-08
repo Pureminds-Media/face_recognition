@@ -1,7 +1,9 @@
 import os
 import json
 import time
+import struct
 import threading
+import collections
 from queue import Queue, Empty, Full
 import cv2
 import numpy as np
@@ -21,6 +23,114 @@ def cosine_distance(a, b):
     b = np.asarray(b, dtype=np.float32)
     denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-10
     return 1.0 - float(np.dot(a, b) / denom)
+
+
+def _mp4_faststart(path):
+    """Move the moov atom before mdat so browsers can stream the MP4.
+
+    Rewrites the file in-place.  If anything goes wrong, the original file
+    is left untouched.  Only operates on .mp4 files.
+    """
+    if not path.lower().endswith(".mp4"):
+        return
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        # Parse top-level boxes to find moov and mdat
+        boxes = []
+        pos = 0
+        while pos < len(data):
+            if pos + 8 > len(data):
+                break
+            size = struct.unpack(">I", data[pos : pos + 4])[0]
+            box_type = data[pos + 4 : pos + 8]
+            if size == 0:
+                break
+            if size == 1:
+                if pos + 16 > len(data):
+                    break
+                size = struct.unpack(">Q", data[pos + 8 : pos + 16])[0]
+            boxes.append((box_type, pos, size))
+            pos += size
+
+        moov_idx = None
+        mdat_idx = None
+        for i, (bt, bp, bs) in enumerate(boxes):
+            if bt == b"moov":
+                moov_idx = i
+            if bt == b"mdat":
+                mdat_idx = i
+
+        if moov_idx is None or mdat_idx is None:
+            return  # not a standard mp4
+        if moov_idx < mdat_idx:
+            return  # already fast-started
+
+        # Rebuild: everything before mdat + moov + mdat + everything after moov
+        moov_type, moov_pos, moov_size = boxes[moov_idx]
+        moov_data = data[moov_pos : moov_pos + moov_size]
+
+        # We need to adjust chunk offsets inside moov by the shift amount
+        # (moov is being moved before mdat, so mdat shifts forward by moov_size)
+        mdat_type, mdat_pos, mdat_size = boxes[mdat_idx]
+        shift = moov_size  # moov is inserted before mdat, pushing mdat forward
+
+        # Adjust stco (32-bit) and co64 (64-bit) chunk offsets in moov
+        adjusted_moov = bytearray(moov_data)
+        _adjust_offsets(adjusted_moov, shift)
+
+        # Rebuild the file
+        before_mdat = data[:mdat_pos]
+        mdat_and_after = data[mdat_pos:moov_pos]
+        after_moov = data[moov_pos + moov_size:]
+
+        new_data = before_mdat + bytes(adjusted_moov) + mdat_and_after + after_moov
+
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "wb") as f:
+            f.write(new_data)
+        os.replace(tmp_path, path)
+    except Exception:
+        # If anything goes wrong, leave the original file
+        try:
+            if os.path.exists(path + ".tmp"):
+                os.remove(path + ".tmp")
+        except Exception:
+            pass
+
+
+def _adjust_offsets(moov_data, shift):
+    """Adjust stco/co64 chunk offsets inside a moov box by `shift` bytes."""
+    pos = 8  # skip moov header
+    _adjust_offsets_recursive(moov_data, pos, len(moov_data), shift)
+
+
+def _adjust_offsets_recursive(data, start, end, shift):
+    """Walk nested boxes inside moov and adjust stco/co64 entries."""
+    pos = start
+    while pos < end - 8:
+        size = struct.unpack(">I", data[pos : pos + 4])[0]
+        box_type = bytes(data[pos + 4 : pos + 8])
+        if size < 8 or pos + size > end:
+            break
+        if box_type == b"stco":
+            # 32-bit chunk offset table
+            entry_count = struct.unpack(">I", data[pos + 12 : pos + 16])[0]
+            for i in range(entry_count):
+                off = pos + 16 + i * 4
+                old = struct.unpack(">I", data[off : off + 4])[0]
+                struct.pack_into(">I", data, off, old + shift)
+        elif box_type == b"co64":
+            # 64-bit chunk offset table
+            entry_count = struct.unpack(">I", data[pos + 12 : pos + 16])[0]
+            for i in range(entry_count):
+                off = pos + 16 + i * 8
+                old = struct.unpack(">Q", data[off : off + 8])[0]
+                struct.pack_into(">Q", data, off, old + shift)
+        elif box_type in (b"trak", b"mdia", b"minf", b"stbl"):
+            # Recurse into container boxes
+            _adjust_offsets_recursive(data, pos + 8, pos + size, shift)
+        pos += size
 
 
 def iou(a, b):
@@ -118,6 +228,17 @@ class FaceEngine:
         self._snapshot_buf = {}
         self._snapshot_lock = threading.Lock()
 
+        # Rolling frame ring buffer per camera source (used for snapshots).
+        # Key: str(camera_source)  Value: deque of numpy_frame
+        self.FOOTAGE_RING_SECS = 5.0  # keep a few seconds for snapshot quality
+        self._frame_ring = {}  # camera_source -> deque
+        self._frame_ring_lock = threading.Lock()
+        self._ring_frame_counts = {}  # camera_source -> (start_mono, frame_count)
+        # Active footage writers: visit_id -> {cam, person, writer, ...}
+        # Each active visit has its own cv2.VideoWriter streaming frames to disk.
+        self._active_writers = {}
+        self._writers_lock = threading.Lock()
+
     # ---------- public ----------
     def start(self):
         if self._running:
@@ -205,6 +326,181 @@ class FaceEngine:
         key = (person_name, str(camera_source) if camera_source is not None else None)
         with self._snapshot_lock:
             return self._snapshot_buf.pop(key, None)
+
+    def _push_frame_to_ring(self, camera_source, frame):
+        """Push an annotated frame into the rolling ring buffer for a camera.
+
+        Throttled to out_fps via frame-count so timing is drift-free.
+        """
+        key = str(camera_source) if camera_source is not None else None
+        now = time.monotonic()
+        fps = max(1, self.out_fps)
+        with self._frame_ring_lock:
+            if key not in self._frame_ring:
+                maxlen = int(fps * self.FOOTAGE_RING_SECS) + 10
+                self._frame_ring[key] = collections.deque(maxlen=maxlen)
+            # Frame-count throttle
+            start_t, count = self._ring_frame_counts.get(key, (now, 0))
+            if key not in self._ring_frame_counts:
+                self._ring_frame_counts[key] = (now, 0)
+                start_t, count = now, 0
+            expected_time = count / fps
+            elapsed = now - start_t
+            if count > 0 and expected_time > elapsed:
+                return  # too early for next frame
+            self._frame_ring[key].append(frame.copy())
+            self._ring_frame_counts[key] = (start_t, count + 1)
+
+    def start_footage(self, visit_id, person_name, camera_source, footage_dir, fname):
+        """Open a VideoWriter for a visit.
+
+        Called by app.py when a new visit opens.  The writer stays open and
+        receives frames from _feed_active_writers() only while the person is
+        visible, until stop_footage() is called.
+
+        Returns (ok: bool, actual_fname: str).
+        """
+        cam_key = str(camera_source) if camera_source is not None else None
+        fpath = os.path.join(footage_dir, fname)
+        fps = max(1, self.out_fps)
+
+        # Determine frame dimensions — prefer ring buffer (native resolution),
+        # then raw frame from worker, then full canvas dimensions.
+        w, h = None, None
+        with self._frame_ring_lock:
+            ring = self._frame_ring.get(cam_key)
+            if ring:
+                h, w = ring[-1].shape[:2]
+        if w is None and self._is_grid_mode():
+            worker = self._grid_workers.get(camera_source)
+            if worker is not None:
+                with worker["lock"]:
+                    raw = worker.get("latest_raw_frame")
+                if raw is not None:
+                    h, w = raw.shape[:2]
+        if w is None:
+            w, h = self.width, self.height
+
+        # Use VP8/WebM — natively supported in all modern browsers.
+        # OpenCV emits a misleading "tag VP80 is not supported" warning,
+        # but the files are valid WebM with correct EBML headers.
+        fname_webm = fname.rsplit(".", 1)[0] + ".webm"
+        fpath = os.path.join(footage_dir, fname_webm)
+        fname = fname_webm
+        fourcc = cv2.VideoWriter_fourcc(*"VP80")
+        writer = cv2.VideoWriter(fpath, fourcc, fps, (w, h))
+        if not writer.isOpened():
+            writer.release()
+            return False, fname
+
+        now = time.monotonic()
+        with self._writers_lock:
+            self._active_writers[visit_id] = {
+                "cam": cam_key,
+                "person": person_name,
+                "writer": writer,
+                "path": fpath,
+                "fname": fname,
+                "w": w,
+                "h": h,
+                "fps": fps,
+                "start_time": now,
+                "frame_count": 0,      # reset on each resume (throttle pacing)
+                "total_frames": 0,     # never reset (actual frames in file)
+            }
+        return True, fname
+
+    def _feed_active_writers(self, camera_source, frame, visible_persons):
+        """Write the current frame to active VideoWriters for visible persons.
+
+        Only writes if the writer's person is in *visible_persons* (set of
+        person names currently tracked on this camera).  Uses frame-count
+        throttle so playback duration matches wall-clock time exactly.
+
+        When a person disappears and reappears, the frame-count clock is
+        reset so there is no burst of catch-up frames.
+        """
+        cam_key = str(camera_source) if camera_source is not None else None
+        now = time.monotonic()
+        with self._writers_lock:
+            for vid, rec in list(self._active_writers.items()):
+                if rec["cam"] != cam_key:
+                    continue
+                is_visible = rec["person"] in visible_persons
+                if not is_visible:
+                    rec["paused"] = True
+                    continue
+                # Person just reappeared — reset frame-count clock to avoid burst
+                if rec.get("paused"):
+                    rec["start_time"] = now
+                    rec["frame_count"] = 0
+                    rec["paused"] = False
+                # Frame-count throttle: write enough frames so that
+                # frame_count stays in sync with wall-clock time.
+                # When the render loop is slower than target fps, we
+                # duplicate the current frame to fill the gap so the
+                # video plays back at real-time speed.
+                fps = rec["fps"]
+                elapsed = now - rec["start_time"]
+                target_frames = int(elapsed * fps) + 1  # where we should be
+                deficit = target_frames - rec["frame_count"]
+                if deficit <= 0:
+                    continue
+                # Safety cap: never write more than 2× fps frames in one call
+                # to avoid runaway writes if start_time is stale.
+                deficit = min(deficit, fps * 2)
+                try:
+                    fh, fw = frame.shape[:2]
+                    if (fw, fh) != (rec["w"], rec["h"]):
+                        f = cv2.resize(frame, (rec["w"], rec["h"]))
+                    else:
+                        f = frame
+                    for _ in range(deficit):
+                        rec["writer"].write(f)
+                    rec["frame_count"] += deficit
+                    rec["total_frames"] += deficit
+                except Exception:
+                    pass  # writer may have been released
+
+    def stop_footage(self, visit_id):
+        """Close the VideoWriter for a visit.
+
+        Returns (fname, visible_secs) or (None, 0).
+        visible_secs = total_frames / fps — the exact on-camera duration
+        across all visible segments (survives pause/resume cycles).
+        """
+        with self._writers_lock:
+            rec = self._active_writers.pop(visit_id, None)
+        if rec is None:
+            return None, 0.0
+        try:
+            rec["writer"].release()
+        except Exception:
+            pass
+        visible_secs = rec["total_frames"] / max(1, rec["fps"])
+        return rec["fname"], visible_secs
+
+    def get_footage_visible_secs(self, visit_id):
+        """Return current visible seconds for an active writer, or 0."""
+        with self._writers_lock:
+            rec = self._active_writers.get(visit_id)
+            if rec is None:
+                return 0.0
+            return rec["total_frames"] / max(1, rec["fps"])
+
+    def stop_all_footage(self):
+        """Close all active VideoWriters. Returns {visit_id: (fname, visible_secs)}."""
+        results = {}
+        with self._writers_lock:
+            for vid, rec in list(self._active_writers.items()):
+                try:
+                    rec["writer"].release()
+                except Exception:
+                    pass
+                visible_secs = rec["total_frames"] / max(1, rec["fps"])
+                results[vid] = (rec["fname"], visible_secs)
+            self._active_writers.clear()
+        return results
 
     def get_qr(self):
         """Return latest decoded QR payload (string) or None."""
@@ -858,8 +1154,16 @@ class FaceEngine:
 
         rows, cols = self._grid_layout
         max_slots = rows * cols
-        tile_w = max(1, int(self.width // cols))
-        tile_h = max(1, int(self.height // rows))
+        # Fixed 16:9 tile aspect ratio regardless of grid layout
+        cell_w = max(1, int(self.width // cols))
+        cell_h = max(1, int(self.height // rows))
+        target_ratio = self.width / max(1, self.height)
+        if cell_w / max(1, cell_h) > target_ratio:
+            tile_h = cell_h
+            tile_w = max(1, int(tile_h * target_ratio))
+        else:
+            tile_w = cell_w
+            tile_h = max(1, int(tile_w / target_ratio))
         workers = {}
         # Ordered list with None entries preserved so each slot index
         # maps directly to a grid position.
@@ -903,6 +1207,7 @@ class FaceEngine:
                 "stop_evt": threading.Event(),
                 "frame_q": Queue(maxsize=1),
                 "latest_frame": None,
+                "latest_raw_frame": None,
                 "latest_frame_t": 0.0,
                 "last_good_frame_t": 0.0,
                 "tracks": [],
@@ -1017,6 +1322,7 @@ class FaceEngine:
                 time.sleep(0.02)
                 continue
 
+            raw_frame = frame  # original camera resolution — used for footage
             try:
                 frame = cv2.resize(frame, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
             except Exception:
@@ -1025,6 +1331,7 @@ class FaceEngine:
 
             with worker["lock"]:
                 worker["latest_frame"] = frame
+                worker["latest_raw_frame"] = raw_frame
                 worker["latest_frame_t"] = now
                 worker["last_good_frame_t"] = now
 
@@ -1198,10 +1505,18 @@ class FaceEngine:
 
     def _grid_render_loop(self):
         rows, cols = self._grid_layout
-        tile_w = max(1, int(self.width // cols))
-        tile_h = max(1, int(self.height // rows))
-        grid_w = tile_w * cols
-        grid_h = tile_h * rows
+        # Fixed 16:9 tile aspect ratio regardless of grid layout
+        cell_w = max(1, int(self.width // cols))
+        cell_h = max(1, int(self.height // rows))
+        target_ratio = self.width / max(1, self.height)
+        if cell_w / max(1, cell_h) > target_ratio:
+            tile_h = cell_h
+            tile_w = max(1, int(tile_h * target_ratio))
+        else:
+            tile_w = cell_w
+            tile_h = max(1, int(tile_w / target_ratio))
+        grid_w = cell_w * cols
+        grid_h = cell_h * rows
         last_encode_t = 0.0
         stale_secs = 1.6
         unknown_stale_secs = max(0.8, self.detect_every * 1.0)
@@ -1218,8 +1533,11 @@ class FaceEngine:
             for slot in range(rows * cols):
                 r = slot // cols
                 c = slot % cols
-                ox = c * tile_w
-                oy = r * tile_h
+                # Cell origin (full grid cell), then center the tile within it
+                cell_ox = c * cell_w
+                cell_oy = r * cell_h
+                ox = cell_ox + (cell_w - tile_w) // 2
+                oy = cell_oy + (cell_h - tile_h) // 2
 
                 tile = np.zeros((tile_h, tile_w, 3), dtype=np.uint8)
                 if slot >= len(self._grid_sources):
@@ -1242,6 +1560,7 @@ class FaceEngine:
 
                 with worker["lock"]:
                     frame = worker.get("latest_frame")
+                    raw_frame = worker.get("latest_raw_frame")
                     tracks = list(worker.get("tracks", []))
                     track_max_misses = int(worker.get("track_max_misses", 6))
                     max_unknown_tracks = int(worker.get("max_unknown_tracks", 3))
@@ -1330,7 +1649,7 @@ class FaceEngine:
                     is_unknown = name == "unknown"
                     color = (0, 0, 255) if is_unknown else (0, 255, 0)
                     cv2.rectangle(tile, (x, y), (x + w, y + h), color, 2)
-                    label = "unknown" if is_unknown else f"{name} ({float(best):.2f})"
+                    label = "unknown" if is_unknown else name
                     cv2.putText(tile, label, (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
                     aggregated_tracks.append(
@@ -1339,6 +1658,7 @@ class FaceEngine:
                             "best": float(best),
                             "bbox": [ox + x, oy + y, w, h],
                             "camera_source": str(source),
+                            "last_detect_t": float(t.get("last_detect_t", 0.0)),
                         }
                     )
 
@@ -1368,6 +1688,34 @@ class FaceEngine:
                         with self._snapshot_lock:
                             for pname in known_on_tile:
                                 self._snapshot_buf[(pname, str(source))] = snap_bytes
+
+                # Build annotated raw frame for footage (native camera resolution)
+                visible = {t.get("name") for t in updated_tracks
+                           if t.get("name") and t.get("name") != "unknown"}
+                if raw_frame is not None:
+                    raw_h, raw_w = raw_frame.shape[:2]
+                    sx = raw_w / tile_w
+                    sy = raw_h / tile_h
+                    footage_frame = raw_frame.copy()
+                    for t in updated_tracks:
+                        bx, by, bw, bh = map(int, t.get("bbox", (0, 0, 0, 0)))
+                        tname = str(t.get("name", "unknown"))
+                        tbest = float(t.get("best", 1.0))
+                        rx, ry = int(bx * sx), int(by * sy)
+                        rw, rh = int(bw * sx), int(bh * sy)
+                        is_unk = tname == "unknown"
+                        col = (0, 0, 255) if is_unk else (0, 255, 0)
+                        cv2.rectangle(footage_frame, (rx, ry), (rx + rw, ry + rh), col, 2)
+                        flabel = "unknown" if is_unk else tname
+                        font_scale = max(0.5, min(sx, sy) * 0.55)
+                        cv2.putText(footage_frame, flabel, (rx, max(0, ry - 8)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, col, 2)
+                else:
+                    footage_frame = tile
+
+                # Push to rolling frame ring buffer + active writers at native resolution
+                self._push_frame_to_ring(source, footage_frame)
+                self._feed_active_writers(source, footage_frame, visible)
 
                 canvas[oy:oy + tile_h, ox:ox + tile_w] = tile
 
@@ -1587,7 +1935,7 @@ class FaceEngine:
 
                 cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
 
-                label = "unknown" if is_unknown else f"{t['name']} ({t['best']:.2f})"
+                label = "unknown" if is_unknown else t['name']
                 cv2.putText(frame, label, (x, max(0, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2,)
 
             # 4b) buffer snapshot for each known person (single-camera mode)
@@ -1606,6 +1954,12 @@ class FaceEngine:
                         for pname in known_on_frame:
                             self._snapshot_buf[(pname, cam_src)] = snap_bytes
 
+            # 4c) push frame to rolling ring buffer + active writers (single-camera)
+            self._push_frame_to_ring(self.cam_index, frame)
+            visible = {t["name"] for t in self.tracks
+                       if t.get("name") and t["name"] != "unknown"}
+            self._feed_active_writers(self.cam_index, frame, visible)
+
             # 5) encode at limited FPS
             if now - last_encode_t >= (1.0 / max(1, self.out_fps)):
                 last_encode_t = now
@@ -1620,6 +1974,7 @@ class FaceEngine:
                                 "name": t["name"],
                                 "best": float(t["best"]),
                                 "bbox": [int(t["bbox"][0]), int(t["bbox"][1]), int(t["bbox"][2]), int(t["bbox"][3])],
+                                "last_detect_t": float(t.get("last_detect_t", 0.0)),
                             }
                             for t in self.tracks
                         ]
