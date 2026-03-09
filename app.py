@@ -48,13 +48,14 @@ engine = FaceEngine(
     jpeg_quality=80,
 )
 
-# Load saved grid config (if any) before starting
+# Load saved grid config (if any) and default to multi-camera mode
 _saved_grid = FaceEngine.load_grid_config()
 if _saved_grid is not None:
     try:
         engine.set_grid_layout(*_saved_grid["layout"])
-    except ValueError:
-        pass  # invalid layout in config, keep default
+        engine.cam_index = _saved_grid["cam_index"]
+    except (ValueError, KeyError):
+        pass  # invalid layout/config, keep default
 
 # Engine stays stopped until user clicks Start in the UI
 # engine.start()

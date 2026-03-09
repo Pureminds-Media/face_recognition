@@ -591,7 +591,7 @@ def get_daily_summary(date):
     date : datetime.date
         The calendar day to query.
 
-    Returns a list of dicts sorted by person_name, then first_seen.
+    Returns a list of dicts sorted by first_seen descending (most recent first).
     """
     day_start = datetime(date.year, date.month, date.day, tzinfo=timezone.utc)
     day_end = day_start + timedelta(days=1)
@@ -609,7 +609,7 @@ def get_daily_summary(date):
         FROM visits v
         JOIN locations l ON l.id = v.location_id
         WHERE v.first_seen >= {ph} AND v.first_seen < {ph}
-        ORDER BY v.person_name, v.first_seen
+        ORDER BY v.first_seen DESC
     """
     with _cursor() as cur:
         cur.execute(sql, params)
