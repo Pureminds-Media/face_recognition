@@ -715,7 +715,15 @@ class FaceEngine:
         return d / scale
 
     def _dedupe_tracks(self, tracks, iou_thresh=0.45, center_dist_thresh=0.5):
-        """Drop overlapping duplicate tracks for the same person."""
+        """Drop duplicate tracks.
+
+        Two-pass dedup:
+        1. Overlap-based — merge tracks whose bboxes overlap (IoU or center
+           distance) and have compatible identities.
+        2. Name-based — for each *known* name, keep only the track with the
+           most recent detector confirmation (``last_detect_t``).  This kills
+           ghost boxes that linger at the old position after a person moves.
+        """
         if len(tracks) <= 1:
             return tracks
 
@@ -731,7 +739,6 @@ class FaceEngine:
             b_bbox = b.get("bbox", (0, 0, 0, 0))
             ov = iou(a_bbox, b_bbox)
             if ov < iou_thresh:
-                # Use center distance as a fallback only when identities are compatible.
                 an = a.get("name", "unknown")
                 bn = b.get("name", "unknown")
                 cd = self._center_dist_norm(a_bbox, b_bbox)
@@ -745,6 +752,7 @@ class FaceEngine:
             bn = b.get("name", "unknown")
             return (an == bn) or (an == "unknown") or (bn == "unknown")
 
+        # Pass 1: overlap-based dedup
         kept = []
         for t in sorted(tracks, key=_rank, reverse=True):
             duplicate = False
@@ -754,7 +762,24 @@ class FaceEngine:
                     break
             if not duplicate:
                 kept.append(t)
-        return kept
+
+        # Pass 2: name-based dedup — one box per known person, keep latest
+        seen_names = {}   # name -> index in final list
+        final = []
+        for t in kept:
+            name = t.get("name", "unknown")
+            if name == "unknown":
+                final.append(t)
+                continue
+            prev_idx = seen_names.get(name)
+            if prev_idx is None:
+                seen_names[name] = len(final)
+                final.append(t)
+            else:
+                # Keep the one with the more recent detector confirmation
+                if float(t.get("last_detect_t", 0)) > float(final[prev_idx].get("last_detect_t", 0)):
+                    final[prev_idx] = t
+        return final
 
     def _dedupe_detections(self, detections, iou_thresh=0.45, center_dist_thresh=0.5):
         """Collapse near-duplicate detections from the same detector pass."""
@@ -1511,8 +1536,8 @@ class FaceEngine:
         unknown_stale_secs = max(0.8, self.detect_every * 1.0)
         # Tracks must be periodically reconfirmed by the face detector;
         # tracker-only boxes drift and create ghost boxes when person leaves.
-        unknown_reconfirm_secs = max(1.2, self.detect_every * 2.8)
-        known_reconfirm_secs = max(3.0, self.detect_every * 5.0)
+        unknown_reconfirm_secs = max(1.5, self.detect_every * 1.5)
+        known_reconfirm_secs = max(2.0, self.detect_every * 2.0)
 
         while not self.stop_evt.is_set() and not self._grid_stop_evt.is_set():
             now = time.monotonic()
@@ -1746,6 +1771,8 @@ class FaceEngine:
         last_encode_t = 0.0
         stale_secs = 2.0
         unknown_stale_secs = 0.7
+        unknown_reconfirm_secs = max(1.5, self.detect_every * 1.5)
+        known_reconfirm_secs = max(2.0, self.detect_every * 2.0)
         max_detection_lag = max(1.5, self.detect_every * 4.0)
 
         while not self.stop_evt.is_set():
@@ -1859,6 +1886,7 @@ class FaceEngine:
                         t["tracker"].init(frame, det_bbox)
                         t["updated"] = True
                         t["last_seen"] = now
+                        t["last_detect_t"] = now
 
                         # label smoothing: unknown doesn't immediately clobber a known identity
                         if name == "unknown":
@@ -1901,6 +1929,7 @@ class FaceEngine:
                                 "bbox": det_bbox,
                                 "updated": True,
                                 "last_seen": now,
+                                "last_detect_t": now,
                                 "unknown_hits": 0 if name != "unknown" else 1,
                             }
                         )
@@ -1909,6 +1938,13 @@ class FaceEngine:
                 self.tracks = [
                     t for t in self.tracks
                     if (now - t.get("last_seen", now)) < (unknown_stale_secs if t.get("name") == "unknown" else stale_secs)
+                ]
+                # drop tracks not reconfirmed by detector (ghost box prevention)
+                self.tracks = [
+                    t for t in self.tracks
+                    if (now - float(t.get("last_detect_t", now))) <= (
+                        unknown_reconfirm_secs if t.get("name") == "unknown" else known_reconfirm_secs
+                    )
                 ]
                 self.tracks = self._dedupe_tracks(self.tracks)
 
