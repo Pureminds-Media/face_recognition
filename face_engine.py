@@ -8,6 +8,7 @@ from queue import Queue, Empty, Full
 import cv2
 import numpy as np
 from deepface import DeepFace
+from action_detector import ActionDetector
 
 GRID_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grid_config.json")
 AVAILABLE_LAYOUTS = [(2, 2), (3, 3), (4, 4)]
@@ -239,6 +240,19 @@ class FaceEngine:
         self._active_writers = {}
         self._writers_lock = threading.Lock()
 
+        # Action detection (CLIP zero-shot) — can be disabled via env
+        self.activity_enabled = os.getenv("ACTION_DETECTION_ENABLED", "true").lower() in ("true", "1", "yes")
+        self._action_detector = None
+        self.activity_detect_every = 2.0  # seconds between activity checks per person
+        # Dedicated action detection thread: runs async, never blocks detect/render loops
+        self._activity_q = Queue(maxsize=32)
+        self._activity_results = {}   # person_id -> {"label": str, "conf": float, "t": float}
+        self._activity_results_lock = threading.Lock()
+        self._activity_t = None
+        # Per-visit activity tallies: visit_id -> Counter of label strings
+        self._activity_counts = {}
+        self._activity_counts_lock = threading.Lock()
+
     # ---------- public ----------
     def start(self):
         if self._running:
@@ -263,6 +277,12 @@ class FaceEngine:
 
             self._main_t = threading.Thread(target=self._main_loop, daemon=True)
             self._main_t.start()
+
+        # Start action detection thread (shared by grid and single-cam modes)
+        if self.activity_enabled:
+            self._action_detector = ActionDetector()
+            self._activity_t = threading.Thread(target=self._activity_loop, daemon=True)
+            self._activity_t.start()
 
         self._running = True
 
@@ -292,6 +312,25 @@ class FaceEngine:
             self._main_t.join(timeout=2.0)
             self._main_t = None
 
+        # Stop activity thread
+        if self._activity_t is not None:
+            try:
+                self._activity_q.put_nowait(None)  # sentinel
+            except Full:
+                pass
+            self._activity_t.join(timeout=2.0)
+            self._activity_t = None
+        # Drain activity queue
+        while not self._activity_q.empty():
+            try:
+                self._activity_q.get_nowait()
+            except Empty:
+                break
+        with self._activity_results_lock:
+            self._activity_results.clear()
+        with self._activity_counts_lock:
+            self._activity_counts.clear()
+
         # Clear queues
         with self.in_q.mutex:
             self.in_q.queue.clear()
@@ -305,6 +344,93 @@ class FaceEngine:
 
         self.tracks = []
 
+    # ---------- action detection thread ----------
+
+    def _activity_loop(self):
+        """Dedicated thread for CLIP action detection.
+
+        Pulls (frame, bbox, person_id) items from the queue and writes
+        results to self._activity_results.  Runs fully async so it never
+        blocks the detection or render loops.
+        """
+        while True:
+            try:
+                item = self._activity_q.get(timeout=1.0)
+            except Empty:
+                if self.stop_evt.is_set():
+                    break
+                continue
+            if item is None:          # sentinel → exit
+                break
+            frame, bbox, person_id = item
+
+            # Drain any older items for the same person (keep only latest)
+            latest_frame, latest_bbox = frame, bbox
+            while not self._activity_q.empty():
+                try:
+                    peek = self._activity_q.get_nowait()
+                except Empty:
+                    break
+                if peek is None:      # sentinel
+                    self._activity_q.put(None)
+                    break
+                pf, pb, pid = peek
+                if pid == person_id:
+                    latest_frame, latest_bbox = pf, pb
+                else:
+                    # Different person — put it back and stop draining
+                    try:
+                        self._activity_q.put_nowait(peek)
+                    except Full:
+                        pass
+                    break
+            frame, bbox = latest_frame, latest_bbox
+
+            try:
+                label, conf = self._action_detector.detect(
+                    frame, bbox, person_id=person_id
+                )
+                with self._activity_results_lock:
+                    self._activity_results[person_id] = {
+                        "label": label,
+                        "conf": conf,
+                        "t": time.monotonic(),
+                    }
+            except Exception:
+                pass
+
+    def get_activity(self, person_id):
+        """Return (label, conf) for a person, or (None, 0.0)."""
+        if not self.activity_enabled:
+            return (None, 0.0)
+        with self._activity_results_lock:
+            r = self._activity_results.get(person_id)
+        if r is None:
+            return (None, 0.0)
+        return (r["label"], r["conf"])
+
+    def record_activity_for_visit(self, visit_id, label):
+        """Increment the activity tally for an active visit."""
+        if label is None:
+            return
+        with self._activity_counts_lock:
+            if visit_id not in self._activity_counts:
+                self._activity_counts[visit_id] = collections.Counter()
+            self._activity_counts[visit_id][label] += 1
+
+    def get_visit_top_activity(self, visit_id):
+        """Return the most frequent activity label for a visit, or None."""
+        with self._activity_counts_lock:
+            ctr = self._activity_counts.get(visit_id)
+        if not ctr:
+            return None
+        most = ctr.most_common(1)
+        return most[0][0] if most else None
+
+    def clear_visit_activity(self, visit_id):
+        """Remove activity tally for a closed visit."""
+        with self._activity_counts_lock:
+            self._activity_counts.pop(visit_id, None)
 
     def is_running(self):
         return self._running
@@ -1501,6 +1627,23 @@ class FaceEngine:
 
                 tracks = [t for t in tracks if int(t.get("misses", 0)) <= track_max_misses]
                 tracks = self._dedupe_tracks(tracks)
+
+                # --- Action detection (enqueue to async thread, throttled) ---
+                if self.activity_enabled:
+                    for t in tracks:
+                        name = t.get("name", "unknown")
+                        if name == "unknown":
+                            continue
+                        last_act_t = float(t.get("_last_activity_t", 0.0))
+                        if (now - last_act_t) < self.activity_detect_every:
+                            continue
+                        bbox = t.get("bbox", (0, 0, 0, 0))
+                        try:
+                            self._activity_q.put_nowait((frame.copy(), bbox, name))
+                        except Full:
+                            pass
+                        t["_last_activity_t"] = now
+
                 worker["tracks"] = tracks
                 worker["latest_tracks"] = [
                     {
@@ -1512,6 +1655,8 @@ class FaceEngine:
                             int(t.get("bbox", (0, 0, 0, 0))[2]),
                             int(t.get("bbox", (0, 0, 0, 0))[3]),
                         ],
+                        "activity": self.get_activity(t.get("name", "unknown"))[0],
+                        "activity_conf": self.get_activity(t.get("name", "unknown"))[1],
                     }
                     for t in tracks
                 ]
@@ -1664,6 +1809,9 @@ class FaceEngine:
                     color = (0, 0, 255) if is_unknown else (0, 255, 0)
                     cv2.rectangle(tile, (x, y), (x + w, y + h), color, 2)
                     label = "unknown" if is_unknown else name
+                    act_label, act_conf = self.get_activity(name) if not is_unknown else (None, 0.0)
+                    if act_label:
+                        label = f"{name} | {act_label}"
                     cv2.putText(tile, label, (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
                     aggregated_tracks.append(
@@ -1673,6 +1821,8 @@ class FaceEngine:
                             "bbox": [ox + x, oy + y, w, h],
                             "camera_source": str(source),
                             "last_detect_t": float(t.get("last_detect_t", 0.0)),
+                            "activity": act_label,
+                            "activity_conf": act_conf,
                         }
                     )
 
@@ -1721,6 +1871,9 @@ class FaceEngine:
                         col = (0, 0, 255) if is_unk else (0, 255, 0)
                         cv2.rectangle(footage_frame, (rx, ry), (rx + rw, ry + rh), col, 2)
                         flabel = "unknown" if is_unk else tname
+                        f_act, _ = self.get_activity(tname) if not is_unk else (None, 0.0)
+                        if f_act:
+                            flabel = f"{tname} | {f_act}"
                         font_scale = max(0.5, min(sx, sy) * 0.55)
                         cv2.putText(footage_frame, flabel, (rx, max(0, ry - 8)),
                                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, col, 2)
@@ -1948,6 +2101,22 @@ class FaceEngine:
                 ]
                 self.tracks = self._dedupe_tracks(self.tracks)
 
+                # --- Action detection (enqueue to async thread, throttled) ---
+                if self.activity_enabled:
+                    for t in self.tracks:
+                        name = t.get("name", "unknown")
+                        if name == "unknown":
+                            continue
+                        last_act_t = float(t.get("_last_activity_t", 0.0))
+                        if (now - last_act_t) < self.activity_detect_every:
+                            continue
+                        bbox = t.get("bbox", (0, 0, 0, 0))
+                        try:
+                            self._activity_q.put_nowait((frame.copy(), bbox, name))
+                        except Full:
+                            pass
+                        t["_last_activity_t"] = now
+
             except Empty:
                 pass
 
@@ -1961,6 +2130,9 @@ class FaceEngine:
                 cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
 
                 label = "unknown" if is_unknown else t['name']
+                act_label, _ = self.get_activity(t['name']) if not is_unknown else (None, 0.0)
+                if act_label:
+                    label = f"{t['name']} | {act_label}"
                 cv2.putText(frame, label, (x, max(0, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2,)
 
             # 4b) buffer snapshot for each known person (single-camera mode)
@@ -2000,6 +2172,8 @@ class FaceEngine:
                                 "best": float(t["best"]),
                                 "bbox": [int(t["bbox"][0]), int(t["bbox"][1]), int(t["bbox"][2]), int(t["bbox"][3])],
                                 "last_detect_t": float(t.get("last_detect_t", 0.0)),
+                                "activity": self.get_activity(t["name"])[0],
+                                "activity_conf": self.get_activity(t["name"])[1],
                             }
                             for t in self.tracks
                         ]

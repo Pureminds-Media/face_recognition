@@ -60,7 +60,8 @@ CREATE TABLE IF NOT EXISTS visits (
     session_id      TEXT REFERENCES sessions(id),
     screenshot      TEXT,
     footage         TEXT,
-    visible_duration REAL
+    visible_duration REAL,
+    activity        TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_visits_person     ON visits (person_name);
@@ -95,7 +96,8 @@ CREATE TABLE IF NOT EXISTS visits (
     session_id      UUID REFERENCES sessions(id),
     screenshot      TEXT,
     footage         TEXT,
-    visible_duration FLOAT
+    visible_duration FLOAT,
+    activity        TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_visits_person     ON visits (person_name);
@@ -145,6 +147,11 @@ def init_db(dsn=None):
                     cur.execute("ALTER TABLE visits ADD COLUMN visible_duration FLOAT")
                 except Exception:
                     pass  # column already exists
+                # Migration: add activity column to existing databases
+                try:
+                    cur.execute("ALTER TABLE visits ADD COLUMN activity TEXT")
+                except Exception:
+                    pass  # column already exists
             _backend = "postgres"
             log.info("Database initialised (PostgreSQL)")
             return
@@ -172,6 +179,12 @@ def init_db(dsn=None):
         # Migration: add visible_duration column to existing databases
         try:
             conn.execute("ALTER TABLE visits ADD COLUMN visible_duration REAL")
+            conn.commit()
+        except Exception:
+            pass  # column already exists
+        # Migration: add activity column to existing databases
+        try:
+            conn.execute("ALTER TABLE visits ADD COLUMN activity TEXT")
             conn.commit()
         except Exception:
             pass  # column already exists
@@ -471,10 +484,17 @@ def update_visit_visible_duration(visit_id, visible_duration):
         cur.execute(sql, (visible_duration, visit_id))
 
 
+def update_visit_activity(visit_id, activity):
+    """Set the most frequent activity label for a visit."""
+    sql = _param("UPDATE visits SET activity = %s WHERE id = %s")
+    with _cursor(commit=True) as cur:
+        cur.execute(sql, (activity, visit_id))
+
+
 def get_open_visit(person_name, location_id):
     """Return the open visit for a person at a location, or None."""
     sql = _param("""
-        SELECT id, person_name, location_id, first_seen, last_seen, confidence, screenshot, footage, visible_duration
+        SELECT id, person_name, location_id, first_seen, last_seen, confidence, screenshot, footage, visible_duration, activity
         FROM visits
         WHERE person_name = %s AND location_id = %s AND NOT ended
         ORDER BY first_seen DESC LIMIT 1
@@ -489,7 +509,7 @@ def get_all_open_visits():
     with _cursor() as cur:
         cur.execute("""
             SELECT v.id, v.person_name, v.location_id, v.first_seen, v.last_seen,
-                   v.confidence, v.screenshot, v.footage, v.visible_duration,
+                   v.confidence, v.screenshot, v.footage, v.visible_duration, v.activity,
                    l.name as location_name, l.camera_source
             FROM visits v
             JOIN locations l ON l.id = v.location_id
@@ -542,7 +562,7 @@ def get_person_visits(person_name, date_from=None, date_to=None, limit=200):
 
     sql = f"""
         SELECT v.id, v.person_name, v.first_seen, v.last_seen, v.ended,
-               v.confidence, v.screenshot, v.footage, v.visible_duration,
+               v.confidence, v.screenshot, v.footage, v.visible_duration, v.activity,
                l.name as location_name, l.camera_source
         FROM visits v
         JOIN locations l ON l.id = v.location_id
@@ -570,7 +590,7 @@ def get_location_visits(location_id, date_from=None, date_to=None, limit=200):
 
     sql = f"""
         SELECT v.id, v.person_name, v.first_seen, v.last_seen, v.ended,
-               v.confidence, v.screenshot, v.footage, v.visible_duration,
+               v.confidence, v.screenshot, v.footage, v.visible_duration, v.activity,
                l.name as location_name
         FROM visits v
         JOIN locations l ON l.id = v.location_id
@@ -604,7 +624,7 @@ def get_daily_summary(date):
     ph = "?" if _backend == "sqlite" else "%s"
     sql = f"""
         SELECT v.id, v.person_name, v.first_seen, v.last_seen, v.ended,
-               v.confidence, v.screenshot, v.footage, v.visible_duration,
+               v.confidence, v.screenshot, v.footage, v.visible_duration, v.activity,
                l.name as location_name, l.camera_source
         FROM visits v
         JOIN locations l ON l.id = v.location_id

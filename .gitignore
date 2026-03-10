@@ -201,3 +201,9 @@ screenshots/
 
 # Visit footage clips
 footage/
+
+# Cached ONNX models (auto-downloaded on first run)
+models/
+
+# QR test artifacts
+qr_test/

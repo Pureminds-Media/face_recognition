@@ -91,12 +91,13 @@
                   <th class="px-4 py-3 text-left">Arrived</th>
                   <th class="px-4 py-3 text-left">Left</th>
                   <th class="px-4 py-3 text-left">Duration</th>
+                  <th class="px-4 py-3 text-left activity-col">Action</th>
                   <th class="px-4 py-3 text-left">Status</th>
                 </tr>
               </thead>
               <tbody id="dailyTableBody">
                 <tr>
-                  <td colspan="7" class="px-4 py-6 text-center text-slate-500">
+                  <td class="px-4 py-6 text-center text-slate-500 empty-msg">
                     Select a date and click Load
                   </td>
                 </tr>
@@ -147,12 +148,13 @@
                   <th class="px-4 py-3 text-left">Arrived</th>
                   <th class="px-4 py-3 text-left">Left</th>
                   <th class="px-4 py-3 text-left">Duration</th>
+                  <th class="px-4 py-3 text-left activity-col">Action</th>
                   <th class="px-4 py-3 text-left">Status</th>
                 </tr>
               </thead>
               <tbody id="personTableBody">
                 <tr>
-                  <td colspan="7" class="px-4 py-6 text-center text-slate-500">
+                  <td class="px-4 py-6 text-center text-slate-500 empty-msg">
                     Select a person and click Load
                   </td>
                 </tr>
@@ -201,12 +203,13 @@
                   <th class="px-4 py-3 text-left">Arrived</th>
                   <th class="px-4 py-3 text-left">Left</th>
                   <th class="px-4 py-3 text-left">Duration</th>
+                  <th class="px-4 py-3 text-left activity-col">Action</th>
                   <th class="px-4 py-3 text-left">Status</th>
                 </tr>
               </thead>
               <tbody id="locationTableBody">
                 <tr>
-                  <td colspan="7" class="px-4 py-6 text-center text-slate-500">
+                  <td class="px-4 py-6 text-center text-slate-500 empty-msg">
                     Select a location and click Load
                   </td>
                 </tr>
@@ -218,6 +221,9 @@
     </div>
 
     <script>
+      // --- Action detection feature flag ---
+      let _activityEnabled = true;  // updated from /api/status on init
+
       // --- Tabs ---
       document.querySelectorAll(".tab-btn").forEach((btn) => {
         btn.addEventListener("click", () => {
@@ -275,12 +281,18 @@
         cols += `<td class="px-4 py-2 text-slate-300">${fmtTime(v.first_seen)}</td>`;
         cols += `<td class="px-4 py-2 text-slate-300">${fmtTime(v.last_seen)}</td>`;
         cols += `<td class="px-4 py-2 text-slate-300">${v.duration_fmt}</td>`;
+        if (_activityEnabled) cols += `<td class="px-4 py-2 activity-col">${v.activity ? `<span class="px-2 py-0.5 rounded text-xs bg-blue-900 text-blue-300">${v.activity}</span>` : '<span class="text-slate-600 text-xs">--</span>'}</td>`;
         cols += `<td class="px-4 py-2">${statusBadge(v)}</td>`;
         return `<tr class="border-b border-slate-800/50 hover:bg-slate-800/30">${cols}</tr>`;
       }
 
       function today() {
         return new Date().toISOString().split("T")[0];
+      }
+
+      function emptyRow(msg) {
+        const span = _activityEnabled ? 8 : 7;
+        return `<tr><td colspan="${span}" class="px-4 py-6 text-center text-slate-500">${msg}</td></tr>`;
       }
 
       // --- Daily Summary ---
@@ -306,7 +318,7 @@
           dailyMsg.textContent = `${j.visits.length} visit(s)`;
           dailyTableBody.innerHTML = j.visits.length
             ? j.visits.map((v) => visitRow(v)).join("")
-            : `<tr><td colspan="7" class="px-4 py-6 text-center text-slate-500">No visits on this date</td></tr>`;
+            : emptyRow("No visits on this date");
 
           // Totals
           const totals = j.person_totals || {};
@@ -365,7 +377,7 @@
           if (!j.ok) return;
           personTableBody.innerHTML = j.visits.length
             ? j.visits.map((v) => visitRow(v, { showDate: true, showPerson: false })).join("")
-            : `<tr><td colspan="7" class="px-4 py-6 text-center text-slate-500">No visits found</td></tr>`;
+            : emptyRow("No visits found");
 
           personSummary.innerHTML = `
             <div class="rounded-lg border border-slate-800 bg-slate-900 px-4 py-3 inline-block">
@@ -412,7 +424,7 @@
           if (!j.ok) return;
           locationTableBody.innerHTML = j.visits.length
             ? j.visits.map((v) => visitRow(v, { showDate: true, showLocation: false })).join("")
-            : `<tr><td colspan="7" class="px-4 py-6 text-center text-slate-500">No visits found</td></tr>`;
+            : emptyRow("No visits found");
         } catch {}
       });
 
@@ -461,6 +473,22 @@
       }
 
       // --- Init ---
+      async function initActionFlag() {
+        try {
+          const r = await fetch("/api/status");
+          const j = await r.json();
+          _activityEnabled = !!j.action_enabled;
+        } catch { _activityEnabled = true; }
+        if (!_activityEnabled) {
+          document.querySelectorAll(".activity-col").forEach(el => el.style.display = "none");
+        }
+        // Set colspan on empty-msg cells based on column count
+        document.querySelectorAll(".empty-msg").forEach(td => {
+          const cols = td.closest("table").querySelectorAll("thead th:not([style*='display: none'])").length;
+          td.setAttribute("colspan", cols);
+        });
+      }
+      initActionFlag();
       loadPersons();
       loadLocations();
     </script>

@@ -107,6 +107,18 @@ _last_stale_check = time.monotonic()
 
 
 def _shutdown_db():
+    # Save activity for all active visits before closing
+    if db.is_available():
+        for name, v in list(_active_visits.items()):
+            vid = v.get("visit_id")
+            if vid:
+                top = engine.get_visit_top_activity(vid)
+                if top:
+                    try:
+                        db.update_visit_activity(vid, top)
+                    except Exception:
+                        pass
+                engine.clear_visit_activity(vid)
     footage_results = engine.stop_all_footage()
     if db.is_available():
         # Save visible_duration for all visits that had active footage writers
@@ -290,6 +302,18 @@ def _update_attendance_from_tracks(tracks):
         if db.is_available():
             _update_visit_for_person(name, camera_source, confidence, last_detect_t)
 
+        # --- Record activity tally for this person's active visit ---
+        active_v = _active_visits.get(name)
+        if active_v and active_v.get("visit_id"):
+            act_label, _ = engine.get_activity(name)
+            if act_label:
+                vid = active_v["visit_id"]
+                engine.record_activity_for_visit(vid, act_label)
+                # Keep DB column up-to-date (not just on visit close)
+                top = engine.get_visit_top_activity(vid)
+                if top and db.is_available():
+                    db.update_visit_activity(vid, top)
+
     # Mark disappeared after a grace period (avoid flicker)
     for name, s in list(attendance_state.items()):
         if s.get("present", False) and (now_mono - s.get("last_seen_mono", now_mono)) > ATTENDANCE_DISAPPEAR_SECS:
@@ -349,7 +373,7 @@ def _start_visit_footage(visit_id, person_name, camera_source):
 
 
 def _stop_visit_footage(visit_id):
-    """Close the footage VideoWriter for a visit and save visible_duration."""
+    """Close the footage VideoWriter for a visit, save visible_duration and activity."""
     try:
         fname, visible_secs = engine.stop_footage(visit_id)
         if fname:
@@ -357,6 +381,11 @@ def _stop_visit_footage(visit_id):
                        visit_id, fname, visible_secs)
             if visible_secs > 0:
                 db.update_visit_visible_duration(visit_id, visible_secs)
+        # Save the most frequent activity detected during this visit
+        top_activity = engine.get_visit_top_activity(visit_id)
+        if top_activity:
+            db.update_visit_activity(visit_id, top_activity)
+        engine.clear_visit_activity(visit_id)
     except Exception as e:
         log.debug("Failed to stop footage for visit %s: %s", visit_id, e)
 
@@ -932,6 +961,7 @@ def api_status():
         "running": engine.is_running(),
         "identities": len(engine.known_embeddings),
         "camera_source": _camera_source_to_text(engine.cam_index),
+        "action_enabled": engine.activity_enabled,
     })
 
 
@@ -1184,6 +1214,7 @@ def _serialize_visit(v):
         "confidence": round(float(v["confidence"]), 3) if v.get("confidence") else None,
         "screenshot_url": f"/screenshots/{v['screenshot']}" if v.get("screenshot") else None,
         "footage_url": f"/footage/{v['footage']}" if v.get("footage") else None,
+        "activity": v.get("activity"),
     }
 
 
