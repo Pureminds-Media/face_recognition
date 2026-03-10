@@ -915,6 +915,12 @@ def api_upload_face():
     if not person:
         return jsonify({"ok": False, "error": "person name is required"}), 400
 
+    # When creating a new person, check that the folder doesn't already exist
+    if mode == "new":
+        person_dir_check = os.path.join(FACES_DIR, person)
+        if os.path.isdir(person_dir_check):
+            return jsonify({"ok": False, "error": f"Person '{person}' already exists. Use 'Existing' to add more images."}), 409
+
     # extension
     original = secure_filename(f.filename or "")
     ext = os.path.splitext(original)[1].lower()
@@ -967,11 +973,20 @@ def api_status():
 
 @app.route("/api/camera", methods=["GET"])
 def api_camera_get():
+    # Determine which camera indices the engine currently holds open
+    active_cams = []
+    if engine.is_running():
+        if engine.is_grid_mode():
+            sources = engine._parse_grid_sources(engine.cam_index)
+            active_cams = [s for s in sources if isinstance(s, int)]
+        elif isinstance(engine.cam_index, int):
+            active_cams = [engine.cam_index]
     return jsonify(
         {
             "running": engine.is_running(),
             "camera_source": _camera_source_to_text(engine.cam_index),
             "devices": _list_camera_devices(),
+            "active_cameras": active_cams,
         }
     )
 

@@ -107,7 +107,7 @@ faces/
 
 Supported formats: `.jpg`, `.jpeg`, `.png`, `.webp`
 
-You can also upload images via the web UI.
+You can also take or upload images via the web UI.
 
 ### 6) Run
 

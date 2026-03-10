@@ -202,7 +202,7 @@
                         name="mode"
                         value="existing"
                         checked
-                        class="accent-slate-200"
+                        class="accent-emerald-500"
                       />
                       Existing
                     </label>
@@ -211,7 +211,7 @@
                         type="radio"
                         name="mode"
                         value="new"
-                        class="accent-slate-200"
+                        class="accent-emerald-500"
                       />
                       New
                     </label>
@@ -229,6 +229,7 @@
                     placeholder="e.g. Ahmed_AlQahtani"
                     class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm hidden"
                   />
+                  <div id="nameValidation" class="text-xs text-red-400 hidden"></div>
                   <div class="text-xs text-slate-400">
                     Folder names are sanitized (letters/numbers/_-).
                   </div>
@@ -236,21 +237,44 @@
 
                 <div class="space-y-2">
                   <div class="text-sm text-slate-300">Image</div>
-                  <input
-                    name="file"
-                    type="file"
-                    accept="image/*"
-                    required
-                    class="w-full text-sm text-slate-200 file:mr-3 file:rounded-lg file:border-0 file:bg-slate-800 file:px-3 file:py-2 file:text-sm file:text-slate-100 hover:file:bg-slate-700"
-                  />
+                  <div class="flex items-center gap-2">
+                    <input
+                      name="file"
+                      id="fileInput"
+                      type="file"
+                      accept="image/*"
+                      required
+                      class="flex-1 min-w-0 text-sm text-slate-200 file:mr-3 file:rounded-lg file:border-0 file:bg-slate-800 file:px-3 file:py-2 file:text-sm file:text-slate-100 hover:file:bg-slate-700"
+                    />
+                    <button
+                      type="button"
+                      onclick="openCaptureModal()"
+                      class="shrink-0 rounded-lg bg-slate-800 hover:bg-slate-700 p-2 text-slate-300 hover:text-white transition-colors"
+                      title="Take photo with camera"
+                    >
+                      <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"/>
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z"/>
+                      </svg>
+                    </button>
+                  </div>
                 </div>
 
                 <button
                   type="submit"
-                  class="w-full rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium"
+                  id="uploadBtn"
+                  class="w-full rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   Upload
                 </button>
+
+                <!-- Progress bar (hidden by default) -->
+                <div id="uploadProgress" class="hidden space-y-1">
+                  <div class="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+                    <div id="uploadProgressBar" class="h-full rounded-full bg-emerald-500 transition-all duration-200" style="width: 0%"></div>
+                  </div>
+                  <div id="uploadProgressText" class="text-xs text-slate-400 text-center">0%</div>
+                </div>
 
                 <div id="uploadMsg" class="text-xs text-slate-300"></div>
               </form>
@@ -261,6 +285,29 @@
     </div>
 
     <div id="toastContainer" class="fixed top-4 right-4 z-50 space-y-2"></div>
+
+    <!-- Camera Capture Modal -->
+    <div id="captureModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
+      <div class="relative bg-slate-900 rounded-xl border border-slate-700 shadow-2xl p-4 max-w-lg w-full mx-4 space-y-3">
+        <div class="flex items-center justify-between">
+          <div class="text-sm font-medium">Take Photo</div>
+          <button onclick="closeCaptureModal()" class="text-slate-400 hover:text-red-400 text-xl font-bold transition-colors">&times;</button>
+        </div>
+        <select id="captureDeviceSelect" onchange="switchCaptureCamera()"
+          class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm">
+        </select>
+        <div id="captureCamMsg" class="text-xs text-yellow-400 hidden"></div>
+        <div class="relative rounded-lg overflow-hidden bg-black aspect-video">
+          <video id="capturePreview" autoplay playsinline
+            class="w-full h-full object-cover" style="transform: scaleX(-1)"></video>
+        </div>
+        <canvas id="captureCanvas" class="hidden"></canvas>
+        <button type="button" onclick="capturePhoto()"
+          class="w-full rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium">
+          Capture
+        </button>
+      </div>
+    </div>
 
     <script>
       // --- DOM (guarded, since some sections may be removed) ---
@@ -549,14 +596,44 @@
       }
 
       document.querySelectorAll('input[name="mode"]').forEach((r) => {
-        r.addEventListener("change", setModeUI);
+        r.addEventListener("change", () => { setModeUI(); validateNewName(); });
       });
 
+      // --- New name duplicate validation ---
+      const nameValidation = document.getElementById("nameValidation");
+
+      function sanitizeName(raw) {
+        return raw.trim().replace(/ /g, "_").replace(/[^A-Za-z0-9_\-]/g, "").slice(0, 64);
+      }
+
+      function validateNewName() {
+        if (!nameValidation) return true;
+        if (currentMode() !== "new") {
+          nameValidation.classList.add("hidden");
+          return true;
+        }
+        const sanitized = sanitizeName(newNameInput.value);
+        if (sanitized && _knownPeopleNames.includes(sanitized.toLowerCase())) {
+          nameValidation.textContent = `"${sanitized}" already exists. Use "Existing" to add more images.`;
+          nameValidation.classList.remove("hidden");
+          return false;
+        }
+        nameValidation.classList.add("hidden");
+        return true;
+      }
+
+      if (newNameInput) {
+        newNameInput.addEventListener("input", validateNewName);
+      }
+
       // --- People list (for dropdown; grid section can be removed safely) ---
+      let _knownPeopleNames = [];
+
       async function refreshPeople() {
         const r = await fetch("/api/people");
         const j = await r.json();
         const people = j.people || [];
+        _knownPeopleNames = people.map(p => p.name.toLowerCase());
 
         if (peopleCountEl) peopleCountEl.textContent = `${people.length} total`;
         if (peopleListEl) {
@@ -847,32 +924,258 @@
 
       // --- Upload ---
       const uploadForm = document.getElementById("uploadForm");
+      const uploadBtn = document.getElementById("uploadBtn");
+      const uploadProgress = document.getElementById("uploadProgress");
+      const uploadProgressBar = document.getElementById("uploadProgressBar");
+      const uploadProgressText = document.getElementById("uploadProgressText");
+
+      function _setProgress(pct) {
+        if (!uploadProgress || !uploadProgressBar || !uploadProgressText) return;
+        uploadProgress.classList.remove("hidden");
+        uploadProgressBar.style.width = pct + "%";
+        uploadProgressText.textContent = pct < 100 ? pct + "%" : "Processing...";
+      }
+
+      function _hideProgress() {
+        if (uploadProgress) uploadProgress.classList.add("hidden");
+        if (uploadProgressBar) uploadProgressBar.style.width = "0%";
+        if (uploadProgressText) uploadProgressText.textContent = "0%";
+      }
+
+      function _setUploading(busy) {
+        if (uploadBtn) {
+          uploadBtn.disabled = busy;
+          uploadBtn.textContent = busy ? "Uploading..." : "Upload";
+        }
+      }
+
       if (uploadForm) {
         uploadForm.onsubmit = async (e) => {
           e.preventDefault();
-          if (uploadMsg) uploadMsg.textContent = "Uploading...";
+          if (!validateNewName()) {
+            if (uploadMsg) uploadMsg.textContent = "Fix the name error above first.";
+            return;
+          }
 
           const fd = new FormData(e.target);
           fd.set("mode", currentMode());
 
-          const r = await fetch("/api/upload_face", {
-            method: "POST",
-            body: fd,
+          // Clear previous messages
+          if (uploadMsg) { uploadMsg.textContent = ""; uploadMsg.className = "text-xs text-slate-300"; }
+          _setUploading(true);
+          _setProgress(0);
+
+          // Use XMLHttpRequest for upload progress tracking
+          const xhr = new XMLHttpRequest();
+
+          xhr.upload.addEventListener("progress", (ev) => {
+            if (ev.lengthComputable) {
+              const pct = Math.round((ev.loaded / ev.total) * 100);
+              _setProgress(pct);
+            }
           });
-          const j = await r.json();
 
-          if (!r.ok) {
-            if (uploadMsg)
-              uploadMsg.textContent = "Error: " + (j.error || "upload failed");
-            return;
-          }
+          xhr.addEventListener("load", async () => {
+            _hideProgress();
+            _setUploading(false);
 
-          if (uploadMsg)
-            uploadMsg.textContent = `Saved to ${j.person}/ (reloaded embeddings)`;
+            let j;
+            try { j = JSON.parse(xhr.responseText); } catch { j = {}; }
 
-          // Refresh people list after successful upload
-          await refreshPeople();
+            if (xhr.status < 200 || xhr.status >= 300) {
+              if (uploadMsg) {
+                uploadMsg.textContent = "Error: " + (j.error || "upload failed");
+                uploadMsg.className = "text-xs text-red-400";
+              }
+              return;
+            }
+
+            // Success — show inline confirmation + toast
+            if (uploadMsg) {
+              uploadMsg.innerHTML =
+                '<span class="inline-flex items-center gap-1 text-emerald-400">' +
+                '<svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">' +
+                '<path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"/></svg>' +
+                'Saved to ' + (j.person || '') + '/</span>';
+              uploadMsg.className = "text-xs";
+            }
+            toast("Face image uploaded to " + (j.person || "folder"), "success");
+
+            // Refresh people list after successful upload
+            await refreshPeople();
+
+            // Reset form: clear file input, name, and radio buttons
+            uploadForm.reset();
+            setModeUI();
+            if (nameValidation) nameValidation.classList.add("hidden");
+
+            // Clear the success message after a few seconds
+            setTimeout(() => {
+              if (uploadMsg) { uploadMsg.textContent = ""; uploadMsg.className = "text-xs text-slate-300"; }
+            }, 4000);
+          });
+
+          xhr.addEventListener("error", () => {
+            _hideProgress();
+            _setUploading(false);
+            if (uploadMsg) {
+              uploadMsg.textContent = "Network error — check your connection.";
+              uploadMsg.className = "text-xs text-red-400";
+            }
+          });
+
+          xhr.addEventListener("abort", () => {
+            _hideProgress();
+            _setUploading(false);
+            if (uploadMsg) { uploadMsg.textContent = "Upload cancelled."; uploadMsg.className = "text-xs text-slate-300"; }
+          });
+
+          xhr.open("POST", "/api/upload_face");
+          xhr.send(fd);
         };
+      }
+
+      // --- Camera Capture ---
+      let _captureStream = null;
+      let _engineCamIndices = [];   // camera indices currently held by the engine
+
+      async function _fetchEngineCameras() {
+        // Ask the backend which camera indices the engine currently holds open
+        try {
+          const r = await fetch('/api/camera');
+          const j = await r.json();
+          _engineCamIndices = (j.running && Array.isArray(j.active_cameras))
+            ? j.active_cameras : [];
+        } catch (_) {
+          _engineCamIndices = [];
+        }
+      }
+
+      function _cameraErrorMessage(err) {
+        const name = err.name || '';
+        if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+          return 'Camera permission denied. Please allow camera access in your browser.';
+        }
+        if (name === 'NotReadableError' || name === 'AbortError' || name === 'TrackStartError') {
+          return 'Camera is in use by another application (possibly the recognition engine). Try a different camera or stop the engine first.';
+        }
+        if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+          return 'No camera found on this device.';
+        }
+        if (name === 'OverconstrainedError') {
+          return 'Camera does not support the requested resolution.';
+        }
+        return 'Could not open camera: ' + (err.message || name);
+      }
+
+      async function openCaptureModal() {
+        const modal = document.getElementById('captureModal');
+        const select = document.getElementById('captureDeviceSelect');
+        const camMsg = document.getElementById('captureCamMsg');
+        if (camMsg) { camMsg.textContent = ''; camMsg.classList.add('hidden'); }
+        modal.classList.remove('hidden');
+
+        // Fetch engine camera info in parallel with permission probe
+        const engineProm = _fetchEngineCameras();
+
+        // Request permission first so device labels are available
+        try {
+          const tempStream = await navigator.mediaDevices.getUserMedia({ video: true });
+          tempStream.getTracks().forEach(t => t.stop());
+        } catch (err) {
+          console.warn('Camera probe failed:', err);
+          closeCaptureModal();
+          if (uploadMsg) uploadMsg.textContent = _cameraErrorMessage(err);
+          return;
+        }
+
+        await engineProm;
+
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const cameras = devices.filter(d => d.kind === 'videoinput');
+
+        select.innerHTML = cameras.map((d, i) => {
+          const label = d.label || 'Camera ' + i;
+          // Try to detect if this is one of the engine's cameras by matching the index in the label
+          const idxMatch = label.match(/\b(\d+)\b/);
+          const inUse = idxMatch && _engineCamIndices.includes(parseInt(idxMatch[1]));
+          const suffix = inUse ? ' (in use by engine)' : '';
+          return `<option value="${d.deviceId}">${label}${suffix}</option>`;
+        }).join('');
+
+        if (_engineCamIndices.length > 0 && camMsg) {
+          camMsg.textContent = 'Note: The recognition engine is using camera ' +
+            _engineCamIndices.join(', ') + '. If a camera fails to open, try a different one or stop the engine first.';
+          camMsg.classList.remove('hidden');
+        }
+
+        if (cameras.length > 0) {
+          await switchCaptureCamera();
+        }
+      }
+
+      async function switchCaptureCamera() {
+        if (_captureStream) {
+          _captureStream.getTracks().forEach(t => t.stop());
+          _captureStream = null;
+        }
+
+        const select = document.getElementById('captureDeviceSelect');
+        const video = document.getElementById('capturePreview');
+        const camMsg = document.getElementById('captureCamMsg');
+        const deviceId = select.value;
+        if (!deviceId) return;
+
+        try {
+          _captureStream = await navigator.mediaDevices.getUserMedia({
+            video: { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+          });
+          video.srcObject = _captureStream;
+          // Clear any previous per-camera error (keep the engine-note if present)
+        } catch (err) {
+          console.error('Camera error:', err);
+          video.srcObject = null;
+          if (camMsg) {
+            camMsg.textContent = _cameraErrorMessage(err);
+            camMsg.classList.remove('hidden');
+          }
+        }
+      }
+
+      function capturePhoto() {
+        const video = document.getElementById('capturePreview');
+        const canvas = document.getElementById('captureCanvas');
+        const fileInput = document.getElementById('fileInput');
+
+        if (!video.videoWidth) return;
+
+        // Draw unmirrored frame to canvas
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(video, 0, 0);
+
+        canvas.toBlob((blob) => {
+          if (!blob) return;
+          const file = new File([blob], 'capture.jpg', { type: 'image/jpeg' });
+          const dt = new DataTransfer();
+          dt.items.add(file);
+          fileInput.files = dt.files;
+
+          closeCaptureModal();
+          if (uploadMsg) uploadMsg.textContent = 'Photo captured. Click Upload to save.';
+        }, 'image/jpeg', 0.92);
+      }
+
+      function closeCaptureModal() {
+        if (_captureStream) {
+          _captureStream.getTracks().forEach(t => t.stop());
+          _captureStream = null;
+        }
+        const modal = document.getElementById('captureModal');
+        const video = document.getElementById('capturePreview');
+        video.srcObject = null;
+        modal.classList.add('hidden');
       }
 
       // --- initial ---

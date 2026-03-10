@@ -1373,8 +1373,11 @@ class FaceEngine:
             ordered_sources.append(src_key)
 
         if not workers:
-            self._cleanup_grid_mode()
-            raise RuntimeError("Cannot open any camera for grid mode")
+            import logging
+            logging.getLogger(__name__).warning(
+                "Grid mode: no cameras opened — all tiles will show 'No Signal'. "
+                "Check that at least one configured camera is connected."
+            )
 
         self._grid_workers = workers
         self._grid_sources = ordered_sources
