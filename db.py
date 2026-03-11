@@ -645,6 +645,24 @@ def get_known_persons(limit=500):
         return [dict(r)["person_name"] for r in cur.fetchall()]
 
 
+def rename_person(old_name, new_name):
+    """Rename a person across all visits. Returns number of rows updated."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    sql = _param(f"UPDATE visits SET person_name = {ph} WHERE person_name = {ph}")
+    with _cursor(commit=True) as cur:
+        cur.execute(sql, (new_name, old_name))
+        return cur.rowcount
+
+
+def delete_person_visits(person_name):
+    """Delete all visits for a person. Returns number of rows deleted."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    sql = _param(f"DELETE FROM visits WHERE person_name = {ph}")
+    with _cursor(commit=True) as cur:
+        cur.execute(sql, (person_name,))
+        return cur.rowcount
+
+
 def clear_all_data():
     """Delete all visits and sessions. Locations are kept (they map to cameras).
 

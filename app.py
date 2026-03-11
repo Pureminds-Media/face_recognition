@@ -1,4 +1,5 @@
 import os
+import shutil
 import atexit
 import time
 import re
@@ -784,6 +785,10 @@ def index():
 def test_page():
     return render_template("test.html")
 
+@app.route("/people")
+def people_page():
+    return render_template("people.html")
+
 @app.route("/video")
 def video():
     if not engine.is_running():
@@ -945,6 +950,165 @@ def api_upload_face():
 
     engine.reload_faces()
     return jsonify({"ok": True, "person": person, "saved": f"/faces/{person}/{filename}"})
+
+@app.route("/api/rename_person", methods=["POST"])
+def api_rename_person():
+    """Rename a person: move faces/ folder + update DB visits."""
+    data = request.get_json(silent=True) or {}
+    old_name = (data.get("old_name") or "").strip()
+    new_name_raw = (data.get("new_name") or "").strip()
+
+    if not old_name:
+        return jsonify({"ok": False, "error": "old_name is required"}), 400
+
+    new_name = safe_person_name(new_name_raw)
+    if not new_name:
+        return jsonify({"ok": False, "error": "new_name is required (letters, numbers, _, -)"}), 400
+
+    old_dir = os.path.join(FACES_DIR, old_name)
+    new_dir = os.path.join(FACES_DIR, new_name)
+
+    if not os.path.isdir(old_dir):
+        return jsonify({"ok": False, "error": f"Person '{old_name}' not found"}), 404
+
+    if old_name == new_name:
+        return jsonify({"ok": True, "person": new_name, "renamed_visits": 0})
+
+    if os.path.exists(new_dir):
+        return jsonify({"ok": False, "error": f"Person '{new_name}' already exists"}), 409
+
+    # Rename folder
+    os.rename(old_dir, new_dir)
+
+    # Update DB visits
+    rows = db.rename_person(old_name, new_name)
+
+    # Reload face embeddings
+    engine.reload_faces()
+
+    return jsonify({"ok": True, "person": new_name, "renamed_visits": rows})
+
+@app.route("/api/person/<name>", methods=["DELETE"])
+def api_delete_person(name):
+    """Delete a person: remove faces/ folder + optionally delete visits."""
+    person = safe_person_name(name)
+    if not person:
+        return jsonify({"ok": False, "error": "Invalid person name"}), 400
+
+    person_dir = os.path.join(FACES_DIR, person)
+    if not os.path.isdir(person_dir):
+        return jsonify({"ok": False, "error": f"Person '{person}' not found"}), 404
+
+    # Remove face images
+    shutil.rmtree(person_dir)
+
+    # Delete visits from DB
+    deleted_visits = db.delete_person_visits(person)
+
+    # Reload face embeddings
+    engine.reload_faces()
+
+    return jsonify({"ok": True, "person": person, "deleted_visits": deleted_visits})
+
+@app.route("/api/person/<name>/images")
+def api_person_images(name):
+    """List all face images for a person."""
+    person = safe_person_name(name)
+    if not person:
+        return jsonify({"ok": False, "error": "Invalid person name"}), 400
+
+    person_dir = os.path.join(FACES_DIR, person)
+    if not os.path.isdir(person_dir):
+        return jsonify({"ok": False, "error": f"Person '{person}' not found"}), 404
+
+    imgs = []
+    for f in sorted(os.listdir(person_dir)):
+        if os.path.splitext(f)[1].lower() in ALLOWED_EXTS:
+            imgs.append({"filename": f, "url": f"/faces/{person}/{f}"})
+
+    return jsonify({"ok": True, "person": person, "images": imgs})
+
+@app.route("/api/person/<name>/image/<filename>", methods=["DELETE"])
+def api_delete_person_image(name, filename):
+    """Delete a single face image from a person's folder."""
+    person = safe_person_name(name)
+    if not person:
+        return jsonify({"ok": False, "error": "Invalid person name"}), 400
+
+    # Sanitise filename
+    filename = secure_filename(filename)
+    if not filename:
+        return jsonify({"ok": False, "error": "Invalid filename"}), 400
+
+    person_dir = os.path.join(FACES_DIR, person)
+    file_path = os.path.join(person_dir, filename)
+
+    if not os.path.isfile(file_path):
+        return jsonify({"ok": False, "error": "Image not found"}), 404
+
+    os.remove(file_path)
+
+    # If directory is now empty, remove the person folder entirely
+    remaining = [f for f in os.listdir(person_dir) if os.path.splitext(f)[1].lower() in ALLOWED_EXTS]
+    person_removed = False
+    if not remaining:
+        shutil.rmtree(person_dir)
+        person_removed = True
+
+    engine.reload_faces()
+    return jsonify({"ok": True, "person_removed": person_removed})
+
+@app.route("/api/person/<name>/image/<filename>/transfer", methods=["POST"])
+def api_transfer_person_image(name, filename):
+    """Move a face image from one person to another."""
+    person = safe_person_name(name)
+    if not person:
+        return jsonify({"ok": False, "error": "Invalid source person name"}), 400
+
+    filename = secure_filename(filename)
+    if not filename:
+        return jsonify({"ok": False, "error": "Invalid filename"}), 400
+
+    data = request.get_json(silent=True) or {}
+    target_name = safe_person_name(data.get("target", ""))
+    if not target_name:
+        return jsonify({"ok": False, "error": "target person name is required"}), 400
+
+    if person == target_name:
+        return jsonify({"ok": False, "error": "Source and target are the same"}), 400
+
+    src_dir = os.path.join(FACES_DIR, person)
+    src_path = os.path.join(src_dir, filename)
+
+    if not os.path.isfile(src_path):
+        return jsonify({"ok": False, "error": "Source image not found"}), 404
+
+    # Ensure target directory exists
+    tgt_dir = os.path.join(FACES_DIR, target_name)
+    os.makedirs(tgt_dir, exist_ok=True)
+
+    # Determine next filename in target folder
+    ext = os.path.splitext(filename)[1].lower() or ".jpg"
+    new_filename = next_image_filename(tgt_dir, ext)
+    tgt_path = os.path.join(tgt_dir, new_filename)
+
+    # Move the file
+    shutil.move(src_path, tgt_path)
+
+    # If source directory is now empty of images, remove it
+    remaining = [f for f in os.listdir(src_dir) if os.path.splitext(f)[1].lower() in ALLOWED_EXTS] if os.path.isdir(src_dir) else []
+    person_removed = False
+    if not remaining:
+        shutil.rmtree(src_dir, ignore_errors=True)
+        person_removed = True
+
+    engine.reload_faces()
+    return jsonify({
+        "ok": True,
+        "target": target_name,
+        "new_filename": new_filename,
+        "person_removed": person_removed,
+    })
 
 @app.route("/faces/<person>/<path:filename>")
 def faces_file(person, filename):

@@ -257,6 +257,11 @@ class FaceEngine:
         self._activity_counts = {}
         self._activity_counts_lock = threading.Lock()
 
+        # Auto-capture unknowns
+        self._unknown_pending = {}  # id(track) -> {"count", "best_frame", "best_bbox", "best_area"}
+        self._unknown_capture_min_detections = 4  # ~1.2s at detect_every=0.3
+        self._unknown_max_auto = 50  # max unknown_N folders
+
     # ---------- public ----------
     def start(self):
         if self._running:
@@ -1001,6 +1006,112 @@ class FaceEngine:
                     t["last_head_t"] = now
                     break  # one head match per track is enough
 
+    # ---------- auto-capture unknowns ----------
+
+    def _next_unknown_name(self):
+        """Scan known_dir for unknown_N folders, return (next_name, existing_count)."""
+        import re as _re
+        existing = []
+        if os.path.isdir(self.known_dir):
+            for d in os.listdir(self.known_dir):
+                m = _re.match(r"^unknown_(\d+)$", d)
+                if m and os.path.isdir(os.path.join(self.known_dir, d)):
+                    existing.append(int(m.group(1)))
+        next_id = max(existing, default=0) + 1
+        return f"unknown_{next_id}", len(existing)
+
+    def _try_capture_unknown(self, track, frame, now):
+        """
+        Accumulate consecutive face-detector-confirmed 'unknown' detections.
+        After _unknown_capture_min_detections, save a cropped face image and
+        promote the track to a named unknown_N identity.
+        Returns the new name if captured, else None.
+        """
+        tid = id(track)
+
+        # Only process face-detector-confirmed unknowns
+        if track.get("name") != "unknown":
+            # Track was recognised — discard any pending accumulation
+            self._unknown_pending.pop(tid, None)
+            return None
+
+        last_det = track.get("last_detect_t", 0)
+        if now - last_det > self.detect_every * 2:
+            # Not freshly detector-confirmed — skip
+            return None
+
+        # Compute face area for quality selection
+        bx, by, bw, bh = track.get("bbox", (0, 0, 0, 0))
+        area = bw * bh
+        if area <= 0:
+            return None
+
+        entry = self._unknown_pending.get(tid)
+        if entry is None:
+            entry = {"count": 0, "best_frame": None, "best_bbox": None, "best_area": 0}
+            self._unknown_pending[tid] = entry
+
+        entry["count"] += 1
+        if area > entry["best_area"]:
+            entry["best_frame"] = frame.copy()
+            entry["best_bbox"] = (bx, by, bw, bh)
+            entry["best_area"] = area
+
+        if entry["count"] < self._unknown_capture_min_detections:
+            return None
+
+        # --- Ready to capture ---
+        next_name, existing_count = self._next_unknown_name()
+        if existing_count >= self._unknown_max_auto:
+            print(f"[auto-capture] Max {self._unknown_max_auto} auto-captured unknowns reached, skipping")
+            self._unknown_pending.pop(tid, None)
+            return None
+
+        # Crop face with 2x padding from best frame
+        bf = entry["best_frame"]
+        fx, fy, fw, fh = entry["best_bbox"]
+        H, W = bf.shape[:2]
+        pad_w, pad_h = fw, fh  # 1x extra on each side = 2x total
+        cx1 = max(0, fx - pad_w)
+        cy1 = max(0, fy - pad_h)
+        cx2 = min(W, fx + fw + pad_w)
+        cy2 = min(H, fy + fh + pad_h)
+        crop = bf[cy1:cy2, cx1:cx2]
+
+        if crop.size == 0:
+            self._unknown_pending.pop(tid, None)
+            return None
+
+        # Save to faces/unknown_N/1.jpg
+        person_dir = os.path.join(self.known_dir, next_name)
+        os.makedirs(person_dir, exist_ok=True)
+        save_path = os.path.join(person_dir, "1.jpg")
+        cv2.imwrite(save_path, crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        print(f"[auto-capture] Saved {next_name} -> {save_path}  (face area={entry['best_area']})")
+
+        # Promote track
+        track["name"] = next_name
+        track["unknown_hits"] = 0
+
+        # Reload embeddings in background (expensive)
+        def _bg_reload():
+            try:
+                self.reload_faces()
+                print(f"[auto-capture] reload_faces() done, {len(self.known_embeddings)} people")
+            except Exception as e:
+                print(f"[auto-capture] reload_faces() error: {e}")
+        threading.Thread(target=_bg_reload, daemon=True).start()
+
+        # Cleanup
+        self._unknown_pending.pop(tid, None)
+        return next_name
+
+    def _cleanup_unknown_pending(self, live_track_ids):
+        """Remove pending entries for tracks that no longer exist."""
+        stale = [tid for tid in self._unknown_pending if tid not in live_track_ids]
+        for tid in stale:
+            del self._unknown_pending[tid]
+
     def reload_faces(self):
         """Rebuild known embeddings from faces/{name}/*"""
         known = []
@@ -1696,6 +1807,14 @@ class FaceEngine:
                 head_bboxes = self._run_head_detection(frame)
                 self._match_heads_to_tracks(tracks, head_bboxes, now)
 
+                # --- Auto-capture unknowns ---
+                for t in tracks:
+                    if t.get("name") == "unknown" and t.get("updated"):
+                        captured = self._try_capture_unknown(t, frame, now)
+                        if captured:
+                            print(f"[grid-detect] auto-captured {captured} on cam {worker['source']}")
+                self._cleanup_unknown_pending({id(t) for t in tracks})
+
                 # --- Action detection (enqueue to async thread, throttled) ---
                 if self.activity_enabled:
                     for t in tracks:
@@ -2181,6 +2300,14 @@ class FaceEngine:
 
                 # --- Head detection: sustain tracks when face not visible ---
                 self._match_heads_to_tracks(self.tracks, head_bboxes_from_det, now)
+
+                # --- Auto-capture unknowns ---
+                for t in self.tracks:
+                    if t.get("name") == "unknown" and t.get("updated"):
+                        captured = self._try_capture_unknown(t, frame, now)
+                        if captured:
+                            print(f"[single-cam] auto-captured {captured}")
+                self._cleanup_unknown_pending({id(t) for t in self.tracks})
 
                 # --- Action detection (enqueue to async thread, throttled) ---
                 if self.activity_enabled:
