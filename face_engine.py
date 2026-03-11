@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 from deepface import DeepFace
 from action_detector import ActionDetector
+from head_detector import HeadDetector
 
 GRID_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grid_config.json")
 AVAILABLE_LAYOUTS = [(2, 2), (3, 3), (4, 4)]
@@ -240,6 +241,9 @@ class FaceEngine:
         self._active_writers = {}
         self._writers_lock = threading.Lock()
 
+        # Head detection (YOLO) — supplements face detector for track persistence
+        self._head_detector = None  # lazy, created in start()
+
         # Action detection (CLIP zero-shot) — can be disabled via env
         self.activity_enabled = os.getenv("ACTION_DETECTION_ENABLED", "true").lower() in ("true", "1", "yes")
         self._action_detector = None
@@ -277,6 +281,14 @@ class FaceEngine:
 
             self._main_t = threading.Thread(target=self._main_loop, daemon=True)
             self._main_t.start()
+
+        # Start head detection (always on — supplements face detector)
+        try:
+            self._head_detector = HeadDetector()
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("HeadDetector not available: %s", e)
+            self._head_detector = None
 
         # Start action detection thread (shared by grid and single-cam modes)
         if self.activity_enabled:
@@ -330,6 +342,9 @@ class FaceEngine:
             self._activity_results.clear()
         with self._activity_counts_lock:
             self._activity_counts.clear()
+
+        # Release head detector
+        self._head_detector = None
 
         # Clear queues
         with self.in_q.mutex:
@@ -943,6 +958,49 @@ class FaceEngine:
 
         return kept
 
+    # ---------- head detection helpers ----------
+
+    def _run_head_detection(self, frame):
+        """Run head detector on *frame* and return list of (x,y,w,h,conf).
+
+        Returns an empty list if the head detector is not available.
+        """
+        if self._head_detector is None:
+            return []
+        try:
+            return self._head_detector.detect(frame)
+        except Exception:
+            return []
+
+    @staticmethod
+    def _match_heads_to_tracks(tracks, head_bboxes, now):
+        """Match head detections to existing tracks and set ``last_head_t``.
+
+        A head bbox matches a track if:
+        - IoU > 0.15 (heads are slightly larger than face boxes), OR
+        - The centre of the head bbox falls within the track bbox.
+
+        Only *existing* tracks are updated — head-only detections that
+        don't overlap any track are ignored (we never create identity
+        from a head alone).
+        """
+        if not tracks or not head_bboxes:
+            return
+
+        for t in tracks:
+            tx, ty, tw, th = t.get("bbox", (0, 0, 0, 0))
+            if tw <= 0 or th <= 0:
+                continue
+            for hx, hy, hw, hh, _hconf in head_bboxes:
+                # Centre of head bbox
+                hcx = hx + hw / 2
+                hcy = hy + hh / 2
+                # Check if head centre falls inside track bbox
+                inside = (tx <= hcx <= tx + tw) and (ty <= hcy <= ty + th)
+                if inside or iou((tx, ty, tw, th), (hx, hy, hw, hh)) > 0.15:
+                    t["last_head_t"] = now
+                    break  # one head match per track is enough
+
     def reload_faces(self):
         """Rebuild known embeddings from faces/{name}/*"""
         known = []
@@ -1104,14 +1162,15 @@ class FaceEngine:
                 frame_full = det_input
 
             results = self._detect_and_match_faces(frame_full)
+            head_bboxes = self._run_head_detection(frame_full)
 
-            # publish latest
+            # publish latest (face results + head bboxes)
             while True:
                 try:
                     self.out_q.get_nowait()
                 except Empty:
                     break
-            self.out_q.put((float(frame_t), results))
+            self.out_q.put((float(frame_t), results, head_bboxes))
 
     def _is_grid_mode(self):
         return isinstance(self.cam_index, str) and self.cam_index.startswith("grid:")
@@ -1572,6 +1631,7 @@ class FaceEngine:
                         t["updated"] = True
                         t["last_seen"] = now
                         t["last_detect_t"] = now
+                        t["last_head_t"] = now   # face confirmed ⇒ head confirmed too
                         t["misses"] = 0
 
                         if name == "unknown":
@@ -1619,6 +1679,7 @@ class FaceEngine:
                                 "updated": True,
                                 "last_seen": now,
                                 "last_detect_t": now,
+                                "last_head_t": now,
                                 "misses": 0,
                                 "unknown_hits": 0 if name != "unknown" else 1,
                             }
@@ -1630,6 +1691,10 @@ class FaceEngine:
 
                 tracks = [t for t in tracks if int(t.get("misses", 0)) <= track_max_misses]
                 tracks = self._dedupe_tracks(tracks)
+
+                # --- Head detection: sustain tracks when face not visible ---
+                head_bboxes = self._run_head_detection(frame)
+                self._match_heads_to_tracks(tracks, head_bboxes, now)
 
                 # --- Action detection (enqueue to async thread, throttled) ---
                 if self.activity_enabled:
@@ -1756,15 +1821,19 @@ class FaceEngine:
                     if int(t.get("misses", 0)) <= this_track_max_misses:
                         updated_tracks.append(t)
 
+                # Head detector can sustain known tracks even when CSRT and face detector lose them.
+                head_reconfirm_secs = max(3.0, self.detect_every * 5.0)
                 updated_tracks = [
                     t for t in updated_tracks
                     if (now - t.get("last_seen", now)) < (unknown_stale_secs if t.get("name") == "unknown" else stale_secs)
+                    or (t.get("name") != "unknown" and (now - float(t.get("last_head_t", 0.0))) <= head_reconfirm_secs)
                 ]
                 updated_tracks = [
                     t for t in updated_tracks
                     if (now - float(t.get("last_detect_t", 0.0))) <= (
                         unknown_reconfirm_secs if t.get("name") == "unknown" else known_reconfirm_secs
                     )
+                    or (t.get("name") != "unknown" and (now - float(t.get("last_head_t", 0.0))) <= head_reconfirm_secs)
                 ]
                 updated_tracks = self._dedupe_tracks(updated_tracks)
                 unknown_seen = 0
@@ -1824,6 +1893,7 @@ class FaceEngine:
                             "bbox": [ox + x, oy + y, w, h],
                             "camera_source": str(source),
                             "last_detect_t": float(t.get("last_detect_t", 0.0)),
+                            "last_head_t": float(t.get("last_head_t", 0.0)),
                             "activity": act_label,
                             "activity_conf": act_conf,
                         }
@@ -1981,10 +2051,10 @@ class FaceEngine:
             # 3) consume detections, update tracks by IoU
             try:
                 det_out = self.out_q.get_nowait()
-                if (
-                    isinstance(det_out, tuple)
-                    and len(det_out) == 2
-                ):
+                head_bboxes_from_det = []
+                if isinstance(det_out, tuple) and len(det_out) == 3:
+                    det_t, results, head_bboxes_from_det = det_out
+                elif isinstance(det_out, tuple) and len(det_out) == 2:
                     det_t, results = det_out
                 else:
                     det_t, results = now, det_out
@@ -2043,6 +2113,7 @@ class FaceEngine:
                         t["updated"] = True
                         t["last_seen"] = now
                         t["last_detect_t"] = now
+                        t["last_head_t"] = now   # face confirmed ⇒ head confirmed too
 
                         # label smoothing: unknown doesn't immediately clobber a known identity
                         if name == "unknown":
@@ -2086,23 +2157,30 @@ class FaceEngine:
                                 "updated": True,
                                 "last_seen": now,
                                 "last_detect_t": now,
+                                "last_head_t": now,
                                 "unknown_hits": 0 if name != "unknown" else 1,
                             }
                         )
 
-                # drop stale tracks
+                # drop stale tracks (head detector can sustain known tracks)
+                head_reconfirm_secs = max(3.0, self.detect_every * 5.0)
                 self.tracks = [
                     t for t in self.tracks
                     if (now - t.get("last_seen", now)) < (unknown_stale_secs if t.get("name") == "unknown" else stale_secs)
+                    or (t.get("name") != "unknown" and (now - float(t.get("last_head_t", 0.0))) <= head_reconfirm_secs)
                 ]
-                # drop tracks not reconfirmed by detector (ghost box prevention)
+                # drop tracks not reconfirmed by face OR head detector (ghost box prevention)
                 self.tracks = [
                     t for t in self.tracks
                     if (now - float(t.get("last_detect_t", now))) <= (
                         unknown_reconfirm_secs if t.get("name") == "unknown" else known_reconfirm_secs
                     )
+                    or (t.get("name") != "unknown" and (now - float(t.get("last_head_t", 0.0))) <= head_reconfirm_secs)
                 ]
                 self.tracks = self._dedupe_tracks(self.tracks)
+
+                # --- Head detection: sustain tracks when face not visible ---
+                self._match_heads_to_tracks(self.tracks, head_bboxes_from_det, now)
 
                 # --- Action detection (enqueue to async thread, throttled) ---
                 if self.activity_enabled:
@@ -2175,6 +2253,7 @@ class FaceEngine:
                                 "best": float(t["best"]),
                                 "bbox": [int(t["bbox"][0]), int(t["bbox"][1]), int(t["bbox"][2]), int(t["bbox"][3])],
                                 "last_detect_t": float(t.get("last_detect_t", 0.0)),
+                                "last_head_t": float(t.get("last_head_t", 0.0)),
                                 "activity": self.get_activity(t["name"])[0],
                                 "activity_conf": self.get_activity(t["name"])[1],
                             }

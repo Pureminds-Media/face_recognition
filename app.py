@@ -281,6 +281,7 @@ def _update_attendance_from_tracks(tracks):
         camera_source = str((t or {}).get("camera_source", engine.cam_index))
         confidence = (t or {}).get("best")
         last_detect_t = float((t or {}).get("last_detect_t", 0.0))
+        last_head_t = float((t or {}).get("last_head_t", 0.0))
 
         s = attendance_state.get(name)
         if s is None:
@@ -300,7 +301,7 @@ def _update_attendance_from_tracks(tracks):
 
         # --- DB visit tracking ---
         if db.is_available():
-            _update_visit_for_person(name, camera_source, confidence, last_detect_t)
+            _update_visit_for_person(name, camera_source, confidence, last_detect_t, last_head_t)
 
         # --- Record activity tally for this person's active visit ---
         active_v = _active_visits.get(name)
@@ -390,7 +391,7 @@ def _stop_visit_footage(visit_id):
         log.debug("Failed to stop footage for visit %s: %s", visit_id, e)
 
 
-def _update_visit_for_person(name, camera_source, confidence=None, last_detect_t=0.0):
+def _update_visit_for_person(name, camera_source, confidence=None, last_detect_t=0.0, last_head_t=0.0):
     """Open, update, or transition a visit for a person at a camera/location.
 
     Flip-flop prevention: when a person appears on a *different* camera than
@@ -402,15 +403,19 @@ def _update_visit_for_person(name, camera_source, confidence=None, last_detect_t
       - If older than VISIT_TRANSITION_SECS: they have genuinely left the
         original camera — close old visit, open new one at the new location.
 
-    Ghost-box prevention: only detector-confirmed tracks (fresh last_detect_t)
-    refresh last_seen_mono.  Tracker-only ghost boxes still bump DB last_seen
-    but do NOT prevent visit transitions.
+    Ghost-box prevention: only detector-confirmed tracks (fresh last_detect_t
+    or last_head_t) refresh last_seen_mono.  Tracker-only ghost boxes still
+    bump DB last_seen but do NOT prevent visit transitions.
     """
     now_mono = time.monotonic()
-    # A track is "detector-confirmed" if the face detector saw it recently
-    # (within 2x detect_every).  Ghost boxes from CSRT have stale last_detect_t.
+    # A track is "confirmed" if the face detector OR head detector saw it
+    # recently.  Ghost boxes from CSRT have stale last_detect_t AND last_head_t.
     detect_freshness = getattr(engine, "detect_every", 1.0) * 2.0
-    is_detector_confirmed = (now_mono - last_detect_t) < detect_freshness
+    head_freshness = max(3.0, getattr(engine, "detect_every", 1.0) * 5.0)
+    is_detector_confirmed = (
+        (now_mono - last_detect_t) < detect_freshness
+        or (now_mono - last_head_t) < head_freshness
+    )
 
     loc = db.get_location_by_source(camera_source)
     if loc is None:
