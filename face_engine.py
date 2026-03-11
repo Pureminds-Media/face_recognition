@@ -257,7 +257,8 @@ class FaceEngine:
         self._activity_counts = {}
         self._activity_counts_lock = threading.Lock()
 
-        # Auto-capture unknowns
+        # Auto-capture unknowns — disabled by default (not suited for large crowds)
+        self.auto_capture_enabled = os.getenv("AUTO_CAPTURE_ENABLED", "false").lower() in ("true", "1", "yes")
         self._unknown_pending = {}  # id(track) -> {"count", "best_frame", "best_bbox", "best_area"}
         self._unknown_capture_min_detections = 4  # ~1.2s at detect_every=0.3
         self._unknown_max_auto = 50  # max unknown_N folders
@@ -279,6 +280,15 @@ class FaceEngine:
 
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            # Minimize internal buffer to reduce lag (matches grid mode)
+            if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+                try:
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    pass
+            # Drain stale buffered frames so first displayed frame is current
+            for _ in range(5):
+                cap.grab()
             self._cap = cap
 
             self._worker_t = threading.Thread(target=self._detector_worker, daemon=True)
@@ -307,6 +317,9 @@ class FaceEngine:
         if not self._running:
             return
 
+        import logging
+        _log = logging.getLogger(__name__)
+
         # Signal threads to exit
         self._running = False
         self.stop_evt.set()
@@ -320,24 +333,36 @@ class FaceEngine:
             self._cap = None
         self._cleanup_grid_mode()
 
-        # Join threads
+        # Join threads (with zombie detection)
         if self._worker_t is not None:
-            self._worker_t.join(timeout=2.0)
+            self._worker_t.join(timeout=3.0)
+            if self._worker_t.is_alive():
+                _log.warning("stop(): _worker_t did not exit within timeout — zombie thread")
             self._worker_t = None
 
         if self._main_t is not None:
-            self._main_t.join(timeout=2.0)
+            self._main_t.join(timeout=3.0)
+            if self._main_t.is_alive():
+                _log.warning("stop(): _main_t did not exit within timeout — zombie thread")
             self._main_t = None
 
         # Stop activity thread
         if self._activity_t is not None:
+            # Drain first so sentinel can be inserted
+            while not self._activity_q.empty():
+                try:
+                    self._activity_q.get_nowait()
+                except Empty:
+                    break
             try:
                 self._activity_q.put_nowait(None)  # sentinel
             except Full:
                 pass
-            self._activity_t.join(timeout=2.0)
+            self._activity_t.join(timeout=3.0)
+            if self._activity_t.is_alive():
+                _log.warning("stop(): _activity_t did not exit within timeout — zombie thread")
             self._activity_t = None
-        # Drain activity queue
+        # Drain any remaining activity queue items
         while not self._activity_q.empty():
             try:
                 self._activity_q.get_nowait()
@@ -348,8 +373,29 @@ class FaceEngine:
         with self._activity_counts_lock:
             self._activity_counts.clear()
 
-        # Release head detector
+        # Release action detector (free GPU memory — CLIP model)
+        self._action_detector = None
+
+        # Release head detector (free GPU memory — YOLO model)
         self._head_detector = None
+
+        # Close all active footage writers (release file handles + codec resources)
+        try:
+            self.stop_all_footage()
+        except Exception as e:
+            _log.warning("stop(): stop_all_footage error: %s", e)
+
+        # Clear frame ring buffers (can be hundreds of MB of numpy arrays)
+        with self._frame_ring_lock:
+            self._frame_ring.clear()
+            self._ring_frame_counts.clear()
+
+        # Clear snapshot buffer
+        with self._snapshot_lock:
+            self._snapshot_buf.clear()
+
+        # Clear unknown pending accumulator
+        self._unknown_pending.clear()
 
         # Clear queues
         with self.in_q.mutex:
@@ -361,6 +407,8 @@ class FaceEngine:
         with self._lock:
             self._latest_jpeg = None
             self._latest_tracks = []
+            self._latest_qr = None
+            self._latest_qr_t = 0.0
 
         self.tracks = []
 
@@ -1580,16 +1628,25 @@ class FaceEngine:
                 except Exception:
                     pass
 
+        import logging
+        _log = logging.getLogger(__name__)
         for w in self._grid_workers.values():
+            src = w.get("source", "?")
             t = w.get("capture_thread")
             if t is not None:
-                t.join(timeout=2.0)
+                t.join(timeout=3.0)
+                if t.is_alive():
+                    _log.warning("_cleanup_grid: capture_thread [%s] zombie", src)
             t = w.get("detect_thread")
             if t is not None:
-                t.join(timeout=2.0)
+                t.join(timeout=3.0)
+                if t.is_alive():
+                    _log.warning("_cleanup_grid: detect_thread [%s] zombie", src)
 
         if self._grid_render_t is not None:
-            self._grid_render_t.join(timeout=2.0)
+            self._grid_render_t.join(timeout=3.0)
+            if self._grid_render_t.is_alive():
+                _log.warning("_cleanup_grid: render_thread zombie")
             self._grid_render_t = None
 
         self._grid_workers = {}
@@ -1808,12 +1865,13 @@ class FaceEngine:
                 self._match_heads_to_tracks(tracks, head_bboxes, now)
 
                 # --- Auto-capture unknowns ---
-                for t in tracks:
-                    if t.get("name") == "unknown" and t.get("updated"):
-                        captured = self._try_capture_unknown(t, frame, now)
-                        if captured:
-                            print(f"[grid-detect] auto-captured {captured} on cam {worker['source']}")
-                self._cleanup_unknown_pending({id(t) for t in tracks})
+                if self.auto_capture_enabled:
+                    for t in tracks:
+                        if t.get("name") == "unknown" and t.get("updated"):
+                            captured = self._try_capture_unknown(t, frame, now)
+                            if captured:
+                                print(f"[grid-detect] auto-captured {captured} on cam {worker['source']}")
+                    self._cleanup_unknown_pending({id(t) for t in tracks})
 
                 # --- Action detection (enqueue to async thread, throttled) ---
                 if self.activity_enabled:
@@ -2302,12 +2360,13 @@ class FaceEngine:
                 self._match_heads_to_tracks(self.tracks, head_bboxes_from_det, now)
 
                 # --- Auto-capture unknowns ---
-                for t in self.tracks:
-                    if t.get("name") == "unknown" and t.get("updated"):
-                        captured = self._try_capture_unknown(t, frame, now)
-                        if captured:
-                            print(f"[single-cam] auto-captured {captured}")
-                self._cleanup_unknown_pending({id(t) for t in self.tracks})
+                if self.auto_capture_enabled:
+                    for t in self.tracks:
+                        if t.get("name") == "unknown" and t.get("updated"):
+                            captured = self._try_capture_unknown(t, frame, now)
+                            if captured:
+                                print(f"[single-cam] auto-captured {captured}")
+                    self._cleanup_unknown_pending({id(t) for t in self.tracks})
 
                 # --- Action detection (enqueue to async thread, throttled) ---
                 if self.activity_enabled:
