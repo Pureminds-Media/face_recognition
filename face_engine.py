@@ -468,12 +468,19 @@ class FaceEngine:
                 pass
 
     def get_activity(self, person_id):
-        """Return (label, conf) for a person, or (None, 0.0)."""
+        """Return (label, conf) for a person, or (None, 0.0).
+
+        Results older than activity_detect_every * 2 are treated as stale
+        (e.g. person turned around — face detector no longer confirming).
+        """
         if not self.activity_enabled:
             return (None, 0.0)
         with self._activity_results_lock:
             r = self._activity_results.get(person_id)
         if r is None:
+            return (None, 0.0)
+        # Expire stale results (face no longer visible → stop showing action)
+        if (time.monotonic() - float(r.get("t", 0.0))) > self.activity_detect_every * 2.0:
             return (None, 0.0)
         return (r["label"], r["conf"])
 
@@ -759,6 +766,33 @@ class FaceEngine:
         video_tracks = []
         track_max_misses = 5
         bbox_smooth_alpha = 0.55
+
+        # --- Lazy-create head detector for offline processing ---
+        _local_head = self._head_detector
+        _created_head = False
+        if _local_head is None:
+            try:
+                _local_head = HeadDetector()
+                _created_head = True
+            except Exception:
+                _local_head = None
+
+        # --- Lazy-create action detector for offline processing ---
+        _local_action = None
+        _created_action = False
+        if self.activity_enabled:
+            _local_action = self._action_detector
+            if _local_action is None:
+                try:
+                    _local_action = ActionDetector()
+                    _created_action = True
+                except Exception:
+                    _local_action = None
+
+        action_results = {}  # name -> (label, conf)
+        action_detect_interval = max(1, int(out_fps * 2))  # every ~2s of video
+        head_grace_frames = max(8, int(out_fps * 0.5))  # ~0.5s of video
+
         try:
             while True:
                 ok, frame = cap.read()
@@ -822,6 +856,8 @@ class FaceEngine:
                                 t["best"] = float(best)
                         t["matched"] = True
                         t["misses"] = 0
+                        t["last_detect_t"] = frame_idx
+                        t["last_head_t"] = frame_idx  # face confirmed → head confirmed
                     else:
                         video_tracks.append(
                             {
@@ -831,21 +867,59 @@ class FaceEngine:
                                 "matched": True,
                                 "misses": 0,
                                 "unknown_hits": 0 if name != "unknown" else 1,
+                                "last_detect_t": frame_idx,
+                                "last_head_t": frame_idx,
                             }
                         )
 
+                # --- Track pruning (head-detector-aware) ---
                 kept_tracks = []
                 for t in video_tracks:
                     if not t.get("matched"):
                         t["misses"] = int(t.get("misses", 0)) + 1
-                    if int(t.get("misses", 0)) <= track_max_misses:
+                    misses = int(t.get("misses", 0))
+                    is_known = t.get("name", "unknown") != "unknown"
+                    head_fresh = (frame_idx - t.get("last_head_t", 0)) <= head_grace_frames
+                    max_m = track_max_misses
+                    if is_known and head_fresh:
+                        max_m = track_max_misses * 2  # head visible → more patient
+                    if misses <= max_m:
                         kept_tracks.append(t)
                 video_tracks = self._dedupe_tracks(kept_tracks, iou_thresh=0.50, center_dist_thresh=0.65)
 
+                # --- Head detection: sustain tracks when face not visible ---
+                if _local_head is not None:
+                    try:
+                        head_bboxes = _local_head.detect(frame)
+                    except Exception:
+                        head_bboxes = []
+                    self._match_heads_to_tracks(video_tracks, head_bboxes, frame_idx)
+
+                # --- Action detection: synchronous CLIP, throttled ---
+                if _local_action is not None and (frame_idx % action_detect_interval == 0):
+                    for t in video_tracks:
+                        tname = t.get("name", "unknown")
+                        if tname == "unknown":
+                            continue
+                        # Only when face detector recently confirmed
+                        if (frame_idx - t.get("last_detect_t", 0)) > action_detect_interval:
+                            continue
+                        bbox = t.get("bbox", (0, 0, 0, 0))
+                        try:
+                            act_label, act_conf = _local_action.detect(
+                                frame, bbox, person_id=tname
+                            )
+                            if act_label:
+                                action_results[tname] = (act_label, act_conf)
+                            else:
+                                action_results.pop(tname, None)
+                        except Exception:
+                            pass
+
+                # --- Draw annotations ---
                 for t in video_tracks:
                     x, y, w, h = map(int, t.get("bbox", (0, 0, 0, 0)))
                     name = t.get("name", "unknown")
-                    best = float(t.get("best", 1.0))
                     is_unknown = name == "unknown"
                     color = (0, 0, 255) if is_unknown else (0, 255, 0)
 
@@ -862,7 +936,11 @@ class FaceEngine:
                         dh = min(out_h - dy, max(dh, min_vis))
 
                     cv2.rectangle(frame, (dx, dy), (dx + dw, dy + dh), color, 2)
-                    label = "unknown" if is_unknown else f"{name} ({best:.2f})"
+                    if is_unknown:
+                        label = "unknown"
+                    else:
+                        act = action_results.get(name)
+                        label = f"{name} | {act[0]}" if act else name
                     cv2.putText(
                         frame,
                         label,
@@ -884,6 +962,11 @@ class FaceEngine:
         finally:
             cap.release()
             writer.release()
+            # Release locally-created detectors
+            if _created_head:
+                _local_head = None
+            if _created_action:
+                _local_action = None
 
         if progress_cb:
             try:
@@ -1694,7 +1777,7 @@ class FaceEngine:
 
             raw_frame = frame  # original camera resolution — used for footage
             try:
-                frame = cv2.resize(frame, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
+                frame = cv2.resize(frame, (tile_w, tile_h), interpolation=cv2.INTER_LINEAR)
             except Exception:
                 time.sleep(0.01)
                 continue
@@ -1732,163 +1815,175 @@ class FaceEngine:
             except Exception:
                 dets = []
 
+            # --- Grab tracks snapshot under lock (fast) ---
             with worker["lock"]:
                 tracks = list(worker.get("tracks", []))
                 bbox_smooth_alpha = float(worker.get("bbox_smooth_alpha", 0.55))
                 track_max_misses = int(worker.get("track_max_misses", 6))
                 max_unknown_tracks = int(worker.get("max_unknown_tracks", 3))
-                matched_track_idx = set()
-                Hf, Wf = frame.shape[:2]
 
-                # Match larger detections first for more stable assignment.
-                dets = sorted(dets, key=lambda r: int(r[2]) * int(r[3]), reverse=True)
-                for x, y, w, h, name, best in dets:
-                    det_bbox = (int(x), int(y), int(w), int(h))
+            # --- Head detection runs outside lock (GPU inference) ---
+            head_bboxes = self._run_head_detection(frame)
+
+            # --- Track matching + update (no lock needed — local list) ---
+            matched_track_idx = set()
+            Hf, Wf = frame.shape[:2]
+
+            # Match larger detections first for more stable assignment.
+            dets = sorted(dets, key=lambda r: int(r[2]) * int(r[3]), reverse=True)
+            for x, y, w, h, name, best in dets:
+                det_bbox = (int(x), int(y), int(w), int(h))
+                if name == "unknown":
+                    # Suppress noisy unknowns (tiny boxes and edge-hugging false positives).
+                    if int(w) < 20 or int(h) < 20:
+                        continue
+                    margin_x = max(3, int(0.01 * Wf))
+                    margin_y = max(3, int(0.01 * Hf))
+                    if (x <= margin_x) or (y <= margin_y) or ((x + w) >= (Wf - margin_x)) or ((y + h) >= (Hf - margin_y)):
+                        continue
+                best_i = -1
+                best_key = None
+                for i, t in enumerate(tracks):
+                    if i in matched_track_idx:
+                        continue
+                    t_name = t.get("name", "unknown")
+                    compatible = (t_name == name) or (t_name == "unknown") or (name == "unknown")
+                    if not compatible:
+                        continue
+
+                    t_bbox = t.get("bbox", (0, 0, 0, 0))
+                    center_dist = self._center_dist_norm(t_bbox, det_bbox)
+                    score = iou(t_bbox, det_bbox)
+                    motion_match = (
+                        (t_name == name and name != "unknown" and center_dist < 0.75)
+                        or (((t_name == "unknown") ^ (name == "unknown")) and center_dist < 0.50)
+                        or (t_name == "unknown" and name == "unknown" and center_dist < 0.40)
+                    )
+                    if score <= 0.3 and not motion_match:
+                        continue
+
+                    cand_key = (score, 1 if t_name != "unknown" else 0, -center_dist)
+                    if (best_key is None) or (cand_key > best_key):
+                        best_key = cand_key
+                        best_i = i
+
+                if best_i >= 0:
+                    t = tracks[best_i]
+                    matched_track_idx.add(best_i)
+                    bx, by, bw, bh = t.get("bbox", det_bbox)
+                    nx, ny, nw, nh = det_bbox
+                    smooth_bbox = (
+                        int(round(bx * bbox_smooth_alpha + nx * (1.0 - bbox_smooth_alpha))),
+                        int(round(by * bbox_smooth_alpha + ny * (1.0 - bbox_smooth_alpha))),
+                        int(round(bw * bbox_smooth_alpha + nw * (1.0 - bbox_smooth_alpha))),
+                        int(round(bh * bbox_smooth_alpha + nh * (1.0 - bbox_smooth_alpha))),
+                    )
+                    t["bbox"] = smooth_bbox
+                    try:
+                        tr = create_tracker(self.tracker_type)
+                        tr.init(frame, smooth_bbox)
+                        t["tracker"] = tr
+                    except Exception:
+                        pass
+                    t["updated"] = True
+                    t["last_seen"] = now
+                    t["last_detect_t"] = now
+                    t["last_head_t"] = now   # face confirmed ⇒ head confirmed too
+                    t["misses"] = 0
+
                     if name == "unknown":
-                        # Suppress noisy unknowns (tiny boxes and edge-hugging false positives).
-                        if int(w) < 20 or int(h) < 20:
-                            continue
-                        margin_x = max(3, int(0.01 * Wf))
-                        margin_y = max(3, int(0.01 * Hf))
-                        if (x <= margin_x) or (y <= margin_y) or ((x + w) >= (Wf - margin_x)) or ((y + h) >= (Hf - margin_y)):
-                            continue
-                    best_i = -1
-                    best_key = None
-                    for i, t in enumerate(tracks):
-                        if i in matched_track_idx:
-                            continue
+                        if t.get("name") != "unknown":
+                            t["unknown_hits"] = int(t.get("unknown_hits", 0)) + 1
+                            if t["unknown_hits"] >= UNKNOWN_TO_FORGET:
+                                t["name"] = "unknown"
+                                t["best"] = float(best)
+                        else:
+                            t["best"] = float(best)
+                    else:
+                        t["name"] = name
+                        t["best"] = float(best)
+                        t["unknown_hits"] = 0
+                else:
+                    near_existing = False
+                    for t in tracks:
                         t_name = t.get("name", "unknown")
                         compatible = (t_name == name) or (t_name == "unknown") or (name == "unknown")
                         if not compatible:
                             continue
-
-                        t_bbox = t.get("bbox", (0, 0, 0, 0))
-                        center_dist = self._center_dist_norm(t_bbox, det_bbox)
-                        score = iou(t_bbox, det_bbox)
-                        motion_match = (
-                            (t_name == name and name != "unknown" and center_dist < 0.75)
-                            or (((t_name == "unknown") ^ (name == "unknown")) and center_dist < 0.50)
-                            or (t_name == "unknown" and name == "unknown" and center_dist < 0.40)
-                        )
-                        if score <= 0.3 and not motion_match:
+                        ov = iou(t.get("bbox", (0, 0, 0, 0)), det_bbox)
+                        cd = self._center_dist_norm(t.get("bbox", (0, 0, 0, 0)), det_bbox)
+                        if ov > 0.45 or cd < 0.32:
+                            near_existing = True
+                            break
+                    if near_existing:
+                        continue
+                    if name == "unknown":
+                        unknown_count = sum(1 for t in tracks if t.get("name") == "unknown")
+                        if unknown_count >= max_unknown_tracks:
                             continue
 
-                        cand_key = (score, 1 if t_name != "unknown" else 0, -center_dist)
-                        if (best_key is None) or (cand_key > best_key):
-                            best_key = cand_key
-                            best_i = i
+                    try:
+                        tr = create_tracker(self.tracker_type)
+                        tr.init(frame, det_bbox)
+                    except Exception:
+                        continue
+                    tracks.append(
+                        {
+                            "tracker": tr,
+                            "name": name,
+                            "best": float(best),
+                            "bbox": det_bbox,
+                            "updated": True,
+                            "last_seen": now,
+                            "last_detect_t": now,
+                            "last_head_t": now,
+                            "misses": 0,
+                            "unknown_hits": 0 if name != "unknown" else 1,
+                        }
+                    )
 
-                    if best_i >= 0:
-                        t = tracks[best_i]
-                        matched_track_idx.add(best_i)
-                        bx, by, bw, bh = t.get("bbox", det_bbox)
-                        nx, ny, nw, nh = det_bbox
-                        smooth_bbox = (
-                            int(round(bx * bbox_smooth_alpha + nx * (1.0 - bbox_smooth_alpha))),
-                            int(round(by * bbox_smooth_alpha + ny * (1.0 - bbox_smooth_alpha))),
-                            int(round(bw * bbox_smooth_alpha + nw * (1.0 - bbox_smooth_alpha))),
-                            int(round(bh * bbox_smooth_alpha + nh * (1.0 - bbox_smooth_alpha))),
-                        )
-                        t["bbox"] = smooth_bbox
-                        try:
-                            tr = create_tracker(self.tracker_type)
-                            tr.init(frame, smooth_bbox)
-                            t["tracker"] = tr
-                        except Exception:
-                            pass
-                        t["updated"] = True
-                        t["last_seen"] = now
-                        t["last_detect_t"] = now
-                        t["last_head_t"] = now   # face confirmed ⇒ head confirmed too
-                        t["misses"] = 0
+            for i, t in enumerate(tracks):
+                if i not in matched_track_idx:
+                    t["misses"] = int(t.get("misses", 0)) + 1
 
-                        if name == "unknown":
-                            if t.get("name") != "unknown":
-                                t["unknown_hits"] = int(t.get("unknown_hits", 0)) + 1
-                                if t["unknown_hits"] >= UNKNOWN_TO_FORGET:
-                                    t["name"] = "unknown"
-                                    t["best"] = float(best)
-                            else:
-                                t["best"] = float(best)
-                        else:
-                            t["name"] = name
-                            t["best"] = float(best)
-                            t["unknown_hits"] = 0
-                    else:
-                        near_existing = False
-                        for t in tracks:
-                            t_name = t.get("name", "unknown")
-                            compatible = (t_name == name) or (t_name == "unknown") or (name == "unknown")
-                            if not compatible:
-                                continue
-                            ov = iou(t.get("bbox", (0, 0, 0, 0)), det_bbox)
-                            cd = self._center_dist_norm(t.get("bbox", (0, 0, 0, 0)), det_bbox)
-                            if ov > 0.45 or cd < 0.32:
-                                near_existing = True
-                                break
-                        if near_existing:
-                            continue
-                        if name == "unknown":
-                            unknown_count = sum(1 for t in tracks if t.get("name") == "unknown")
-                            if unknown_count >= max_unknown_tracks:
-                                continue
+            tracks = [t for t in tracks if int(t.get("misses", 0)) <= track_max_misses]
+            tracks = self._dedupe_tracks(tracks)
 
-                        try:
-                            tr = create_tracker(self.tracker_type)
-                            tr.init(frame, det_bbox)
-                        except Exception:
-                            continue
-                        tracks.append(
-                            {
-                                "tracker": tr,
-                                "name": name,
-                                "best": float(best),
-                                "bbox": det_bbox,
-                                "updated": True,
-                                "last_seen": now,
-                                "last_detect_t": now,
-                                "last_head_t": now,
-                                "misses": 0,
-                                "unknown_hits": 0 if name != "unknown" else 1,
-                            }
-                        )
+            # --- Head matching (cheap — already ran inference above) ---
+            self._match_heads_to_tracks(tracks, head_bboxes, now)
 
-                for i, t in enumerate(tracks):
-                    if i not in matched_track_idx:
-                        t["misses"] = int(t.get("misses", 0)) + 1
+            # --- Auto-capture unknowns ---
+            if self.auto_capture_enabled:
+                for t in tracks:
+                    if t.get("name") == "unknown" and t.get("updated"):
+                        captured = self._try_capture_unknown(t, frame, now)
+                        if captured:
+                            print(f"[grid-detect] auto-captured {captured} on cam {worker['source']}")
+                self._cleanup_unknown_pending({id(t) for t in tracks})
 
-                tracks = [t for t in tracks if int(t.get("misses", 0)) <= track_max_misses]
-                tracks = self._dedupe_tracks(tracks)
+            # --- Action detection (enqueue to async thread, throttled) ---
+            # Only enqueue when face detector recently confirmed the person;
+            # head-detector-only or tracker-only boxes (e.g. back of head) are skipped.
+            if self.activity_enabled:
+                face_fresh_secs = self.detect_every * 2.0
+                for t in tracks:
+                    name = t.get("name", "unknown")
+                    if name == "unknown":
+                        continue
+                    if (now - float(t.get("last_detect_t", 0.0))) > face_fresh_secs:
+                        continue
+                    last_act_t = float(t.get("_last_activity_t", 0.0))
+                    if (now - last_act_t) < self.activity_detect_every:
+                        continue
+                    bbox = t.get("bbox", (0, 0, 0, 0))
+                    try:
+                        self._activity_q.put_nowait((frame.copy(), bbox, name))
+                    except Full:
+                        pass
+                    t["_last_activity_t"] = now
 
-                # --- Head detection: sustain tracks when face not visible ---
-                head_bboxes = self._run_head_detection(frame)
-                self._match_heads_to_tracks(tracks, head_bboxes, now)
-
-                # --- Auto-capture unknowns ---
-                if self.auto_capture_enabled:
-                    for t in tracks:
-                        if t.get("name") == "unknown" and t.get("updated"):
-                            captured = self._try_capture_unknown(t, frame, now)
-                            if captured:
-                                print(f"[grid-detect] auto-captured {captured} on cam {worker['source']}")
-                    self._cleanup_unknown_pending({id(t) for t in tracks})
-
-                # --- Action detection (enqueue to async thread, throttled) ---
-                if self.activity_enabled:
-                    for t in tracks:
-                        name = t.get("name", "unknown")
-                        if name == "unknown":
-                            continue
-                        last_act_t = float(t.get("_last_activity_t", 0.0))
-                        if (now - last_act_t) < self.activity_detect_every:
-                            continue
-                        bbox = t.get("bbox", (0, 0, 0, 0))
-                        try:
-                            self._activity_q.put_nowait((frame.copy(), bbox, name))
-                        except Full:
-                            pass
-                        t["_last_activity_t"] = now
-
+            # --- Write results back under lock (fast) ---
+            with worker["lock"]:
                 worker["tracks"] = tracks
                 worker["latest_tracks"] = [
                     {
@@ -1929,9 +2024,12 @@ class FaceEngine:
         unknown_reconfirm_secs = max(1.5, self.detect_every * 1.5)
         known_reconfirm_secs = max(2.0, self.detect_every * 2.0)
 
+        canvas = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)  # reused each frame
+        last_snap_t = 0.0  # throttle snapshot JPEG encoding
+
         while not self.stop_evt.is_set() and not self._grid_stop_evt.is_set():
             now = time.monotonic()
-            canvas = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)
+            canvas[:] = 0  # clear reused buffer instead of allocating
             aggregated_tracks = []
 
             for slot in range(rows * cols):
@@ -2089,11 +2187,13 @@ class FaceEngine:
 
                 # Buffer annotated tile snapshot for each known person on this camera.
                 # app.py consumes these when opening a new visit.
+                # Throttled to out_fps to avoid redundant JPEG encodes.
+                snap_due = (now - last_snap_t) >= (1.0 / max(1, self.out_fps))
                 known_on_tile = [
                     t.get("name") for t in updated_tracks
                     if t.get("name") and t.get("name") != "unknown"
                 ]
-                if known_on_tile:
+                if known_on_tile and snap_due:
                     ok_snap, snap_buf = cv2.imencode(
                         ".jpg", tile, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
                     )
@@ -2102,11 +2202,20 @@ class FaceEngine:
                         with self._snapshot_lock:
                             for pname in known_on_tile:
                                 self._snapshot_buf[(pname, str(source))] = snap_bytes
+                    last_snap_t = now
 
                 # Build annotated raw frame for footage (native camera resolution)
+                # Only do the expensive copy + annotation when footage is actually recording.
                 visible = {t.get("name") for t in updated_tracks
                            if t.get("name") and t.get("name") != "unknown"}
-                if raw_frame is not None:
+                has_active_writer = False
+                with self._writers_lock:
+                    for vid, rec in self._active_writers.items():
+                        if str(rec.get("cam")) == str(source):
+                            has_active_writer = True
+                            break
+
+                if has_active_writer and raw_frame is not None:
                     raw_h, raw_w = raw_frame.shape[:2]
                     sx = raw_w / tile_w
                     sy = raw_h / tile_h
@@ -2127,12 +2236,15 @@ class FaceEngine:
                         font_scale = max(0.5, min(sx, sy) * 0.55)
                         cv2.putText(footage_frame, flabel, (rx, max(0, ry - 8)),
                                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, col, 2)
+                elif raw_frame is not None:
+                    footage_frame = raw_frame  # no copy needed — just reference for ring buffer
                 else:
                     footage_frame = tile
 
                 # Push to rolling frame ring buffer + active writers at native resolution
                 self._push_frame_to_ring(source, footage_frame)
-                self._feed_active_writers(source, footage_frame, visible)
+                if has_active_writer:
+                    self._feed_active_writers(source, footage_frame, visible)
 
                 canvas[oy:oy + tile_h, ox:ox + tile_w] = tile
 
@@ -2172,6 +2284,7 @@ class FaceEngine:
     def _main_loop(self):
         last_sent_t = 0.0
         last_encode_t = 0.0
+        last_snap_t = 0.0
         stale_secs = 2.0
         unknown_stale_secs = 0.7
         unknown_reconfirm_secs = max(1.5, self.detect_every * 1.5)
@@ -2369,10 +2482,15 @@ class FaceEngine:
                     self._cleanup_unknown_pending({id(t) for t in self.tracks})
 
                 # --- Action detection (enqueue to async thread, throttled) ---
+                # Only enqueue when face detector recently confirmed the person;
+                # head-detector-only or tracker-only boxes (e.g. back of head) are skipped.
                 if self.activity_enabled:
+                    face_fresh_secs = self.detect_every * 2.0
                     for t in self.tracks:
                         name = t.get("name", "unknown")
                         if name == "unknown":
+                            continue
+                        if (now - float(t.get("last_detect_t", 0.0))) > face_fresh_secs:
                             continue
                         last_act_t = float(t.get("_last_activity_t", 0.0))
                         if (now - last_act_t) < self.activity_detect_every:
@@ -2403,11 +2521,13 @@ class FaceEngine:
                 cv2.putText(frame, label, (x, max(0, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2,)
 
             # 4b) buffer snapshot for each known person (single-camera mode)
+            # Throttled to out_fps to avoid redundant JPEG encodes every frame.
+            snap_due = (now - last_snap_t) >= (1.0 / max(1, self.out_fps))
             known_on_frame = [
                 t["name"] for t in self.tracks
                 if t.get("name") and t["name"] != "unknown"
             ]
-            if known_on_frame:
+            if known_on_frame and snap_due:
                 ok_snap, snap_buf = cv2.imencode(
                     ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
                 )
@@ -2417,12 +2537,15 @@ class FaceEngine:
                     with self._snapshot_lock:
                         for pname in known_on_frame:
                             self._snapshot_buf[(pname, cam_src)] = snap_bytes
+                last_snap_t = now
 
             # 4c) push frame to rolling ring buffer + active writers (single-camera)
             self._push_frame_to_ring(self.cam_index, frame)
             visible = {t["name"] for t in self.tracks
                        if t.get("name") and t["name"] != "unknown"}
-            self._feed_active_writers(self.cam_index, frame, visible)
+            has_active_writer = bool(self._active_writers)
+            if has_active_writer:
+                self._feed_active_writers(self.cam_index, frame, visible)
 
             # 5) encode at limited FPS
             if now - last_encode_t >= (1.0 / max(1, self.out_fps)):
@@ -2431,17 +2554,20 @@ class FaceEngine:
                     ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)]
                 )
                 if ok:
+                    # Build track list outside lock to avoid nested lock acquisition
+                    pub_tracks = [
+                        {
+                            "name": t["name"],
+                            "best": float(t["best"]),
+                            "bbox": [int(t["bbox"][0]), int(t["bbox"][1]), int(t["bbox"][2]), int(t["bbox"][3])],
+                            "last_detect_t": float(t.get("last_detect_t", 0.0)),
+                            "last_head_t": float(t.get("last_head_t", 0.0)),
+                            "activity": self.get_activity(t["name"])[0],
+                            "activity_conf": self.get_activity(t["name"])[1],
+                        }
+                        for t in self.tracks
+                    ]
+                    jpeg_bytes = buf.tobytes()
                     with self._lock:
-                        self._latest_jpeg = buf.tobytes()
-                        self._latest_tracks = [
-                            {
-                                "name": t["name"],
-                                "best": float(t["best"]),
-                                "bbox": [int(t["bbox"][0]), int(t["bbox"][1]), int(t["bbox"][2]), int(t["bbox"][3])],
-                                "last_detect_t": float(t.get("last_detect_t", 0.0)),
-                                "last_head_t": float(t.get("last_head_t", 0.0)),
-                                "activity": self.get_activity(t["name"])[0],
-                                "activity_conf": self.get_activity(t["name"])[1],
-                            }
-                            for t in self.tracks
-                        ]
+                        self._latest_jpeg = jpeg_bytes
+                        self._latest_tracks = pub_tracks

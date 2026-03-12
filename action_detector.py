@@ -118,12 +118,18 @@ class ActionDetector:
         try:
             from optimum.onnxruntime import ORTModelForZeroShotImageClassification
             from transformers import CLIPProcessor
+            import onnxruntime as ort
+
+            # Suppress ONNX Memcpy/provider assignment warnings
+            sess_opts = ort.SessionOptions()
+            sess_opts.log_severity_level = 3
 
             t0 = time.monotonic()
             if os.path.isdir(self._model_path):
                 log.info("Loading CLIP ONNX model from %s", self._model_path)
                 self._model = ORTModelForZeroShotImageClassification.from_pretrained(
-                    self._model_path, provider=self._provider
+                    self._model_path, provider=self._provider,
+                    session_options=sess_opts,
                 )
             else:
                 log.info("Exporting CLIP to ONNX from %s", self._model_path)
@@ -131,12 +137,15 @@ class ActionDetector:
                     "openai/clip-vit-base-patch32",
                     export=True,
                     provider=self._provider,
+                    session_options=sess_opts,
                 )
                 os.makedirs(self._model_path, exist_ok=True)
                 self._model.save_pretrained(self._model_path)
 
             self._model.use_io_binding = False
-            self._processor = CLIPProcessor.from_pretrained(self._model_path)
+            self._processor = CLIPProcessor.from_pretrained(
+                self._model_path, use_fast=False
+            )
             elapsed = time.monotonic() - t0
             log.info("CLIP action detector ready (%.1fs)", elapsed)
             self._ready = True

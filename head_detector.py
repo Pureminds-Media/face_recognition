@@ -96,9 +96,11 @@ class HeadDetector:
         import onnxruntime as ort
 
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        opts = ort.SessionOptions()
+        opts.log_severity_level = 3  # suppress Memcpy/provider warnings
         t0 = time.monotonic()
         self._session = ort.InferenceSession(
-            self._model_path, providers=providers
+            self._model_path, sess_options=opts, providers=providers
         )
         active = self._session.get_providers()
         self._input_name = self._session.get_inputs()[0].name

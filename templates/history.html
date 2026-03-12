@@ -24,7 +24,7 @@
               onclick="clearAllData()"
               class="rounded-lg bg-red-600 hover:bg-red-500 px-3 py-2 text-sm font-medium"
             >
-              Clear Data
+              Clear Visit Data
             </button>
             <a
               href="/people"
@@ -434,7 +434,7 @@
         } catch {}
       });
 
-      // --- Clear data ---
+      // --- Clear Visit Data ---
       async function clearAllData() {
         if (!confirm("Delete ALL visits and sessions? This cannot be undone.")) return;
         const btn = document.getElementById("clearDataBtn");
@@ -449,15 +449,15 @@
             dailyLoadBtn.click();
             loadPersons();
             loadLocations();
-            setTimeout(() => { btn.textContent = "Clear Data"; btn.disabled = false; }, 1500);
+            setTimeout(() => { btn.textContent = "Clear Visit Data"; btn.disabled = false; }, 1500);
           } else {
             alert("Error: " + (j.error || "unknown"));
-            btn.textContent = "Clear Data";
+            btn.textContent = "Clear Visit Data";
             btn.disabled = false;
           }
         } catch (e) {
           alert("Failed: " + e);
-          btn.textContent = "Clear Data";
+          btn.textContent = "Clear Visit Data";
           btn.disabled = false;
         }
       }
