@@ -1,4 +1,21 @@
 import os
+# RTSP/HTTP camera tuning for OpenCV's FFmpeg backend.
+# - rtsp_transport=tcp avoids UDP packet loss/NAT issues common on Wi-Fi cams.
+# - stimeout (microseconds) caps socket-level read waits so a dead camera
+#   surfaces as a clean failure instead of hanging.
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|stimeout;5000000",
+)
+# Silence the HEVC mid-GOP join noise ("PPS id out of range",
+# "Could not find ref with POC N", "First slice in a frame missing",
+# "Error constructing the frame RPS"). These are AV_LOG_ERROR level
+# even though they're benign chatter while the decoder waits for the
+# next keyframe; with 21 RTSP streams they flood the terminal. We drop
+# to AV_LOG_FATAL (8) — actual fatal decoder errors still surface,
+# everything else is muted.
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "8")
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
 import shutil
 import atexit
 import time
@@ -15,6 +32,13 @@ from flask import Flask, Response, render_template, request, jsonify, send_from_
 from werkzeug.utils import secure_filename
 import threading
 import cv2
+# Backstop the env-var settings above in case this OpenCV build ignores
+# them. LOG_LEVEL_ERROR=4 is the standard symbol; fall back to the int
+# constant if the symbolic name isn't present.
+try:
+    cv2.setLogLevel(getattr(cv2, "LOG_LEVEL_ERROR", 4))
+except Exception:
+    pass
 from dotenv import load_dotenv
 from face_engine import FaceEngine, AVAILABLE_LAYOUTS
 import db
@@ -30,6 +54,148 @@ TEST_UPLOAD_DIR = os.path.join("test_runs", "uploads")
 TEST_OUTPUT_DIR = os.path.join("test_runs", "outputs")
 SCREENSHOTS_DIR = "screenshots"
 FOOTAGE_DIR = "footage"
+IP_CAMERAS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ip_cameras.json")
+_ip_cameras_lock = threading.Lock()
+
+
+def _new_id():
+    return uuid.uuid4().hex[:8]
+
+
+def _normalize_ip_cameras(data):
+    """Return ``(state, migrated)``. ``migrated`` is True when *data* was
+    in an older format and we converted it; the caller should persist the
+    state so subsequent reads see stable IDs."""
+    # Legacy: bare list of cameras with full URLs.
+    if isinstance(data, list):
+        cams = [c for c in data if isinstance(c, dict) and c.get("id") and c.get("url")]
+        return ({
+            "groups": [{
+                "id": _new_id(),
+                "name": "Standalone",
+                "base_url": "",
+                "cameras": cams,
+            }] if cams else []
+        }, True)
+
+    if not isinstance(data, dict):
+        return ({"groups": []}, True)
+
+    # Earlier single-base format.
+    if "groups" not in data and ("base_url" in data or "cameras" in data):
+        cams = [c for c in (data.get("cameras") or []) if isinstance(c, dict) and c.get("id")]
+        return ({
+            "groups": [{
+                "id": _new_id(),
+                "name": "Default",
+                "base_url": str(data.get("base_url") or "").strip(),
+                "cameras": cams,
+            }] if cams else []
+        }, True)
+
+    # Current multi-group format.
+    groups = []
+    for g in data.get("groups") or []:
+        if not isinstance(g, dict) or not g.get("id"):
+            continue
+        cams = []
+        for c in g.get("cameras") or []:
+            if not isinstance(c, dict) or not c.get("id"):
+                continue
+            if c.get("channel") or c.get("url"):
+                cams.append(c)
+        groups.append({
+            "id": str(g["id"]),
+            "name": str(g.get("name") or "Group").strip(),
+            "base_url": str(g.get("base_url") or "").strip(),
+            "cameras": cams,
+        })
+    return ({"groups": groups}, False)
+
+
+def _load_ip_cameras():
+    """Return the IP-camera config dict. Migrates older formats on the
+    fly and persists the migration so IDs are stable across requests.
+    """
+    try:
+        with open(IP_CAMERAS_PATH) as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"groups": []}
+
+    state, migrated = _normalize_ip_cameras(data)
+    if migrated:
+        # Persist immediately. Without this, every subsequent read would
+        # mint fresh UUIDs and the frontend's PUT/DELETE calls (which
+        # reference the IDs the browser saw on its last render) would
+        # 404 with "group not found".
+        try:
+            _save_ip_cameras(state)
+        except Exception:
+            pass
+    return state
+
+
+def _save_ip_cameras(state):
+    with open(IP_CAMERAS_PATH, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def _resolved_camera_url(cam, base_url):
+    """Compute the full RTSP URL. Returns "" if incomplete."""
+    if cam.get("url"):
+        return str(cam["url"]).strip()
+    ch = str(cam.get("channel") or "").strip()
+    if ch and base_url:
+        return base_url + ch
+    return ""
+
+
+def _find_group(state, group_id):
+    return next((g for g in state.get("groups", []) if g.get("id") == group_id), None)
+
+
+def _find_camera(state, camera_id):
+    """Return (group, camera) or (None, None)."""
+    for g in state.get("groups", []):
+        for c in g.get("cameras", []):
+            if c.get("id") == camera_id:
+                return g, c
+    return None, None
+
+
+def _expanded_cameras(state):
+    """Yield (group, cam, resolved_url) for every camera that has a URL."""
+    for g in state.get("groups", []):
+        base = g.get("base_url", "")
+        for c in g.get("cameras", []):
+            url = _resolved_camera_url(c, base)
+            if not url:
+                continue
+            yield g, c, url
+
+
+def _serialize_state(state):
+    """Frontend-shaped view: each camera carries `resolved_url`."""
+    out = {"groups": []}
+    for g in state.get("groups", []):
+        cams_out = []
+        base = g.get("base_url", "")
+        for c in g.get("cameras", []):
+            cams_out.append({
+                "id": c.get("id"),
+                "name": c.get("name") or "",
+                "channel": c.get("channel") or "",
+                "url": c.get("url") or "",
+                "resolved_url": _resolved_camera_url(c, base),
+            })
+        out["groups"].append({
+            "id": g.get("id"),
+            "name": g.get("name") or "",
+            "base_url": base,
+            "cameras": cams_out,
+        })
+    return out
 ALLOWED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
 os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
@@ -661,6 +827,30 @@ def list_people():
     return people
 
 
+def _resolve_camera_display_name(source):
+    """Return a human-friendly camera label (e.g. '2 — Office (IP)').
+
+    Looks up *source* against the configured IP cameras. Never returns the
+    raw URL/IP — the visit-history UI must not leak addresses. Falls back
+    to 'Unknown camera' when no match is found.
+    """
+    if not source:
+        return "Unknown camera"
+    s = str(source)
+    try:
+        state = _load_ip_cameras()
+        for group, cam, url in _expanded_cameras(state):
+            if str(url) == s:
+                cam_name = str(cam.get("name") or "IP Camera").strip()
+                group_name = str(group.get("name") or "").strip()
+                if group_name and group_name.lower() != "standalone":
+                    return f"{cam_name} — {group_name} (IP)"
+                return f"{cam_name} (IP)"
+    except Exception:
+        pass
+    return "Unknown camera"
+
+
 def _camera_source_to_text(source):
     if source is None:
         return ""
@@ -734,6 +924,25 @@ def _list_camera_devices():
             }
         )
 
+    # Append configured IP cameras (walk every group; standalone or NVR-style).
+    state = _load_ip_cameras()
+    seen_urls = set()
+    for group, cam, url in _expanded_cameras(state):
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        cam_name = str(cam.get("name") or "IP Camera").strip()
+        group_name = str(group.get("name") or "").strip()
+        # Suffix the group name whenever the camera belongs to a meaningful
+        # non-standalone group. Older configs store cameras with a raw `url`
+        # instead of `channel`, but they're still part of the group.
+        in_named_group = bool(group_name) and group_name.lower() != "standalone"
+        if in_named_group:
+            label = f"{cam_name} — {group_name} (IP)"
+        else:
+            label = f"{cam_name} (IP)"
+        devices.append({"value": url, "label": label, "path": url})
+
     if devices:
         # Insert grid options for each supported layout
         for idx, (r, c) in enumerate(reversed(AVAILABLE_LAYOUTS)):
@@ -785,9 +994,17 @@ def index():
 def test_page():
     return render_template("test.html")
 
+@app.route("/settings")
+def settings_page():
+    return render_template("settings.html")
+
+@app.route("/dashboard")
+def dashboard_page():
+    return render_template("settings.html")
+
 @app.route("/people")
 def people_page():
-    return render_template("people.html")
+    return render_template("settings.html")
 
 @app.route("/video")
 def video():
@@ -894,6 +1111,17 @@ def api_attendance_reset():
 def api_people():
     return jsonify({"people": list_people()})
 
+def _reload_faces_async():
+    """Fire engine.reload_faces() on a background thread.
+
+    Used by mutating endpoints (upload/move/delete/rename/merge) so the
+    HTTP response returns as soon as the filesystem change is committed,
+    rather than waiting for embeddings to rebuild. The next detection
+    pass picks up the new embeddings once the thread finishes.
+    """
+    threading.Thread(target=engine.reload_faces, daemon=True).start()
+
+
 @app.route("/api/reload_faces", methods=["POST"])
 def api_reload_faces():
     engine.reload_faces()
@@ -948,7 +1176,7 @@ def api_upload_face():
     # Add some delay before reloading faces to allow file save to complete
     time.sleep(1)  # You can adjust this based on file sizes
 
-    engine.reload_faces()
+    _reload_faces_async()
     return jsonify({"ok": True, "person": person, "saved": f"/faces/{person}/{filename}"})
 
 @app.route("/api/rename_person", methods=["POST"])
@@ -984,7 +1212,7 @@ def api_rename_person():
     rows = db.rename_person(old_name, new_name)
 
     # Reload face embeddings
-    engine.reload_faces()
+    _reload_faces_async()
 
     return jsonify({"ok": True, "person": new_name, "renamed_visits": rows})
 
@@ -1006,7 +1234,7 @@ def api_delete_person(name):
     deleted_visits = db.delete_person_visits(person)
 
     # Reload face embeddings
-    engine.reload_faces()
+    _reload_faces_async()
 
     return jsonify({"ok": True, "person": person, "deleted_visits": deleted_visits})
 
@@ -1055,7 +1283,7 @@ def api_delete_person_image(name, filename):
         shutil.rmtree(person_dir)
         person_removed = True
 
-    engine.reload_faces()
+    _reload_faces_async()
     return jsonify({"ok": True, "person_removed": person_removed})
 
 @app.route("/api/person/<name>/image/<filename>/transfer", methods=["POST"])
@@ -1102,13 +1330,183 @@ def api_transfer_person_image(name, filename):
         shutil.rmtree(src_dir, ignore_errors=True)
         person_removed = True
 
-    engine.reload_faces()
+    _reload_faces_async()
     return jsonify({
         "ok": True,
         "target": target_name,
         "new_filename": new_filename,
         "person_removed": person_removed,
     })
+
+@app.route("/api/person/<name>/images/bulk_delete", methods=["POST"])
+def api_bulk_delete_person_images(name):
+    """Delete multiple images from a person. Body: {"filenames": [...]}."""
+    person = safe_person_name(name)
+    if not person:
+        return jsonify({"ok": False, "error": "Invalid person name"}), 400
+
+    data = request.get_json(silent=True) or {}
+    filenames = data.get("filenames") or []
+    if not isinstance(filenames, list) or not filenames:
+        return jsonify({"ok": False, "error": "filenames list is required"}), 400
+
+    person_dir = os.path.join(FACES_DIR, person)
+    if not os.path.isdir(person_dir):
+        return jsonify({"ok": False, "error": "Person not found"}), 404
+
+    deleted, missing = [], []
+    for raw in filenames:
+        fn = secure_filename(str(raw))
+        if not fn:
+            missing.append(raw)
+            continue
+        fp = os.path.join(person_dir, fn)
+        if not os.path.isfile(fp):
+            missing.append(fn)
+            continue
+        try:
+            os.remove(fp)
+            deleted.append(fn)
+        except Exception:
+            missing.append(fn)
+
+    person_removed = False
+    remaining = [f for f in os.listdir(person_dir) if os.path.splitext(f)[1].lower() in ALLOWED_EXTS]
+    if not remaining:
+        shutil.rmtree(person_dir, ignore_errors=True)
+        person_removed = True
+
+    _reload_faces_async()
+    return jsonify({
+        "ok": True, "deleted": deleted, "missing": missing,
+        "person_removed": person_removed,
+    })
+
+
+@app.route("/api/person/<name>/images/bulk_transfer", methods=["POST"])
+def api_bulk_transfer_person_images(name):
+    """Move multiple images to another person. Body: {"target": "...", "filenames": [...]}."""
+    person = safe_person_name(name)
+    if not person:
+        return jsonify({"ok": False, "error": "Invalid source person name"}), 400
+
+    data = request.get_json(silent=True) or {}
+    target_name = safe_person_name(data.get("target", ""))
+    if not target_name:
+        return jsonify({"ok": False, "error": "target person name is required"}), 400
+    if person == target_name:
+        return jsonify({"ok": False, "error": "Source and target are the same"}), 400
+
+    filenames = data.get("filenames") or []
+    if not isinstance(filenames, list) or not filenames:
+        return jsonify({"ok": False, "error": "filenames list is required"}), 400
+
+    src_dir = os.path.join(FACES_DIR, person)
+    if not os.path.isdir(src_dir):
+        return jsonify({"ok": False, "error": "Source person not found"}), 404
+
+    tgt_dir = os.path.join(FACES_DIR, target_name)
+    os.makedirs(tgt_dir, exist_ok=True)
+
+    moved, missing = [], []
+    for raw in filenames:
+        fn = secure_filename(str(raw))
+        if not fn:
+            missing.append(raw); continue
+        sp = os.path.join(src_dir, fn)
+        if not os.path.isfile(sp):
+            missing.append(fn); continue
+        ext = os.path.splitext(fn)[1].lower() or ".jpg"
+        new_fn = next_image_filename(tgt_dir, ext)
+        try:
+            shutil.move(sp, os.path.join(tgt_dir, new_fn))
+            moved.append({"old": fn, "new": new_fn})
+        except Exception:
+            missing.append(fn)
+
+    person_removed = False
+    if os.path.isdir(src_dir):
+        remaining = [f for f in os.listdir(src_dir) if os.path.splitext(f)[1].lower() in ALLOWED_EXTS]
+        if not remaining:
+            shutil.rmtree(src_dir, ignore_errors=True)
+            person_removed = True
+
+    _reload_faces_async()
+    return jsonify({
+        "ok": True, "target": target_name, "moved": moved,
+        "missing": missing, "person_removed": person_removed,
+    })
+
+
+@app.route("/api/people/merge", methods=["POST"])
+def api_merge_people():
+    """Merge one or more source people into a target person.
+
+    Body: {"sources": ["a", "b"], "target": "c"}. The target may be a new name —
+    it will be created. All images from each source are moved into the target's
+    folder (filenames re-numbered to avoid collisions). Source folders are
+    removed when emptied.
+    """
+    data = request.get_json(silent=True) or {}
+    target_name = safe_person_name(data.get("target", ""))
+    sources_raw = data.get("sources") or []
+    if not target_name:
+        return jsonify({"ok": False, "error": "target is required"}), 400
+    if not isinstance(sources_raw, list) or not sources_raw:
+        return jsonify({"ok": False, "error": "sources list is required"}), 400
+
+    sources = []
+    for s in sources_raw:
+        sn = safe_person_name(s)
+        if sn and sn != target_name and sn not in sources:
+            sources.append(sn)
+    if not sources:
+        return jsonify({"ok": False, "error": "no valid sources"}), 400
+
+    tgt_dir = os.path.join(FACES_DIR, target_name)
+    os.makedirs(tgt_dir, exist_ok=True)
+
+    merged, removed = 0, []
+    for src in sources:
+        src_dir = os.path.join(FACES_DIR, src)
+        if not os.path.isdir(src_dir):
+            continue
+        for fn in list(os.listdir(src_dir)):
+            ext = os.path.splitext(fn)[1].lower()
+            if ext not in ALLOWED_EXTS:
+                continue
+            sp = os.path.join(src_dir, fn)
+            new_fn = next_image_filename(tgt_dir, ext or ".jpg")
+            try:
+                shutil.move(sp, os.path.join(tgt_dir, new_fn))
+                merged += 1
+            except Exception:
+                pass
+        try:
+            remaining = [f for f in os.listdir(src_dir) if os.path.splitext(f)[1].lower() in ALLOWED_EXTS]
+            if not remaining:
+                shutil.rmtree(src_dir, ignore_errors=True)
+                removed.append(src)
+        except Exception:
+            pass
+
+    # Reassign visit history rows from each source to the target so that
+    # historical visits appear under the merged identity.
+    rows_updated = 0
+    if db.is_available():
+        for src in sources:
+            try:
+                rows_updated += int(db.rename_person(src, target_name) or 0)
+            except Exception:
+                pass
+
+    _reload_faces_async()
+    return jsonify({
+        "ok": True, "target": target_name, "sources": sources,
+        "merged": merged, "removed": removed,
+        "visits_reassigned": rows_updated,
+    })
+
 
 @app.route("/faces/<person>/<path:filename>")
 def faces_file(person, filename):
@@ -1145,105 +1543,372 @@ def api_camera_get():
     # Determine which camera indices the engine currently holds open
     active_cams = []
     if engine.is_running():
-        if engine.is_grid_mode():
+        if engine._is_grid_mode():
             sources = engine._parse_grid_sources(engine.cam_index)
             active_cams = [s for s in sources if isinstance(s, int)]
         elif isinstance(engine.cam_index, int):
             active_cams = [engine.cam_index]
+    rows, cols = engine._grid_layout
     return jsonify(
         {
             "running": engine.is_running(),
             "camera_source": _camera_source_to_text(engine.cam_index),
             "devices": _list_camera_devices(),
             "active_cameras": active_cams,
+            "viewer_mode": engine.viewer_mode,
+            "viewer_source": engine.viewer_source,
+            "viewer_grid_offset": engine.viewer_grid_offset,
+            "grid_layout": [rows, cols],
+            "grid_page_size": engine.grid_page_size(),
+            "grid_page_count": engine.grid_page_count(),
         }
     )
 
 
+def _all_configured_sources():
+    """Return every non-grid camera source value the UI knows about."""
+    out = []
+    for d in _list_camera_devices():
+        val = str(d.get("value", "")).strip()
+        if not val or val.startswith("grid_"):
+            continue
+        out.append(val)
+    return out
+
+
+def _build_analysis_pool_source():
+    """Build the engine's grid: cam_index string covering every configured
+    camera. Empty if there are none."""
+    sources = _all_configured_sources()
+    if not sources:
+        return ""
+    return "grid:" + ",".join(sources)
+
+
+def _refresh_source_name_map():
+    """Rebuild engine.source_name_map from the IP-cameras config so grid
+    tiles label IP cams by their configured name."""
+    engine.source_name_map = {
+        url: (cam.get("name") or "IP Camera")
+        for _, cam, url in _expanded_cameras(_load_ip_cameras())
+    }
+
+
 @app.route("/api/camera", methods=["POST"])
 def api_camera_set():
+    """Update *viewer* state. Does not stop or restart the engine —
+    every configured camera stays open and continues running face
+    recognition. Choosing a grid layout (``grid_RxC``) just changes
+    the visible composite size; choosing a numeric or URL source
+    switches single-view to that camera.
+    """
     payload = request.get_json(silent=True) or {}
+    # Support a "grid_offset" only update — change which page of cameras
+    # the visible composite shows without touching mode or layout.
+    if "grid_offset" in payload and "source" not in payload:
+        try:
+            new_offset = int(payload.get("grid_offset", 0))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "grid_offset must be int"}), 400
+        # Wrap or clamp so the offset is always valid for the current pool
+        page_size = engine.grid_page_size()
+        n_pages = engine.grid_page_count()
+        if n_pages > 0:
+            page_idx = (new_offset // page_size) % n_pages
+            new_offset = page_idx * page_size
+        engine.set_viewer(grid_offset=new_offset)
+        return jsonify({
+            "ok": True,
+            "running": engine.is_running(),
+            "viewer_mode": engine.viewer_mode,
+            "viewer_grid_offset": engine.viewer_grid_offset,
+            "grid_page_count": n_pages,
+        })
+
     source_raw = payload.get("source", request.form.get("source", ""))
     source_text = str(source_raw or "").strip()
     if not source_text:
         return jsonify({"ok": False, "error": "source is required"}), 400
 
-    restart = bool(payload.get("restart", True))
-
-    # Match grid_RxC patterns (e.g. grid_3x2, grid_4x4)
     grid_match = re.fullmatch(r"grid_(\d+)x(\d+)", source_text)
     if grid_match:
         rows, cols = int(grid_match.group(1)), int(grid_match.group(2))
+        old_layout = tuple(engine._grid_layout)
         try:
             engine.set_grid_layout(rows, cols)
         except ValueError as e:
             return jsonify({"ok": False, "error": str(e)}), 400
-
-        # Check if we have a saved grid config for this layout
-        saved = FaceEngine.load_grid_config()
-        if saved and tuple(saved["layout"]) == (rows, cols):
-            new_source = saved["cam_index"]
-        else:
-            # Auto-fill: discover devices and fill slots sequentially
-            numeric_sources = []
-            for d in _list_camera_devices():
-                val = str(d.get("value", "")).strip()
-                if re.fullmatch(r"\d+", val):
-                    numeric_sources.append(val)
-            if not numeric_sources:
-                return jsonify({"ok": False, "error": "no camera devices found for grid mode"}), 400
-            max_slots = rows * cols
-            new_source = "grid:" + ",".join(numeric_sources[:max_slots])
-    else:
-        new_source = int(source_text) if re.fullmatch(r"\d+", source_text) else source_text
-
-    with state_lock:
-        old_source = engine.cam_index
-        was_running = engine.is_running()
-        source_changed = new_source != old_source
-
-        if source_changed and was_running:
-            engine.stop()
-        if source_changed:
-            engine.cam_index = new_source
-
-        should_start = (was_running or restart) and (not engine.is_running())
-        if should_start:
-            try:
-                engine.start()
-            except Exception as e:
+        # Reset to first page when entering grid mode or changing layout
+        engine.set_viewer(mode="grid", source="", grid_offset=0)
+        # Layout actually changed → restart the analysis pool. The render
+        # loop captures tile sizes at start; without restart, the new
+        # layout would just paint into the old canvas dimensions and the
+        # composite would still look like the previous grid.
+        if (rows, cols) != old_layout and engine.is_running():
+            with state_lock:
                 if engine.is_running():
                     engine.stop()
-                engine.cam_index = old_source
-                restored = False
-                if was_running:
-                    try:
-                        engine.start()
-                        restored = True
-                    except Exception:
-                        restored = False
-                return jsonify(
-                    {
-                        "ok": False,
-                        "error": f"failed to open camera source: {e}",
-                        "camera_source": _camera_source_to_text(engine.cam_index),
-                        "running": engine.is_running(),
-                        "restored_previous_source": restored,
-                    }
-                ), 500
+                pool = _build_analysis_pool_source()
+                if pool:
+                    engine.cam_index = pool
+                _refresh_source_name_map()
+                engine.set_viewer(mode="grid", source="", grid_offset=0)
+                try:
+                    engine.start()
+                except Exception as e:
+                    return jsonify({"ok": False, "error": f"failed to restart: {e}"}), 500
+    else:
+        engine.set_viewer(mode="single", source=source_text)
 
-    if source_changed:
-        with attendance_lock:
-            _mark_all_absent()
+    _refresh_source_name_map()
 
-    return jsonify(
-        {
-            "ok": True,
-            "running": engine.is_running(),
-            "camera_source": _camera_source_to_text(engine.cam_index),
-            "devices": _list_camera_devices(),
-        }
-    )
+    rows_o, cols_o = engine._grid_layout
+    return jsonify({
+        "ok": True,
+        "running": engine.is_running(),
+        "viewer_mode": engine.viewer_mode,
+        "viewer_source": engine.viewer_source,
+        "viewer_grid_offset": engine.viewer_grid_offset,
+        "grid_layout": [rows_o, cols_o],
+        "grid_page_size": engine.grid_page_size(),
+        "grid_page_count": engine.grid_page_count(),
+        "camera_source": _camera_source_to_text(engine.cam_index),
+        "devices": _list_camera_devices(),
+    })
+
+
+@app.route("/api/camera/reload", methods=["POST"])
+def api_camera_reload():
+    """Restart the analysis pool to pick up newly added/removed cameras.
+    The viewer state is preserved across the restart."""
+    with state_lock:
+        was_running = engine.is_running()
+        prev_mode = engine.viewer_mode
+        prev_source = engine.viewer_source
+        if was_running:
+            engine.stop()
+        new_pool = _build_analysis_pool_source()
+        if not new_pool:
+            return jsonify({"ok": False, "error": "no cameras configured"}), 400
+        engine.cam_index = new_pool
+        _refresh_source_name_map()
+        engine.set_viewer(mode=prev_mode, source=prev_source)
+        try:
+            engine.start()
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"failed to start: {e}"}), 500
+    return jsonify({"ok": True, "running": engine.is_running()})
+
+def _all_resolved_urls(state, exclude_camera_id=None):
+    """Return a set of resolved URLs across all groups, optionally
+    excluding a given camera id (used for duplicate-detection on update)."""
+    out = set()
+    for _, c, url in _expanded_cameras(state):
+        if exclude_camera_id and c.get("id") == exclude_camera_id:
+            continue
+        out.add(url)
+    return out
+
+
+@app.route("/api/ip_cameras", methods=["GET"])
+def api_ip_cameras_list():
+    return jsonify({"ok": True, **_serialize_state(_load_ip_cameras())})
+
+
+@app.route("/api/ip_cameras/groups", methods=["POST"])
+def api_ip_cameras_group_add():
+    payload = request.get_json(silent=True) or {}
+    name = str(payload.get("name", "")).strip() or "Group"
+    base_url = str(payload.get("base_url", "")).strip()
+    with _ip_cameras_lock:
+        state = _load_ip_cameras()
+        group = {"id": _new_id(), "name": name, "base_url": base_url, "cameras": []}
+        state["groups"].append(group)
+        _save_ip_cameras(state)
+    return jsonify({"ok": True, "group": group})
+
+
+@app.route("/api/ip_cameras/groups/<group_id>", methods=["PUT"])
+def api_ip_cameras_group_update(group_id):
+    payload = request.get_json(silent=True) or {}
+    new_name = payload.get("name")
+    new_base = payload.get("base_url")
+    with _ip_cameras_lock:
+        state = _load_ip_cameras()
+        g = _find_group(state, group_id)
+        if not g:
+            return jsonify({"ok": False, "error": "group not found"}), 404
+        if new_name is not None:
+            n = str(new_name).strip()
+            if n:
+                g["name"] = n
+        if new_base is not None:
+            g["base_url"] = str(new_base).strip()
+        _save_ip_cameras(state)
+    return jsonify({"ok": True, "group": {
+        "id": g["id"], "name": g["name"], "base_url": g["base_url"],
+    }})
+
+
+@app.route("/api/ip_cameras/groups/<group_id>", methods=["DELETE"])
+def api_ip_cameras_group_delete(group_id):
+    with _ip_cameras_lock:
+        state = _load_ip_cameras()
+        before = len(state["groups"])
+        state["groups"] = [g for g in state["groups"] if g.get("id") != group_id]
+        if len(state["groups"]) == before:
+            return jsonify({"ok": False, "error": "group not found"}), 404
+        _save_ip_cameras(state)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/ip_cameras/groups/<group_id>/cameras", methods=["POST"])
+def api_ip_cameras_camera_add(group_id):
+    payload = request.get_json(silent=True) or {}
+    name = str(payload.get("name", "")).strip() or "IP Camera"
+    channel = str(payload.get("channel", "")).strip()
+    url = str(payload.get("url", "")).strip()
+
+    if not channel and not url:
+        return jsonify({"ok": False, "error": "either channel or url is required"}), 400
+
+    with _ip_cameras_lock:
+        state = _load_ip_cameras()
+        g = _find_group(state, group_id)
+        if not g:
+            return jsonify({"ok": False, "error": "group not found"}), 404
+
+        cam = {"id": _new_id(), "name": name}
+        if url:
+            cam["url"] = url
+        else:
+            cam["channel"] = channel
+
+        # Duplicate URL check (only if we can resolve a URL)
+        resolved = _resolved_camera_url(cam, g.get("base_url", ""))
+        if resolved and resolved in _all_resolved_urls(state):
+            return jsonify({"ok": False, "error": "a camera with this URL already exists"}), 400
+
+        g.setdefault("cameras", []).append(cam)
+        _save_ip_cameras(state)
+    return jsonify({"ok": True, "camera": {**cam, "resolved_url": resolved}})
+
+
+@app.route("/api/ip_cameras/cameras/<camera_id>", methods=["PUT"])
+def api_ip_cameras_camera_update(camera_id):
+    payload = request.get_json(silent=True) or {}
+    new_name = payload.get("name")
+    new_channel = payload.get("channel")
+    new_url = payload.get("url")
+    with _ip_cameras_lock:
+        state = _load_ip_cameras()
+        group, cam = _find_camera(state, camera_id)
+        if not cam:
+            return jsonify({"ok": False, "error": "camera not found"}), 404
+
+        if new_name is not None:
+            n = str(new_name).strip()
+            if n:
+                cam["name"] = n
+
+        # channel and url are mutually exclusive on a single camera record
+        if new_url is not None:
+            u = str(new_url).strip()
+            if u:
+                cam["url"] = u
+                cam.pop("channel", None)
+            else:
+                cam.pop("url", None)
+        if new_channel is not None:
+            ch = str(new_channel).strip()
+            if ch:
+                cam["channel"] = ch
+                cam.pop("url", None)
+            else:
+                cam.pop("channel", None)
+
+        # Duplicate URL check across all groups (excluding this camera)
+        resolved = _resolved_camera_url(cam, group.get("base_url", ""))
+        if resolved and resolved in _all_resolved_urls(state, exclude_camera_id=camera_id):
+            return jsonify({"ok": False, "error": "another camera with this URL already exists"}), 400
+
+        _save_ip_cameras(state)
+    return jsonify({"ok": True, "camera": {**cam, "resolved_url": resolved}})
+
+
+def _coerce_probe_source(raw):
+    """Convert a UI source value into something cv2.VideoCapture accepts."""
+    s = str(raw).strip()
+    return int(s) if re.fullmatch(r"\d+", s) else s
+
+
+def _probe_camera_url(url, timeout_s=8.0):
+    """Try to open *url* with cv2.VideoCapture and read one frame.
+
+    Accepts either a URL string or an integer-like device index. Returns
+    ``(ok, message)``. Runs cv2 calls in a worker thread so we can enforce
+    *timeout_s* even if the FFmpeg/V4L backend hangs.
+    """
+    src = _coerce_probe_source(url)
+    is_url = isinstance(src, str)
+    result = {"ok": False, "msg": "timeout"}
+
+    def _worker():
+        cap = None
+        try:
+            cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG) if is_url else cv2.VideoCapture(src)
+            if not cap.isOpened():
+                result["msg"] = "cannot open (check URL, credentials, network or device)" \
+                    if is_url else "device unavailable"
+                return
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                result["msg"] = "opened but no frame received"
+                return
+            result["ok"] = True
+            result["msg"] = f"ok ({frame.shape[1]}x{frame.shape[0]})"
+        except Exception as e:
+            result["msg"] = f"error: {e}"
+        finally:
+            if cap is not None:
+                try: cap.release()
+                except Exception: pass
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        return False, f"timed out after {timeout_s:.0f}s"
+    return result["ok"], result["msg"]
+
+
+@app.route("/api/ip_cameras/cameras/<camera_id>/test", methods=["POST"])
+def api_ip_cameras_camera_test(camera_id):
+    payload = request.get_json(silent=True) or {}
+    url = str(payload.get("url", "")).strip()
+    if not url:
+        state = _load_ip_cameras()
+        group, cam = _find_camera(state, camera_id)
+        if not cam:
+            return jsonify({"ok": False, "error": "camera not found"}), 404
+        url = _resolved_camera_url(cam, group.get("base_url", ""))
+    if not url:
+        return jsonify({"ok": False, "error": "camera has no resolvable url"}), 400
+    ok, msg = _probe_camera_url(url)
+    return jsonify({"ok": ok, "message": msg})
+
+
+@app.route("/api/ip_cameras/cameras/<camera_id>", methods=["DELETE"])
+def api_ip_cameras_camera_delete(camera_id):
+    with _ip_cameras_lock:
+        state = _load_ip_cameras()
+        group, cam = _find_camera(state, camera_id)
+        if not cam:
+            return jsonify({"ok": False, "error": "camera not found"}), 404
+        group["cameras"] = [c for c in group["cameras"] if c.get("id") != camera_id]
+        _save_ip_cameras(state)
+    return jsonify({"ok": True})
+
 
 @app.route("/api/grid/config", methods=["GET"])
 def api_grid_config_get():
@@ -1366,7 +2031,7 @@ def api_grid_config_set():
 
 @app.route("/history")
 def history_page():
-    return render_template("history.html")
+    return render_template("settings.html")
 
 
 def _to_dt(val):
@@ -1389,6 +2054,7 @@ def _serialize_visit(v):
         "id": v.get("id"),
         "person_name": v.get("person_name", ""),
         "location_name": v.get("location_name", ""),
+        "location_display": _resolve_camera_display_name(v.get("camera_source")),
         "camera_source": v.get("camera_source", ""),
         "first_seen": first.isoformat() if first else None,
         "last_seen": last.isoformat() if last else None,
@@ -1495,6 +2161,8 @@ def api_history_locations():
     if not db.is_available():
         return jsonify({"ok": False, "error": "database not available"}), 503
     locs = db.get_locations()
+    for l in locs:
+        l["display_name"] = _resolve_camera_display_name(l.get("camera_source"))
     return jsonify({"ok": True, "locations": locs})
 
 
@@ -1568,7 +2236,17 @@ def api_history_clear():
 def api_start():
     with state_lock:
         if not engine.is_running():
-            engine.start()
+            # Always start with the full analysis pool — every USB and IP
+            # camera the system knows about. The viewer state decides what
+            # the MJPEG stream displays; analysis runs on all of them.
+            pool = _build_analysis_pool_source()
+            if pool:
+                engine.cam_index = pool
+            _refresh_source_name_map()
+            try:
+                engine.start()
+            except Exception as e:
+                return jsonify({"ok": False, "error": f"failed to start: {e}"}), 500
     return jsonify({"ok": True, "running": engine.is_running()})
 
 @app.route("/api/stop", methods=["POST"])

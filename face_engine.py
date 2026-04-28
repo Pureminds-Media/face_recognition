@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import time
 import struct
 import threading
@@ -209,6 +210,11 @@ class FaceEngine:
         self._cap = None
         self._grid_workers = {}
         self._grid_sources = []
+        # Optional friendly-name lookup for grid tile labels:
+        # { "<source-string>": "<friendly name>" }
+        # Set by callers (e.g. app.py) before/after start(). Falls back to
+        # "Cam <source>" when a source isn't in the map.
+        self.source_name_map = {}
         self._grid_stop_evt = threading.Event()
         self._grid_render_t = None
         self._grid_layout = (2, 2)  # rows, cols  (may be overridden by load_grid_config)
@@ -216,7 +222,27 @@ class FaceEngine:
         self._worker_t = None
         self._main_t = None
         self._lock = threading.Lock()
+        # Serialize all DeepFace inference calls. With many simultaneous
+        # detect_loops the underlying TensorFlow models race during lazy
+        # model load / state mutation; the symptom is that *no* boxes
+        # ever appear because every call either crashes silently or
+        # returns garbage. The lock costs us parallelism but the GPU
+        # was already the bottleneck anyway.
+        self._inference_lock = threading.Lock()
         self._latest_jpeg = None
+        # Per-camera annotated full-resolution JPEG for the source the
+        # user is currently watching in single mode. None when no source
+        # is selected or the source is offline.
+        self._latest_single_jpeg = None
+        # Viewer state (decoupled from the analysis pool). The engine
+        # analyses every camera; viewer_* just controls what get_jpeg()
+        # returns to the MJPEG stream.
+        self.viewer_mode = "grid"   # "single" | "grid"
+        self.viewer_source = ""     # str representation of the chosen source
+        # In grid mode, this is the index of the first camera shown in
+        # the visible composite. Lets the user page through more cameras
+        # than the layout has slots for.
+        self.viewer_grid_offset = 0
         self._latest_tracks = []
         self._running = False
         self._qr_detector = cv2.QRCodeDetector()
@@ -244,8 +270,11 @@ class FaceEngine:
         # Head detection (YOLO) — supplements face detector for track persistence
         self._head_detector = None  # lazy, created in start()
 
-        # Action detection (CLIP zero-shot) — can be disabled via env
-        self.activity_enabled = os.getenv("ACTION_DETECTION_ENABLED", "true").lower() in ("true", "1", "yes")
+        # Action detection (CLIP zero-shot) — can be disabled via env.
+        # Default OFF: on large deployments (10+ cams) CLIP dominates GPU
+        # and starves the face/head detectors. Set ACTION_DETECTION_ENABLED=true
+        # to opt back in.
+        self.activity_enabled = os.getenv("ACTION_DETECTION_ENABLED", "false").lower() in ("true", "1", "yes")
         self._action_detector = None
         self.activity_detect_every = 2.0  # seconds between activity checks per person
         # Dedicated action detection thread: runs async, never blocks detect/render loops
@@ -259,9 +288,28 @@ class FaceEngine:
 
         # Auto-capture unknowns — disabled by default (not suited for large crowds)
         self.auto_capture_enabled = os.getenv("AUTO_CAPTURE_ENABLED", "false").lower() in ("true", "1", "yes")
-        self._unknown_pending = {}  # id(track) -> {"count", "best_frame", "best_bbox", "best_area"}
-        self._unknown_capture_min_detections = 4  # ~1.2s at detect_every=0.3
-        self._unknown_max_auto = 50  # max unknown_N folders
+        print(f"[face-engine] auto_capture_enabled={self.auto_capture_enabled} activity_enabled={self.activity_enabled}")
+        self._unknown_pending = {}  # id(track) -> {"first_t", "best_frame", "best_bbox", "best_area"}
+        # Save an unknown after they've been tracked continuously for this
+        # many seconds. Time-based (not detection-count-based) so cadence
+        # changes / lock contention don't affect when capture fires.
+        self._unknown_capture_min_seconds = 5.0
+        self._unknown_max_auto = 150  # max unknown_N folders
+        # After an unknown_N is created, keep adding sample images while
+        # the same track is still in frame, up to this cap. More samples
+        # = more diverse embeddings = better recognition next time the
+        # person reappears.
+        self._unknown_max_images_per_person = 30
+        self._unknown_extra_capture_min_interval = 1.0  # seconds between extra saves
+        # Per-(person, camera_source) cooldown for extra captures. Saving a
+        # fresh sample on the *same* camera is rate-limited (default 10 min)
+        # since consecutive frames look near-identical, but a different
+        # camera produces genuinely new viewpoints/lighting and is allowed
+        # immediately. Applies to both unknown_N folders and human-named
+        # people once enrolled.
+        self._extra_capture_per_cam_cooldown = 600.0
+        self._last_extra_capture_at = {}  # (name, camera_source) -> monotonic ts
+        self._last_extra_capture_lock = threading.Lock()
 
     # ---------- public ----------
     def start(self):
@@ -278,8 +326,7 @@ class FaceEngine:
             if not cap.isOpened():
                 raise RuntimeError("Cannot open webcam")
 
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            # Use the camera's native resolution — don't constrain it.
             # Minimize internal buffer to reduce lag (matches grid mode)
             if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
                 try:
@@ -320,31 +367,45 @@ class FaceEngine:
         import logging
         _log = logging.getLogger(__name__)
 
-        # Signal threads to exit
+        # Signal threads to exit. Join BEFORE releasing self._cap, since
+        # _main_loop calls self._cap.read() — releasing while it's blocked
+        # inside read() (e.g. on RTSP) is a use-after-free → segfault.
         self._running = False
         self.stop_evt.set()
 
-        # Release camera early to unblock reads
-        if self._cap is not None:
-            try:
-                self._cap.release()
-            except Exception:
-                pass
-            self._cap = None
+        # Tear down grid workers (their own cleanup joins+releases safely)
         self._cleanup_grid_mode()
 
-        # Join threads (with zombie detection)
+        # Join threads. Use a timeout > FFmpeg stimeout (5s) so RTSP
+        # workers actually have a chance to return from a blocking read.
+        worker_alive = False
+        main_alive = False
         if self._worker_t is not None:
-            self._worker_t.join(timeout=3.0)
+            self._worker_t.join(timeout=8.0)
             if self._worker_t.is_alive():
+                worker_alive = True
                 _log.warning("stop(): _worker_t did not exit within timeout — zombie thread")
             self._worker_t = None
 
         if self._main_t is not None:
-            self._main_t.join(timeout=3.0)
+            self._main_t.join(timeout=8.0)
             if self._main_t.is_alive():
+                main_alive = True
                 _log.warning("stop(): _main_t did not exit within timeout — zombie thread")
             self._main_t = None
+
+        # Release the capture only after the readers are gone. If _main_t
+        # is a zombie still holding a reference, leak the cap rather than
+        # crash; the OS reclaims it on process exit.
+        if self._cap is not None:
+            if not main_alive:
+                try:
+                    self._cap.release()
+                except Exception:
+                    pass
+            else:
+                _log.warning("stop(): leaking _cap because _main_t is still alive")
+            self._cap = None
 
         # Stop activity thread
         if self._activity_t is not None:
@@ -511,8 +572,68 @@ class FaceEngine:
         return self._running
 
     def get_jpeg(self):
+        """Return the JPEG bytes appropriate for the current viewer mode.
+
+        Single mode returns the annotated full-resolution frame for the
+        chosen camera (or None until the first frame for that source has
+        been rendered). Grid mode returns the composite. We deliberately
+        do NOT fall back from single→grid: that produced a noticeable
+        flash of the grid composite every time the user switched cameras.
+        Returning None makes the MJPEG generator briefly hold the last
+        frame in the browser instead.
+        """
         with self._lock:
+            if self.viewer_mode == "single":
+                return self._latest_single_jpeg
             return self._latest_jpeg
+
+    def set_viewer(self, mode=None, source=None, grid_offset=None):
+        """Update viewer state. Cheap operation — does not touch the
+        analysis pool. Cameras keep running regardless. We do NOT clear
+        ``_latest_single_jpeg`` here; the next render produces a fresh
+        frame for the new source on its own and a stale frame is far
+        less jarring than a black gap or a grid flash."""
+        if mode is not None and mode in ("single", "grid"):
+            self.viewer_mode = mode
+        if source is not None:
+            self.viewer_source = str(source)
+        if grid_offset is not None:
+            self.viewer_grid_offset = max(0, int(grid_offset))
+
+    def grid_page_count(self):
+        """How many pages of cameras the current grid layout has."""
+        rows, cols = self._grid_layout
+        slots = max(1, rows * cols)
+        # Use the union of grid_sources and worker keys (matches the
+        # render loop's analysis_sources construction).
+        n = len(self._grid_sources)
+        for src in self._grid_workers.keys():
+            if src not in self._grid_sources:
+                n += 1
+        return max(1, (n + slots - 1) // slots)
+
+    def grid_page_size(self):
+        rows, cols = self._grid_layout
+        return max(1, rows * cols)
+
+    def _render_single_no_signal(self, source):
+        """Produce a placeholder annotated frame when the viewer's chosen
+        camera is offline. Sized to ``self.width × self.height`` so the
+        MJPEG stream stays at a consistent resolution."""
+        frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        msg = f"No Signal [{source}]"
+        cv2.putText(
+            frame, msg,
+            (max(8, self.width // 2 - 200), self.height // 2),
+            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3,
+        )
+        ok, buf = cv2.imencode(
+            ".jpg", frame,
+            [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)],
+        )
+        if ok:
+            with self._lock:
+                self._latest_single_jpeg = buf.tobytes()
 
     def get_tracks(self):
         with self._lock:
@@ -1151,24 +1272,37 @@ class FaceEngine:
         next_id = max(existing, default=0) + 1
         return f"unknown_{next_id}", len(existing)
 
-    def _try_capture_unknown(self, track, frame, now):
+    def _try_capture_unknown(self, track, frame, now, crop_frame=None, crop_bbox=None, pending=None):
         """
-        Accumulate consecutive face-detector-confirmed 'unknown' detections.
-        After _unknown_capture_min_detections, save a cropped face image and
-        promote the track to a named unknown_N identity.
+        Watch an 'unknown' track over time. After it has been continuously
+        tracked for ``_unknown_capture_min_seconds`` (~5s), save a cropped
+        face image and promote the track to a named unknown_N identity.
+
+        Parameters
+        ----------
+        track : dict
+            The currently-tracked person (bbox in tile coordinate space).
+        frame : ndarray
+            The tile-size frame the tracker is operating on. Used for
+            "best frame" selection by face area in the tile.
+        now : float
+        crop_frame : ndarray | None
+            Higher-resolution frame (typically the raw RTSP frame) to
+            crop the saved face from. If None, falls back to ``frame``.
+        crop_bbox : tuple | None
+            ``(x, y, w, h)`` of the face in ``crop_frame`` coordinates.
+            Required when ``crop_frame`` is supplied.
+
         Returns the new name if captured, else None.
         """
+        if pending is None:
+            pending = self._unknown_pending
         tid = id(track)
 
         # Only process face-detector-confirmed unknowns
         if track.get("name") != "unknown":
             # Track was recognised — discard any pending accumulation
-            self._unknown_pending.pop(tid, None)
-            return None
-
-        last_det = track.get("last_detect_t", 0)
-        if now - last_det > self.detect_every * 2:
-            # Not freshly detector-confirmed — skip
+            pending.pop(tid, None)
             return None
 
         # Compute face area for quality selection
@@ -1177,25 +1311,38 @@ class FaceEngine:
         if area <= 0:
             return None
 
-        entry = self._unknown_pending.get(tid)
+        entry = pending.get(tid)
         if entry is None:
-            entry = {"count": 0, "best_frame": None, "best_bbox": None, "best_area": 0}
-            self._unknown_pending[tid] = entry
+            entry = {"first_t": now, "best_frame": None, "best_bbox": None, "best_area": 0, "_log_t": 0.0}
+            pending[tid] = entry
+            print(f"[auto-capture] new unknown track tid={tid} (need {self._unknown_capture_min_seconds:.1f}s)")
+        else:
+            if (now - entry.get("_log_t", 0.0)) >= 1.0:
+                entry["_log_t"] = now
+                print(f"[auto-capture] tid={tid} elapsed={now - entry['first_t']:.1f}s area={area}")
 
-        entry["count"] += 1
         if area > entry["best_area"]:
-            entry["best_frame"] = frame.copy()
-            entry["best_bbox"] = (bx, by, bw, bh)
+            # Prefer cropping from the higher-resolution frame when available.
+            if crop_frame is not None and crop_bbox is not None:
+                entry["best_frame"] = crop_frame.copy()
+                entry["best_bbox"] = tuple(int(v) for v in crop_bbox)
+            else:
+                entry["best_frame"] = frame.copy()
+                entry["best_bbox"] = (bx, by, bw, bh)
             entry["best_area"] = area
 
-        if entry["count"] < self._unknown_capture_min_detections:
+        if (now - entry["first_t"]) < self._unknown_capture_min_seconds:
+            return None
+
+        if entry["best_frame"] is None:
+            print(f"[auto-capture] tid={tid} hit time threshold but no best_frame — skipping")
             return None
 
         # --- Ready to capture ---
         next_name, existing_count = self._next_unknown_name()
         if existing_count >= self._unknown_max_auto:
             print(f"[auto-capture] Max {self._unknown_max_auto} auto-captured unknowns reached, skipping")
-            self._unknown_pending.pop(tid, None)
+            pending.pop(tid, None)
             return None
 
         # Crop face with 2x padding from best frame
@@ -1210,7 +1357,7 @@ class FaceEngine:
         crop = bf[cy1:cy2, cx1:cx2]
 
         if crop.size == 0:
-            self._unknown_pending.pop(tid, None)
+            pending.pop(tid, None)
             return None
 
         # Save to faces/unknown_N/1.jpg
@@ -1234,14 +1381,139 @@ class FaceEngine:
         threading.Thread(target=_bg_reload, daemon=True).start()
 
         # Cleanup
-        self._unknown_pending.pop(tid, None)
+        pending.pop(tid, None)
         return next_name
 
-    def _cleanup_unknown_pending(self, live_track_ids):
+    def _try_capture_more_for_known(self, track, crop_frame, crop_bbox, now, camera_source=None):
+        """Save additional sample images for an already-recognised person
+        (auto-captured ``unknown_N`` or human-named), up to
+        ``self._unknown_max_images_per_person``.
+
+        Per-camera cooldown: saving on the same camera is rate-limited
+        by ``self._extra_capture_per_cam_cooldown``; a different camera
+        sees a different viewpoint and is allowed immediately.
+
+        Returns True if an image was saved, False otherwise.
+        """
+        name = str(track.get("name", ""))
+        if not name or name == "unknown":
+            return False
+
+        cam_key = str(camera_source) if camera_source is not None else ""
+        with self._last_extra_capture_lock:
+            last_t = float(self._last_extra_capture_at.get((name, cam_key), 0.0))
+        if (now - last_t) < self._extra_capture_per_cam_cooldown:
+            return False
+
+        person_dir = os.path.join(self.known_dir, name)
+        if not os.path.isdir(person_dir):
+            return False
+
+        existing = [
+            f for f in os.listdir(person_dir)
+            if f.lower().endswith(self.allowed_exts)
+        ]
+        n = len(existing)
+        if n >= self._unknown_max_images_per_person:
+            return False
+
+        bx, by, bw, bh = (int(v) for v in crop_bbox)
+        if bw <= 0 or bh <= 0:
+            return False
+        H, W = crop_frame.shape[:2]
+        pad_w, pad_h = bw, bh
+        cx1 = max(0, bx - pad_w)
+        cy1 = max(0, by - pad_h)
+        cx2 = min(W, bx + bw + pad_w)
+        cy2 = min(H, by + bh + pad_h)
+        crop = crop_frame[cy1:cy2, cx1:cx2]
+        if crop.size == 0:
+            return False
+
+        # Verify the new crop actually matches this person's existing
+        # template before saving. Without this check, a track that was
+        # promoted to unknown_N can drift onto a different person (the
+        # detector treats any "unknown" detection as compatible with an
+        # unknown_N track) and contaminate the folder with someone else.
+        template = next(
+            (emb for nm, emb in self.known_embeddings if nm == name),
+            None,
+        )
+        if template is None:
+            # reload_faces() hasn't built the template yet — skip rather
+            # than save blind. We'll get another chance on the next interval.
+            return False
+        if template is not None:
+            try:
+                tight = crop_frame[by:by + bh, bx:bx + bw]
+                if tight.size == 0:
+                    return False
+                with self._inference_lock:
+                    faces = DeepFace.extract_faces(
+                        img_path=tight,
+                        detector_backend=self.detector,
+                        enforce_detection=False,
+                        align=True,
+                    )
+                faces = [
+                    f for f in (faces or [])
+                    if float(f.get("confidence", 0.0)) >= 0.90
+                    and f.get("face") is not None
+                ]
+                if not faces:
+                    return False
+                with self._inference_lock:
+                    rep = DeepFace.represent(
+                        img_path=faces[0]["face"],
+                        model_name=self.model,
+                        detector_backend="skip",
+                        enforce_detection=False,
+                    )
+                if not rep:
+                    return False
+                emb_new = l2norm(rep[0]["embedding"])
+                d = cosine_distance(emb_new, template)
+                if d > self.threshold:
+                    return False
+            except Exception:
+                return False
+
+        # Pick the next free integer filename. We don't assume contiguous
+        # numbering — the user might have manually deleted some.
+        used = set()
+        for f in existing:
+            stem = os.path.splitext(f)[0]
+            if stem.isdigit():
+                used.add(int(stem))
+        idx = 1
+        while idx in used:
+            idx += 1
+        save_path = os.path.join(person_dir, f"{idx}.jpg")
+        try:
+            cv2.imwrite(save_path, crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        except Exception:
+            return False
+        with self._last_extra_capture_lock:
+            self._last_extra_capture_at[(name, cam_key)] = now
+
+        # Reload embeddings in the background so the new sample is used
+        # the next time this person enters the frame. Cheap relative to
+        # the once-per-second cap.
+        def _bg_reload():
+            try:
+                self.reload_faces()
+            except Exception:
+                pass
+        threading.Thread(target=_bg_reload, daemon=True).start()
+        return True
+
+    def _cleanup_unknown_pending(self, live_track_ids, pending=None):
         """Remove pending entries for tracks that no longer exist."""
-        stale = [tid for tid in self._unknown_pending if tid not in live_track_ids]
+        if pending is None:
+            pending = self._unknown_pending
+        stale = [tid for tid in pending if tid not in live_track_ids]
         for tid in stale:
-            del self._unknown_pending[tid]
+            del pending[tid]
 
     def reload_faces(self):
         """Rebuild known embeddings from faces/{name}/*"""
@@ -1263,14 +1535,19 @@ class FaceEngine:
                     faces = DeepFace.extract_faces(
                         img_path=path,
                         detector_backend=self.detector,
-                        enforce_detection=True,
+                        enforce_detection=False,
                         align=True,
                     )
+                    # Filter out the "no face found" placeholder DeepFace
+                    # returns when enforce_detection=False (confidence==0).
+                    faces = [
+                        f for f in (faces or [])
+                        if float(f.get("confidence", 0.0)) >= 0.90
+                        and f.get("face") is not None
+                    ]
                     if not faces:
                         continue
-                    face_img = faces[0].get("face")
-                    if face_img is None:
-                        continue
+                    face_img = faces[0]["face"]
                     rep = DeepFace.represent(
                         img_path=face_img,
                         model_name=self.model,
@@ -1280,7 +1557,9 @@ class FaceEngine:
                     if rep and "embedding" in rep[0]:
                         embs.append(l2norm(rep[0]["embedding"]))
                 except Exception as e:
-                    print(f"Error processing {file}: {e}")
+                    # Don't spam — bad crops are expected with auto-capture.
+                    import logging as _logging
+                    _logging.getLogger(__name__).debug("reload_faces: skip %s (%s)", path, e)
                     continue
 
             if embs:
@@ -1297,26 +1576,30 @@ class FaceEngine:
             used_scale = self.detect_scale
             small = cv2.resize(frame_full, None, fx=used_scale, fy=used_scale)
 
-            faces = DeepFace.extract_faces(
-                img_path=small,
-                detector_backend=self.detector,
-                enforce_detection=False,
-                align=True,
-            )
-
-            if not faces:
+            with self._inference_lock:
                 faces = DeepFace.extract_faces(
-                    img_path=frame_full,
+                    img_path=small,
                     detector_backend=self.detector,
                     enforce_detection=False,
                     align=True,
                 )
-                used_scale = 1.0
+
+                if not faces:
+                    faces = DeepFace.extract_faces(
+                        img_path=frame_full,
+                        detector_backend=self.detector,
+                        enforce_detection=False,
+                        align=True,
+                    )
+                    used_scale = 1.0
 
             inv = 1.0 / used_scale
-        except Exception:
+        except Exception as _ext_err:
+            import logging as _logging
+            _logging.getLogger(__name__).warning("extract_faces failed: %s", _ext_err)
             faces = []
             inv = 1.0
+
 
         for face in faces:
             fa = face.get("facial_area", {})
@@ -1346,18 +1629,21 @@ class FaceEngine:
                 continue
 
             try:
-                rep_live = DeepFace.represent(
-                    img_path=face_img,
-                    model_name=self.model,
-                    detector_backend="skip",
-                    enforce_detection=False,
-                )
+                with self._inference_lock:
+                    rep_live = DeepFace.represent(
+                        img_path=face_img,
+                        model_name=self.model,
+                        detector_backend="skip",
+                        enforce_detection=False,
+                    )
                 if not rep_live:
                     if keep_unembedded_unknown:
                         results.append((x, y, w, h, "unknown", 1.0))
                     continue
                 emb_live = l2norm(rep_live[0]["embedding"])
-            except Exception:
+            except Exception as _rep_err:
+                import logging as _logging
+                _logging.getLogger(__name__).warning("represent failed: %s", _rep_err)
                 if keep_unembedded_unknown:
                     results.append((x, y, w, h, "unknown", 1.0))
                 continue
@@ -1594,7 +1880,6 @@ class FaceEngine:
             raise RuntimeError("No camera sources configured for grid mode")
 
         rows, cols = self._grid_layout
-        max_slots = rows * cols
         # Fixed 16:9 tile aspect ratio regardless of grid layout
         cell_w = max(1, int(self.width // cols))
         cell_h = max(1, int(self.height // rows))
@@ -1607,12 +1892,15 @@ class FaceEngine:
             tile_h = max(1, int(tile_w / target_ratio))
         workers = {}
         # Ordered list with None entries preserved so each slot index
-        # maps directly to a grid position.
+        # maps directly to a grid position. Workers are created for ALL
+        # configured sources (not just those visible in the current grid
+        # layout) so face recognition and visit tracking run on every
+        # camera regardless of what the viewer is looking at.
         ordered_sources = []
         self._grid_stop_evt.clear()
         self._grid_qr_rr_idx = 0
 
-        for source in sources[:max_slots]:
+        for source in sources:
             # None means an intentionally empty slot — no worker needed
             if source is None:
                 ordered_sources.append(None)
@@ -1633,13 +1921,24 @@ class FaceEngine:
                 ordered_sources.append(None)  # treat as empty if can't open
                 continue
 
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, tile_w)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, tile_h)
+            # IMPORTANT: do NOT call cap.set(CAP_PROP_FRAME_WIDTH/HEIGHT).
+            # That would downscale the camera feed at the source on backends
+            # that honor it, starving the AI detectors with a tile-sized
+            # frame. We want the camera's native resolution for detection
+            # and only resize for the tile renderer (done in capture loop).
             if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
                 try:
                     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 except Exception:
                     pass
+
+            # Phase-stagger per worker so N grid workers don't all hit
+            # the inference lock at the same moment. Spreads the load
+            # across detect_every and dramatically reduces lock contention
+            # on large grids (10+ cams).
+            _worker_idx = len(workers)
+            _detect_period = max(0.25, float(self.detect_every))
+            _phase_offset = (_detect_period * _worker_idx / max(1, len(sources))) - _detect_period
 
             worker = {
                 "source": source,
@@ -1653,12 +1952,15 @@ class FaceEngine:
                 "last_good_frame_t": 0.0,
                 "tracks": [],
                 "latest_tracks": [],
-                "last_det_t": 0.0,
+                "last_det_t": time.monotonic() + _phase_offset,
                 "track_max_misses": 6,
                 "bbox_smooth_alpha": 0.55,
                 "max_unknown_tracks": 3,
                 "capture_thread": None,
                 "detect_thread": None,
+                # Per-worker pending dict for auto-capture so workers don't
+                # wipe each other's state via the engine-level cleanup.
+                "unknown_pending": {},
             }
             worker["capture_thread"] = threading.Thread(
                 target=self._grid_capture_loop,
@@ -1695,36 +1997,51 @@ class FaceEngine:
         self._grid_render_t.start()
 
     def _cleanup_grid_mode(self):
+        # 1) Signal every worker to exit.
         self._grid_stop_evt.set()
-
         for w in self._grid_workers.values():
             try:
                 w["stop_evt"].set()
             except Exception:
                 pass
 
-        for w in self._grid_workers.values():
+        import logging
+        _log = logging.getLogger(__name__)
+
+        # 2) Join workers BEFORE releasing their cv2.VideoCapture handles.
+        # On RTSP, cap.read() can block for up to ~stimeout (5s) since the
+        # stop flag is only checked between reads — releasing the cap while
+        # the worker is still inside read() would be a use-after-free and
+        # segfault the process. Use a join timeout > stimeout so RTSP
+        # workers actually have a chance to exit.
+        joined = {}
+        for src, w in self._grid_workers.items():
+            ct = w.get("capture_thread")
+            ok = True
+            if ct is not None:
+                ct.join(timeout=8.0)
+                if ct.is_alive():
+                    _log.warning("_cleanup_grid: capture_thread [%s] zombie — leaking cap to avoid crash", w.get("source", "?"))
+                    ok = False
+            dt = w.get("detect_thread")
+            if dt is not None:
+                dt.join(timeout=4.0)
+                if dt.is_alive():
+                    _log.warning("_cleanup_grid: detect_thread [%s] zombie", w.get("source", "?"))
+            joined[src] = ok
+
+        # 3) Release caps only for workers that actually stopped. A zombie
+        # capture thread still holds a reference to its cap; releasing it
+        # would be a use-after-free.
+        for src, w in self._grid_workers.items():
+            if not joined.get(src, False):
+                continue
             cap = w.get("cap")
             if cap is not None:
                 try:
                     cap.release()
                 except Exception:
                     pass
-
-        import logging
-        _log = logging.getLogger(__name__)
-        for w in self._grid_workers.values():
-            src = w.get("source", "?")
-            t = w.get("capture_thread")
-            if t is not None:
-                t.join(timeout=3.0)
-                if t.is_alive():
-                    _log.warning("_cleanup_grid: capture_thread [%s] zombie", src)
-            t = w.get("detect_thread")
-            if t is not None:
-                t.join(timeout=3.0)
-                if t.is_alive():
-                    _log.warning("_cleanup_grid: detect_thread [%s] zombie", src)
 
         if self._grid_render_t is not None:
             self._grid_render_t.join(timeout=3.0)
@@ -1788,15 +2105,25 @@ class FaceEngine:
                 worker["latest_frame_t"] = now
                 worker["last_good_frame_t"] = now
 
-            self._push_latest(worker["frame_q"], (now, frame.copy()))
+            # Push BOTH the raw camera frame AND the tile-sized resize.
+            # Detection runs on raw for accuracy on small/distant faces;
+            # the tracker is initialised in tile space so render-loop
+            # tracker.update(tile) calls remain cheap and consistent.
+            self._push_latest(
+                worker["frame_q"],
+                (now, raw_frame.copy(), frame.copy()),
+            )
 
     def _grid_detect_loop(self, worker):
         UNKNOWN_TO_FORGET = 3
         detect_period = max(0.25, float(self.detect_every))
         while not self.stop_evt.is_set() and not self._grid_stop_evt.is_set() and not worker["stop_evt"].is_set():
             try:
-                _frame_t, frame = worker["frame_q"].get(timeout=0.1)
+                _frame_t, raw_frame, tile_frame = worker["frame_q"].get(timeout=0.1)
             except Empty:
+                continue
+            except (TypeError, ValueError):
+                # Defensive: queue payload shape mismatch (e.g. legacy 2-tuple).
                 continue
 
             now = time.monotonic()
@@ -1805,15 +2132,50 @@ class FaceEngine:
             if (now - last_det_t) < detect_period:
                 continue
 
+            # Run face detection on the FULL-resolution camera frame so
+            # small faces are still found, then scale results into the
+            # tile coordinate system the tracker + renderer expect.
             try:
-                dets = self._detect_and_match_faces(
-                    frame,
+                dets_raw = self._detect_and_match_faces(
+                    raw_frame,
                     min_face_size=20,
                     keep_unembedded_unknown=True,
                 )
-                dets = self._dedupe_detections(dets)
-            except Exception:
-                dets = []
+                dets_raw = self._dedupe_detections(dets_raw)
+            except Exception as _det_err:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "grid detect failed for %s: %s", worker.get("source", "?"), _det_err,
+                )
+                dets_raw = []
+
+            tile_h_local, tile_w_local = tile_frame.shape[:2]
+            raw_h_local, raw_w_local = raw_frame.shape[:2]
+            sx = tile_w_local / max(1, raw_w_local)
+            sy = tile_h_local / max(1, raw_h_local)
+
+            # Apply noisy-unknown filtering in RAW coordinates before
+            # scaling. Doing this in tile space (post-scale) was rejecting
+            # legitimate ~80px raw faces that shrank below 20px in the
+            # tile, killing auto-capture and action detection downstream.
+            raw_min_face = 20
+            raw_margin_x = max(3, int(0.01 * raw_w_local))
+            raw_margin_y = max(3, int(0.01 * raw_h_local))
+
+            dets = []
+            for x, y, w, h, name, best in dets_raw:
+                if name == "unknown":
+                    if int(w) < raw_min_face or int(h) < raw_min_face:
+                        continue
+                    if (x <= raw_margin_x) or (y <= raw_margin_y) \
+                       or ((x + w) >= (raw_w_local - raw_margin_x)) \
+                       or ((y + h) >= (raw_h_local - raw_margin_y)):
+                        continue
+                tx = int(round(x * sx))
+                ty = int(round(y * sy))
+                tw = max(1, int(round(w * sx)))
+                th = max(1, int(round(h * sy)))
+                dets.append((tx, ty, tw, th, name, best))
 
             # --- Grab tracks snapshot under lock (fast) ---
             with worker["lock"]:
@@ -1822,25 +2184,40 @@ class FaceEngine:
                 track_max_misses = int(worker.get("track_max_misses", 6))
                 max_unknown_tracks = int(worker.get("max_unknown_tracks", 3))
 
-            # --- Head detection runs outside lock (GPU inference) ---
-            head_bboxes = self._run_head_detection(frame)
+            # --- Head detection on the raw frame too (better for small
+            # heads); scale resulting boxes back to tile space. The
+            # downstream matcher expects 5-tuples (x, y, w, h, conf).
+            head_bboxes_raw = self._run_head_detection(raw_frame)
+            head_bboxes = []
+            for hbb in head_bboxes_raw:
+                if not hbb or len(hbb) < 4:
+                    continue
+                hx, hy, hw, hh = hbb[:4]
+                hconf = float(hbb[4]) if len(hbb) >= 5 else 1.0
+                head_bboxes.append((
+                    int(round(hx * sx)),
+                    int(round(hy * sy)),
+                    max(1, int(round(hw * sx))),
+                    max(1, int(round(hh * sy))),
+                    hconf,
+                ))
+
+            # `frame` is what the rest of the loop (tracker init, auto-
+            # capture) operates on. Keep it tile-sized so tracker.update
+            # calls in the render loop remain consistent.
+            frame = tile_frame
 
             # --- Track matching + update (no lock needed — local list) ---
             matched_track_idx = set()
             Hf, Wf = frame.shape[:2]
 
             # Match larger detections first for more stable assignment.
+            # The noisy-unknown filter was already applied in RAW space
+            # above (against the camera-native dimensions); doing it
+            # again in tile space would over-filter.
             dets = sorted(dets, key=lambda r: int(r[2]) * int(r[3]), reverse=True)
             for x, y, w, h, name, best in dets:
                 det_bbox = (int(x), int(y), int(w), int(h))
-                if name == "unknown":
-                    # Suppress noisy unknowns (tiny boxes and edge-hugging false positives).
-                    if int(w) < 20 or int(h) < 20:
-                        continue
-                    margin_x = max(3, int(0.01 * Wf))
-                    margin_y = max(3, int(0.01 * Hf))
-                    if (x <= margin_x) or (y <= margin_y) or ((x + w) >= (Wf - margin_x)) or ((y + h) >= (Hf - margin_y)):
-                        continue
                 best_i = -1
                 best_key = None
                 for i, t in enumerate(tracks):
@@ -1953,19 +2330,53 @@ class FaceEngine:
             self._match_heads_to_tracks(tracks, head_bboxes, now)
 
             # --- Auto-capture unknowns ---
+            # Crop from the raw RTSP frame for highest enrollment quality.
+            # We have to convert the tile-space track bbox back to raw
+            # coordinates using the inverse of (sx, sy).
             if self.auto_capture_enabled:
+                inv_sx = raw_w_local / max(1, tile_w_local)
+                inv_sy = raw_h_local / max(1, tile_h_local)
                 for t in tracks:
-                    if t.get("name") == "unknown" and t.get("updated"):
-                        captured = self._try_capture_unknown(t, frame, now)
+                    if not t.get("updated"):
+                        continue
+                    bx, by, bw, bh = t.get("bbox", (0, 0, 0, 0))
+                    raw_bbox = (
+                        int(round(bx * inv_sx)),
+                        int(round(by * inv_sy)),
+                        max(1, int(round(bw * inv_sx))),
+                        max(1, int(round(bh * inv_sy))),
+                    )
+                    if t.get("name") == "unknown":
+                        # First-time enrollment of a new unknown person.
+                        captured = self._try_capture_unknown(
+                            t, frame, now,
+                            crop_frame=raw_frame, crop_bbox=raw_bbox,
+                            pending=worker["unknown_pending"],
+                        )
                         if captured:
                             print(f"[grid-detect] auto-captured {captured} on cam {worker['source']}")
-                self._cleanup_unknown_pending({id(t) for t in tracks})
+                    else:
+                        # Recognised (auto-captured unknown_N or human-named):
+                        # top up samples, throttled per (person, camera).
+                        self._try_capture_more_for_known(
+                            t, raw_frame, raw_bbox, now,
+                            camera_source=worker.get("source"),
+                        )
+                self._cleanup_unknown_pending(
+                    {id(t) for t in tracks}, pending=worker["unknown_pending"]
+                )
 
             # --- Action detection (enqueue to async thread, throttled) ---
             # Only enqueue when face detector recently confirmed the person;
             # head-detector-only or tracker-only boxes (e.g. back of head) are skipped.
             if self.activity_enabled:
-                face_fresh_secs = self.detect_every * 2.0
+                _n_workers_act = max(1, len(self._grid_workers or {}))
+                face_fresh_secs = max(1.0, self.detect_every * 2.0 * _n_workers_act)
+                # Send the raw camera frame + raw-space bbox to CLIP so
+                # body cues (clothing, posture) aren't degraded by the
+                # downscale to tile size.
+                inv_sx = raw_w_local / max(1, tile_w_local)
+                inv_sy = raw_h_local / max(1, tile_h_local)
                 for t in tracks:
                     name = t.get("name", "unknown")
                     if name == "unknown":
@@ -1975,9 +2386,15 @@ class FaceEngine:
                     last_act_t = float(t.get("_last_activity_t", 0.0))
                     if (now - last_act_t) < self.activity_detect_every:
                         continue
-                    bbox = t.get("bbox", (0, 0, 0, 0))
+                    bx, by, bw, bh = t.get("bbox", (0, 0, 0, 0))
+                    raw_bbox = (
+                        int(round(bx * inv_sx)),
+                        int(round(by * inv_sy)),
+                        max(1, int(round(bw * inv_sx))),
+                        max(1, int(round(bh * inv_sy))),
+                    )
                     try:
-                        self._activity_q.put_nowait((frame.copy(), bbox, name))
+                        self._activity_q.put_nowait((raw_frame.copy(), raw_bbox, name))
                     except Full:
                         pass
                     t["_last_activity_t"] = now
@@ -2017,47 +2434,70 @@ class FaceEngine:
         grid_w = cell_w * cols
         grid_h = cell_h * rows
         last_encode_t = 0.0
+        last_single_encode_t = 0.0
         stale_secs = 1.6
         unknown_stale_secs = max(0.8, self.detect_every * 1.0)
-        # Tracks must be periodically reconfirmed by the face detector;
-        # tracker-only boxes drift and create ghost boxes when person leaves.
-        unknown_reconfirm_secs = max(1.5, self.detect_every * 1.5)
-        known_reconfirm_secs = max(2.0, self.detect_every * 2.0)
 
         canvas = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)  # reused each frame
         last_snap_t = 0.0  # throttle snapshot JPEG encoding
+
+        # Build a list of every source we have a worker for. The visible
+        # composite is only the first rows*cols of the *configured*
+        # grid_sources, but we still want to run track upkeep + visit
+        # detection for every running worker.
+        analysis_sources = list(self._grid_sources)
+        for src in self._grid_workers.keys():
+            if src not in analysis_sources:
+                analysis_sources.append(src)
+
+        # Reconfirm windows scale with the number of cameras: detection is
+        # serialized through _inference_lock, so per-camera detect cadence
+        # is roughly num_workers * detect_every. Tracks must outlive that
+        # window or every track gets killed before reconfirmation.
+        n_workers = max(1, len([s for s in analysis_sources if s is not None]))
+        unknown_reconfirm_secs = max(3.0, self.detect_every * 5.0 * n_workers)
+        known_reconfirm_secs = max(5.0, self.detect_every * 7.0 * n_workers)
 
         while not self.stop_evt.is_set() and not self._grid_stop_evt.is_set():
             now = time.monotonic()
             canvas[:] = 0  # clear reused buffer instead of allocating
             aggregated_tracks = []
 
-            for slot in range(rows * cols):
-                r = slot // cols
-                c = slot % cols
-                # Cell origin (full grid cell), then center the tile within it
-                cell_ox = c * cell_w
-                cell_oy = r * cell_h
-                ox = cell_ox + (cell_w - tile_w) // 2
-                oy = cell_oy + (cell_h - tile_h) // 2
+            # Snapshot the page offset once per frame so the visible
+            # window doesn't change mid-render if the user clicks the
+            # arrow concurrently.
+            visible_start = max(0, int(self.viewer_grid_offset))
+            visible_end = visible_start + (rows * cols)
+
+            # Iterate over every analysis source (not just the visible grid
+            # slots). The slot index decides whether we paint into the
+            # composite; everything else (tracker update, snapshots, visit
+            # bookkeeping) runs for all sources.
+            for slot, source in enumerate(analysis_sources):
+                in_visible_grid = visible_start <= slot < visible_end
+                if in_visible_grid:
+                    visible_slot = slot - visible_start
+                    r = visible_slot // cols
+                    c = visible_slot % cols
+                    cell_ox = c * cell_w
+                    cell_oy = r * cell_h
+                    ox = cell_ox + (cell_w - tile_w) // 2
+                    oy = cell_oy + (cell_h - tile_h) // 2
+                else:
+                    ox = oy = 0
 
                 tile = np.zeros((tile_h, tile_w, 3), dtype=np.uint8)
-                if slot >= len(self._grid_sources):
-                    self._draw_empty_tile(tile)
-                    canvas[oy:oy + tile_h, ox:ox + tile_w] = tile
-                    continue
-
-                source = self._grid_sources[slot]
-                # None means intentionally empty slot
                 if source is None:
-                    self._draw_empty_tile(tile)
-                    canvas[oy:oy + tile_h, ox:ox + tile_w] = tile
+                    if in_visible_grid:
+                        self._draw_empty_tile(tile)
+                        canvas[oy:oy + tile_h, ox:ox + tile_w] = tile
                     continue
 
                 worker = self._grid_workers.get(source)
                 if worker is None:
-                    self._draw_no_signal_tile(tile, source)
-                    canvas[oy:oy + tile_h, ox:ox + tile_w] = tile
+                    if in_visible_grid:
+                        self._draw_no_signal_tile(tile, source)
+                        canvas[oy:oy + tile_h, ox:ox + tile_w] = tile
                     continue
 
                 with worker["lock"]:
@@ -2068,8 +2508,11 @@ class FaceEngine:
                     max_unknown_tracks = int(worker.get("max_unknown_tracks", 3))
 
                 if frame is None:
-                    self._draw_no_signal_tile(tile, source)
-                    canvas[oy:oy + tile_h, ox:ox + tile_w] = tile
+                    if in_visible_grid:
+                        self._draw_no_signal_tile(tile, source)
+                        canvas[oy:oy + tile_h, ox:ox + tile_w] = tile
+                    if str(source) == self.viewer_source:
+                        self._render_single_no_signal(source)
                     continue
 
                 tile = frame.copy()
@@ -2083,7 +2526,7 @@ class FaceEngine:
                         x, y, w, h = bbox
                         if w > 0.75 * tile_w or h > 0.75 * tile_h:
                             t["misses"] = int(t.get("misses", 0)) + 1
-                        elif w < 12 or h < 12:
+                        elif w < 4 or h < 4:
                             t["misses"] = int(t.get("misses", 0)) + 1
                         else:
                             t["bbox"] = (int(x), int(y), int(w), int(h))
@@ -2097,7 +2540,7 @@ class FaceEngine:
                         updated_tracks.append(t)
 
                 # Head detector can sustain known tracks even when CSRT and face detector lose them.
-                head_reconfirm_secs = max(3.0, self.detect_every * 5.0)
+                head_reconfirm_secs = max(3.0, self.detect_every * 5.0 * n_workers)
                 updated_tracks = [
                     t for t in updated_tracks
                     if (now - t.get("last_seen", now)) < (unknown_stale_secs if t.get("name") == "unknown" else stale_secs)
@@ -2174,9 +2617,10 @@ class FaceEngine:
                         }
                     )
 
+                tile_label = self.source_name_map.get(str(source)) or f"Cam {source}"
                 cv2.putText(
                     tile,
-                    f"Cam {source}",
+                    tile_label,
                     (8, tile_h - 10),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.55,
@@ -2185,24 +2629,11 @@ class FaceEngine:
                 )
                 cv2.rectangle(tile, (0, 0), (tile_w - 1, tile_h - 1), (80, 80, 80), 1)
 
-                # Buffer annotated tile snapshot for each known person on this camera.
-                # app.py consumes these when opening a new visit.
-                # Throttled to out_fps to avoid redundant JPEG encodes.
                 snap_due = (now - last_snap_t) >= (1.0 / max(1, self.out_fps))
                 known_on_tile = [
                     t.get("name") for t in updated_tracks
                     if t.get("name") and t.get("name") != "unknown"
                 ]
-                if known_on_tile and snap_due:
-                    ok_snap, snap_buf = cv2.imencode(
-                        ".jpg", tile, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
-                    )
-                    if ok_snap:
-                        snap_bytes = snap_buf.tobytes()
-                        with self._snapshot_lock:
-                            for pname in known_on_tile:
-                                self._snapshot_buf[(pname, str(source))] = snap_bytes
-                    last_snap_t = now
 
                 # Build annotated raw frame for footage (native camera resolution)
                 # Only do the expensive copy + annotation when footage is actually recording.
@@ -2215,38 +2646,93 @@ class FaceEngine:
                             has_active_writer = True
                             break
 
-                if has_active_writer and raw_frame is not None:
+                # Build annotated raw frame at native camera resolution.
+                # Needed when (a) footage is recording, OR (b) this is the
+                # source the user is currently viewing in single mode, OR
+                # (c) a visit snapshot is due for a known person on this tile.
+                is_viewer_single = str(source) == self.viewer_source
+                snap_needs_raw = bool(known_on_tile) and snap_due
+                need_annotated_raw = (has_active_writer or is_viewer_single or snap_needs_raw) and raw_frame is not None
+                if need_annotated_raw:
                     raw_h, raw_w = raw_frame.shape[:2]
                     sx = raw_w / tile_w
                     sy = raw_h / tile_h
-                    footage_frame = raw_frame.copy()
+                    annotated_raw = raw_frame.copy()
                     for t in updated_tracks:
                         bx, by, bw, bh = map(int, t.get("bbox", (0, 0, 0, 0)))
                         tname = str(t.get("name", "unknown"))
-                        tbest = float(t.get("best", 1.0))
                         rx, ry = int(bx * sx), int(by * sy)
                         rw, rh = int(bw * sx), int(bh * sy)
                         is_unk = tname == "unknown"
                         col = (0, 0, 255) if is_unk else (0, 255, 0)
-                        cv2.rectangle(footage_frame, (rx, ry), (rx + rw, ry + rh), col, 2)
+                        cv2.rectangle(annotated_raw, (rx, ry), (rx + rw, ry + rh), col, 2)
                         flabel = "unknown" if is_unk else tname
                         f_act, _ = self.get_activity(tname) if not is_unk else (None, 0.0)
                         if f_act:
                             flabel = f"{tname} | {f_act}"
                         font_scale = max(0.5, min(sx, sy) * 0.55)
-                        cv2.putText(footage_frame, flabel, (rx, max(0, ry - 8)),
+                        cv2.putText(annotated_raw, flabel, (rx, max(0, ry - 8)),
                                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, col, 2)
+                    footage_frame = annotated_raw
                 elif raw_frame is not None:
                     footage_frame = raw_frame  # no copy needed — just reference for ring buffer
                 else:
                     footage_frame = tile
+
+                # Buffer full-resolution snapshot for each known person on this camera.
+                # app.py consumes these when opening a new visit. Encoded from the
+                # annotated raw frame (native camera resolution) so saved visit
+                # screenshots match the camera's true resolution.
+                if known_on_tile and snap_due:
+                    snap_src = footage_frame if footage_frame is not None else tile
+                    ok_snap, snap_buf = cv2.imencode(
+                        ".jpg", snap_src, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+                    )
+                    if ok_snap:
+                        snap_bytes = snap_buf.tobytes()
+                        with self._snapshot_lock:
+                            for pname in known_on_tile:
+                                self._snapshot_buf[(pname, str(source))] = snap_bytes
+                    last_snap_t = now
 
                 # Push to rolling frame ring buffer + active writers at native resolution
                 self._push_frame_to_ring(source, footage_frame)
                 if has_active_writer:
                     self._feed_active_writers(source, footage_frame, visible)
 
-                canvas[oy:oy + tile_h, ox:ox + tile_w] = tile
+                # Encode the annotated full-res frame for single-view display.
+                # Throttled to out_fps to keep CPU encode work bounded.
+                if (is_viewer_single and need_annotated_raw and
+                        (now - last_single_encode_t) >= (1.0 / max(1, self.out_fps))):
+                    last_single_encode_t = now
+                    ok_s, buf_s = cv2.imencode(
+                        ".jpg", footage_frame,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)],
+                    )
+                    if ok_s:
+                        with self._lock:
+                            self._latest_single_jpeg = buf_s.tobytes()
+
+                if in_visible_grid:
+                    canvas[oy:oy + tile_h, ox:ox + tile_w] = tile
+
+            # Fill any visible slots that fall past the end of the source
+            # list with an "empty" tile (e.g. when paging beyond the last
+            # camera with a layout that has more slots than remaining
+            # sources).
+            total_visible = rows * cols
+            n_sources = len(analysis_sources)
+            for vis in range(total_visible):
+                abs_slot = visible_start + vis
+                if abs_slot < n_sources:
+                    continue
+                er = vis // cols
+                ec = vis % cols
+                eox = ec * cell_w + (cell_w - tile_w) // 2
+                eoy = er * cell_h + (cell_h - tile_h) // 2
+                empty_tile = np.zeros((tile_h, tile_w, 3), dtype=np.uint8)
+                self._draw_empty_tile(empty_tile)
+                canvas[eoy:eoy + tile_h, eox:eox + tile_w] = empty_tile
 
             # QR scan round-robin (skip None/empty slots)
             active_sources = [s for s in self._grid_sources if s is not None]
@@ -2475,10 +2961,19 @@ class FaceEngine:
                 # --- Auto-capture unknowns ---
                 if self.auto_capture_enabled:
                     for t in self.tracks:
-                        if t.get("name") == "unknown" and t.get("updated"):
+                        if not t.get("updated"):
+                            continue
+                        bbox = t.get("bbox", (0, 0, 0, 0))
+                        if t.get("name") == "unknown":
                             captured = self._try_capture_unknown(t, frame, now)
                             if captured:
                                 print(f"[single-cam] auto-captured {captured}")
+                        else:
+                            # Top up samples for any recognised person.
+                            self._try_capture_more_for_known(
+                                t, frame, bbox, now,
+                                camera_source=self.cam_index,
+                            )
                     self._cleanup_unknown_pending({id(t) for t in self.tracks})
 
                 # --- Action detection (enqueue to async thread, throttled) ---

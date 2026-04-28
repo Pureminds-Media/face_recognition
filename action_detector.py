@@ -103,6 +103,9 @@ class ActionDetector:
         self._provider = provider
         self._model_path = model_path
         self._ready = False
+        # Permanently disable after the first failed load so we don't
+        # retry (and re-log the traceback) on every detect() call.
+        self._load_failed = False
 
         # Per-person smoothing history:  person_id -> deque of display_names
         self._history: dict[str, collections.deque] = {}
@@ -113,7 +116,7 @@ class ActionDetector:
     # Lazy loading
     # ------------------------------------------------------------------
     def _ensure_loaded(self):
-        if self._ready:
+        if self._ready or self._load_failed:
             return
         try:
             from optimum.onnxruntime import ORTModelForZeroShotImageClassification
@@ -124,15 +127,45 @@ class ActionDetector:
             sess_opts = ort.SessionOptions()
             sess_opts.log_severity_level = 3
 
+            # A "complete" cached model dir needs the ONNX weights AND the
+            # processor metadata. A previous run can leave the directory
+            # half-populated (export crashed before save_pretrained() finished
+            # or transformers updated and stopped writing some files); when
+            # that happens we wipe and re-export rather than trying to load
+            # a partial cache forever.
+            required = ["preprocessor_config.json"]
+            cache_dir_complete = (
+                os.path.isdir(self._model_path)
+                and all(
+                    os.path.isfile(os.path.join(self._model_path, f))
+                    for f in required
+                )
+            )
+
             t0 = time.monotonic()
-            if os.path.isdir(self._model_path):
+            if cache_dir_complete:
                 log.info("Loading CLIP ONNX model from %s", self._model_path)
                 self._model = ORTModelForZeroShotImageClassification.from_pretrained(
                     self._model_path, provider=self._provider,
                     session_options=sess_opts,
                 )
             else:
-                log.info("Exporting CLIP to ONNX from %s", self._model_path)
+                if os.path.isdir(self._model_path):
+                    log.warning(
+                        "CLIP cache at %s is incomplete (missing %s); re-exporting.",
+                        self._model_path,
+                        ", ".join(
+                            f for f in required
+                            if not os.path.isfile(os.path.join(self._model_path, f))
+                        ),
+                    )
+                    # Best-effort cleanup so save_pretrained writes a fresh tree.
+                    import shutil as _shutil
+                    try:
+                        _shutil.rmtree(self._model_path)
+                    except Exception:
+                        pass
+                log.info("Exporting CLIP to ONNX into %s", self._model_path)
                 self._model = ORTModelForZeroShotImageClassification.from_pretrained(
                     "openai/clip-vit-base-patch32",
                     export=True,
@@ -141,6 +174,12 @@ class ActionDetector:
                 )
                 os.makedirs(self._model_path, exist_ok=True)
                 self._model.save_pretrained(self._model_path)
+                # Persist the matching processor too so the next start can
+                # take the fast-path above.
+                processor = CLIPProcessor.from_pretrained(
+                    "openai/clip-vit-base-patch32", use_fast=False
+                )
+                processor.save_pretrained(self._model_path)
 
             self._model.use_io_binding = False
             self._processor = CLIPProcessor.from_pretrained(
@@ -150,8 +189,12 @@ class ActionDetector:
             log.info("CLIP action detector ready (%.1fs)", elapsed)
             self._ready = True
         except Exception:
-            log.exception("Failed to load CLIP action detector")
+            log.exception(
+                "Failed to load CLIP action detector — disabling action "
+                "labels for this run."
+            )
             self._ready = False
+            self._load_failed = True
 
     # ------------------------------------------------------------------
     # Public API

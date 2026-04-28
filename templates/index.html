@@ -16,34 +16,22 @@
         >
           <div>
             <div class="text-xl font-semibold">Face Recognition</div>
-            <div class="text-slate-400 text-sm">Flask dashboard</div>
+            <div class="text-slate-400 text-sm">Home</div>
           </div>
 
           <div class="flex gap-2">
             <a
-              href="/history"
-              class="rounded-lg bg-slate-800 hover:bg-slate-700 px-3 py-2 text-sm"
+              href="/"
+              class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium"
             >
-              History
+              Home
             </a>
             <a
-              href="/people"
+              href="/settings"
               class="rounded-lg bg-slate-800 hover:bg-slate-700 px-3 py-2 text-sm"
             >
-              People
+              Settings
             </a>
-            <a
-              href="/test"
-              class="rounded-lg bg-slate-800 hover:bg-slate-700 px-3 py-2 text-sm"
-            >
-              Test Video
-            </a>
-            <button
-              id="reloadBtn"
-              class="rounded-lg bg-slate-800 hover:bg-slate-700 px-3 py-2 text-sm"
-            >
-              Reload faces
-            </button>
           </div>
         </div>
       </div>
@@ -57,11 +45,35 @@
             class="rounded-xl border border-slate-800 bg-slate-900"
           >
             <div
-              class="px-4 py-3 border-b border-slate-800 flex items-center justify-between rounded-t-xl"
+              class="px-4 py-3 border-b border-slate-800 flex items-center justify-between rounded-t-xl flex-wrap"
             >
               <div class="font-medium">Live feed</div>
               <div class="text-xs text-slate-400" id="statusText">—</div>
               <div class="flex flex-wrap items-center gap-2">
+                <!-- Zoom controls -->
+                <div class="flex rounded-lg overflow-hidden border border-slate-700">
+                  <button id="zoomOutBtn" type="button" title="Zoom out"
+                    class="flex items-center gap-1 px-2 py-2 text-sm transition-colors bg-slate-800 hover:bg-slate-700">
+                    <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+                      <line x1="8" y1="11" x2="14" y2="11"/>
+                    </svg>
+                  </button>
+                  <span id="zoomLevel" class="px-2 py-2 text-xs font-medium text-slate-400 bg-slate-900 min-w-12 text-center">100%</span>
+                  <button id="zoomInBtn" type="button" title="Zoom in"
+                    class="flex items-center gap-1 px-2 py-2 text-sm transition-colors bg-slate-800 hover:bg-slate-700 border-l border-slate-700">
+                    <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+                      <line x1="8" y1="11" x2="14" y2="11"/><line x1="11" y1="8" x2="11" y2="14"/>
+                    </svg>
+                  </button>
+                  <button id="zoomResetBtn" type="button" title="Reset zoom"
+                    class="flex items-center gap-1 px-2 py-2 text-sm transition-colors bg-slate-800 hover:bg-slate-700 border-l border-slate-700">
+                    <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M1 4v6h6"/><path d="M23 20v-6h-6"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64"/><path d="M3.51 15A9 9 0 0 0 18.36 18.36"/>
+                    </svg>
+                  </button>
+                </div>
                 <!-- Single / Multi cam mode selector -->
                 <div class="relative" id="camModeGroup">
                   <div class="flex rounded-lg overflow-hidden border border-slate-700">
@@ -86,34 +98,42 @@
                       <span class="text-xs">Multi</span>
                     </button>
                   </div>
-                  <!-- Single camera dropdown -->
-                  <div id="singleCamDropdown"
-                    class="hidden absolute top-full left-0 mt-1 z-50 min-w-52 rounded-lg border border-slate-700 bg-slate-900 shadow-xl overflow-hidden">
-                    <div id="singleCamList" class="max-h-60 overflow-y-auto"></div>
-                  </div>
                   <!-- Multi camera dropdown -->
                   <div id="multiCamDropdown"
                     class="hidden absolute top-full left-0 mt-1 z-50 min-w-52 rounded-lg border border-slate-700 bg-slate-900 shadow-xl overflow-hidden">
                     <div id="multiCamList" class="max-h-60 overflow-y-auto"></div>
                   </div>
                 </div>
-                <button
-                  id="startBtn"
-                  class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium"
-                >
-                  Start
-                </button>
-                <button
-                  id="stopBtn"
-                  class="rounded-lg bg-rose-600 hover:bg-rose-500 px-3 py-2 text-sm font-medium"
-                >
-                  Stop
-                </button>
               </div>
             </div>
-            <div class="p-3 relative">
+            <div class="p-3 relative overflow-hidden">
               <div id="cameraMsg" class="mb-2 text-xs text-slate-400"></div>
-              <img id="videoFeed" class="w-full ..." src="" alt="video" />
+              <div id="videoStage" class="relative select-none touch-pan-y overflow-hidden">
+                <img id="videoFeed" class="w-full block" src="" alt="video" style="transform-origin: 0 0; cursor: default; will-change: transform;" />
+                <div id="gridOverlay" class="hidden absolute inset-0 pointer-events-auto"></div>
+
+                <!-- Carousel controls (single-camera mode only) -->
+                <button
+                  id="carouselPrev"
+                  type="button"
+                  aria-label="Previous camera"
+                  class="hidden absolute left-2 top-1/2 -translate-y-1/2 z-10 rounded-full bg-black/55 hover:bg-black/75 text-white w-10 h-10 flex items-center justify-center transition"
+                >
+                  <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+                </button>
+                <button
+                  id="carouselNext"
+                  type="button"
+                  aria-label="Next camera"
+                  class="hidden absolute right-2 top-1/2 -translate-y-1/2 z-10 rounded-full bg-black/55 hover:bg-black/75 text-white w-10 h-10 flex items-center justify-center transition"
+                >
+                  <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+                </button>
+                <div
+                  id="carouselLabel"
+                  class="hidden absolute bottom-2 left-1/2 -translate-x-1/2 z-10 px-3 py-1 rounded-full bg-black/55 text-white text-xs"
+                ></div>
+              </div>
 
               <!-- QR prompt overlay -->
               <!-- <div
@@ -133,45 +153,10 @@
             </div>
           </div>
 
-          <!-- Grid Configurator Panel (shown when a grid mode is selected) -->
-          <div id="gridConfigPanel" class="hidden mt-4">
-            <div
-              class="rounded-xl border border-slate-800 bg-slate-900 overflow-hidden"
-            >
-              <div
-                class="px-4 py-3 border-b border-slate-800 flex items-center justify-between"
-              >
-                <div class="font-medium">Grid Configuration</div>
-                <div class="flex items-center gap-2">
-                  <label class="text-xs text-slate-400">Layout:</label>
-                  <select
-                    id="gridLayoutSelect"
-                    class="rounded-lg bg-slate-950 border border-slate-800 px-2 py-1 text-xs"
-                  ></select>
-                </div>
-              </div>
-              <div class="p-4">
-                <div
-                  id="gridSlotsContainer"
-                  class="grid gap-2"
-                ></div>
-                <div class="mt-3 flex items-center gap-2">
-                  <button
-                    id="applyGridBtn"
-                    class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-4 py-2 text-sm font-medium"
-                  >
-                    Apply Grid
-                  </button>
-                  <div id="gridMsg" class="text-xs text-slate-400"></div>
-                </div>
-              </div>
-            </div>
-          </div>
-
+          <!--
           <div class="flex flex-row w-full gap-2 mt-6">
-            <!-- Attendace Tracker -->
             <div
-              class="rounded-xl border border-slate-800 bg-slate-900 w-[50%]"
+              class="rounded-xl border border-slate-800 bg-slate-900 w-full"
             >
               <div class="px-4 py-3 border-b border-slate-800">
                 <div class="font-medium">Attendance</div>
@@ -182,165 +167,220 @@
 
               <div id="attendanceList" class="p-4 space-y-2"></div>
             </div>
+          </div>
+          -->
 
-            <!-- Upload -->
-            <div
-              class="rounded-xl border border-slate-800 bg-slate-900 w-[50%]"
-            >
-              <div class="px-4 py-3 border-b border-slate-800">
-                <div class="font-medium">Add image</div>
-                <div class="text-xs text-slate-400">
-                  Saves as 1.jpg, 2.jpg, … in faces/&lt;person&gt;/
-                </div>
+
+          <!-- ================= HISTORY ================= -->
+          <div class="mt-8">
+            <div class="flex items-center justify-between mb-4">
+              <div>
+                <div class="text-lg font-semibold">Visit History</div>
+                <div class="text-xs text-slate-400">Location-based attendance tracking</div>
               </div>
-
-              <form
-                id="uploadForm"
-                class="p-4 space-y-4"
-                enctype="multipart/form-data"
+              <!-- "Clear Visit Data" button intentionally hidden — use the
+                   terminal command documented in README.md instead. -->
+              <button
+                id="clearDataBtn"
+                onclick="clearAllData()"
+                class="hidden rounded-lg bg-red-600 hover:bg-red-500 px-3 py-2 text-sm font-medium"
               >
-                <div class="space-y-2">
-                  <div class="text-sm text-slate-300">Person</div>
-                  <div class="flex items-center gap-3">
-                    <label class="flex items-center gap-2 text-sm">
-                      <input
-                        type="radio"
-                        name="mode"
-                        value="existing"
-                        checked
-                        class="accent-emerald-500"
-                      />
-                      Existing
-                    </label>
-                    <label class="flex items-center gap-2 text-sm">
-                      <input
-                        type="radio"
-                        name="mode"
-                        value="new"
-                        class="accent-emerald-500"
-                      />
-                      New
-                    </label>
-                  </div>
+                Clear Visit Data
+              </button>
+            </div>
 
-                  <select
-                    id="existingName"
-                    name="existing_name"
-                    class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm"
-                  ></select>
+            <!-- Sub-tab bar -->
+            <div class="flex gap-1 mb-6 border-b border-slate-800">
+              <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-emerald-500 text-emerald-400" data-tab="daily">Daily Summary</button>
+              <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200" data-tab="person">Per Person</button>
+              <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200" data-tab="location">Per Location</button>
+            </div>
 
-                  <input
-                    id="newName"
-                    name="new_name"
-                    placeholder="e.g. Ahmed_AlQahtani"
-                    class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm hidden"
-                  />
-                  <div id="nameValidation" class="text-xs text-red-400 hidden"></div>
-                  <div class="text-xs text-slate-400">
-                    Folder names are sanitized (letters/numbers/_-).
-                  </div>
-                </div>
+            <!-- Daily Summary Tab -->
+            <div id="tab-daily" class="tab-content">
+              <div class="flex items-center gap-3 mb-4">
+                <label class="text-sm text-slate-400">Date:</label>
+                <input id="dailyDate" type="date" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm" />
+                <button id="dailyLoadBtn" class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium">Load</button>
+                <div id="dailyMsg" class="text-xs text-slate-400"></div>
+              </div>
+              <div id="dailyTotals" class="mb-4"></div>
+              <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-hidden">
+                <table class="w-full text-sm">
+                  <thead>
+                    <tr class="border-b border-slate-800 text-slate-400 text-xs">
+                      <th class="px-4 py-3 text-left">Footage</th>
+                      <th class="px-4 py-3 text-left">Person</th>
+                      <th class="px-4 py-3 text-left">Location</th>
+                      <th class="px-4 py-3 text-left">Arrived</th>
+                      <th class="px-4 py-3 text-left">Left</th>
+                      <th class="px-4 py-3 text-left">Duration</th>
+                      <th class="px-4 py-3 text-left activity-col">Action</th>
+                      <th class="px-4 py-3 text-left">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody id="dailyTableBody">
+                    <tr><td class="px-4 py-6 text-center text-slate-500 empty-msg">Select a date and click Load</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
 
-                <div class="space-y-2">
-                  <div class="text-sm text-slate-300">Image</div>
-                  <div class="flex items-center gap-2">
-                    <input
-                      name="file"
-                      id="fileInput"
-                      type="file"
-                      accept="image/*"
-                      required
-                      class="flex-1 min-w-0 text-sm text-slate-200 file:mr-3 file:rounded-lg file:border-0 file:bg-slate-800 file:px-3 file:py-2 file:text-sm file:text-slate-100 hover:file:bg-slate-700"
-                    />
-                    <button
-                      type="button"
-                      onclick="openCaptureModal()"
-                      class="shrink-0 rounded-lg bg-slate-800 hover:bg-slate-700 p-2 text-slate-300 hover:text-white transition-colors"
-                      title="Take photo with camera"
-                    >
-                      <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                        <path stroke-linecap="round" stroke-linejoin="round" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"/>
-                        <path stroke-linecap="round" stroke-linejoin="round" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z"/>
-                      </svg>
-                    </button>
-                  </div>
-                </div>
+            <!-- Per Person Tab -->
+            <div id="tab-person" class="tab-content hidden">
+              <div class="flex items-center gap-3 mb-4 flex-wrap">
+                <label class="text-sm text-slate-400">Person:</label>
+                <select id="personSelect" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm min-w-48"><option value="">Select...</option></select>
+                <label class="text-sm text-slate-400 ml-2">From:</label>
+                <input id="personFrom" type="date" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm" />
+                <label class="text-sm text-slate-400">To:</label>
+                <input id="personTo" type="date" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm" />
+                <button id="personLoadBtn" class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium">Load</button>
+              </div>
+              <div id="personSummary" class="mb-4"></div>
+              <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-hidden">
+                <table class="w-full text-sm">
+                  <thead>
+                    <tr class="border-b border-slate-800 text-slate-400 text-xs">
+                      <th class="px-4 py-3 text-left">Footage</th>
+                      <th class="px-4 py-3 text-left">Date</th>
+                      <th class="px-4 py-3 text-left">Location</th>
+                      <th class="px-4 py-3 text-left">Arrived</th>
+                      <th class="px-4 py-3 text-left">Left</th>
+                      <th class="px-4 py-3 text-left">Duration</th>
+                      <th class="px-4 py-3 text-left activity-col">Action</th>
+                      <th class="px-4 py-3 text-left">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody id="personTableBody">
+                    <tr><td class="px-4 py-6 text-center text-slate-500 empty-msg">Select a person and click Load</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
 
-                <button
-                  type="submit"
-                  id="uploadBtn"
-                  class="w-full rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  Upload
-                </button>
-
-                <!-- Progress bar (hidden by default) -->
-                <div id="uploadProgress" class="hidden space-y-1">
-                  <div class="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
-                    <div id="uploadProgressBar" class="h-full rounded-full bg-emerald-500 transition-all duration-200" style="width: 0%"></div>
-                  </div>
-                  <div id="uploadProgressText" class="text-xs text-slate-400 text-center">0%</div>
-                </div>
-
-                <div id="uploadMsg" class="text-xs text-slate-300"></div>
-              </form>
+            <!-- Per Location Tab -->
+            <div id="tab-location" class="tab-content hidden">
+              <div class="flex items-center gap-3 mb-4 flex-wrap">
+                <label class="text-sm text-slate-400">Location:</label>
+                <select id="locationSelect" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm min-w-48"><option value="">Select...</option></select>
+                <label class="text-sm text-slate-400 ml-2">From:</label>
+                <input id="locationFrom" type="date" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm" />
+                <label class="text-sm text-slate-400">To:</label>
+                <input id="locationTo" type="date" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm" />
+                <button id="locationLoadBtn" class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium">Load</button>
+              </div>
+              <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-hidden">
+                <table class="w-full text-sm">
+                  <thead>
+                    <tr class="border-b border-slate-800 text-slate-400 text-xs">
+                      <th class="px-4 py-3 text-left">Footage</th>
+                      <th class="px-4 py-3 text-left">Person</th>
+                      <th class="px-4 py-3 text-left">Date</th>
+                      <th class="px-4 py-3 text-left">Arrived</th>
+                      <th class="px-4 py-3 text-left">Left</th>
+                      <th class="px-4 py-3 text-left">Duration</th>
+                      <th class="px-4 py-3 text-left activity-col">Action</th>
+                      <th class="px-4 py-3 text-left">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody id="locationTableBody">
+                    <tr><td class="px-4 py-6 text-center text-slate-500 empty-msg">Select a location and click Load</td></tr>
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
         </div>
       </div>
     </div>
 
-    <div id="toastContainer" class="fixed top-4 right-4 z-50 space-y-2"></div>
-
-    <!-- Camera Capture Modal -->
-    <div id="captureModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
-      <div class="relative bg-slate-900 rounded-xl border border-slate-700 shadow-2xl p-4 max-w-lg w-full mx-4 space-y-3">
-        <div class="flex items-center justify-between">
-          <div class="text-sm font-medium">Take Photo</div>
-          <button onclick="closeCaptureModal()" class="text-slate-400 hover:text-red-400 text-xl font-bold transition-colors">&times;</button>
-        </div>
-        <select id="captureDeviceSelect" onchange="switchCaptureCamera()"
-          class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm">
-        </select>
-        <div id="captureCamMsg" class="text-xs text-yellow-400 hidden"></div>
-        <div class="relative rounded-lg overflow-hidden bg-black aspect-video">
-          <video id="capturePreview" autoplay playsinline
-            class="w-full h-full object-cover" style="transform: scaleX(-1)"></video>
-        </div>
-        <canvas id="captureCanvas" class="hidden"></canvas>
-        <button type="button" onclick="capturePhoto()"
-          class="w-full rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium">
-          Capture
-        </button>
+    <!-- Video Modal Overlay -->
+    <div id="videoModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm" onclick="closeVideoModal()">
+      <div class="relative max-w-3xl w-full mx-4" onclick="event.stopPropagation()">
+        <button onclick="closeVideoModal()" class="absolute -top-10 right-0 text-white hover:text-red-400 text-2xl font-bold transition-colors">&times;</button>
+        <video id="modalVideo" class="w-full rounded-xl border border-slate-700 shadow-2xl" controls autoplay loop muted></video>
       </div>
     </div>
 
+    <!-- Fullscreen Zoom Modal -->
+    <div id="fullscreenZoomModal" class="hidden fixed inset-0 z-50 flex flex-col bg-black" onclick="closeFullscreenZoom(event)">
+      <div class="flex items-center justify-between p-4 border-b border-slate-700 bg-slate-950">
+        <div class="text-slate-300" id="fullscreenCameraLabel">Camera</div>
+        <div class="flex items-center gap-4">
+          <div class="flex rounded-lg overflow-hidden border border-slate-700">
+            <button id="fsZoomOutBtn" type="button" title="Zoom out" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 transition-colors">
+              <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/><line x1="8" y1="11" x2="14" y2="11"/>
+              </svg>
+            </button>
+            <span id="fsZoomLevel" class="px-3 py-1 text-xs font-medium text-slate-400 bg-slate-900 min-w-14 text-center">100%</span>
+            <button id="fsZoomInBtn" type="button" title="Zoom in" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 transition-colors border-l border-slate-700">
+              <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/><line x1="8" y1="11" x2="14" y2="11"/><line x1="11" y1="8" x2="11" y2="14"/>
+              </svg>
+            </button>
+            <button id="fsZoomResetBtn" type="button" title="Reset zoom" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 transition-colors border-l border-slate-700">
+              <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M1 4v6h6"/><path d="M23 20v-6h-6"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64"/><path d="M3.51 15A9 9 0 0 0 18.36 18.36"/>
+              </svg>
+            </button>
+          </div>
+          <button onclick="closeFullscreenZoom()" class="text-white hover:text-red-400 text-2xl font-bold transition-colors">&times;</button>
+        </div>
+      </div>
+      <div id="fullscreenZoomContainer" class="flex-1 overflow-auto flex items-center justify-center" onclick="event.stopPropagation()">
+        <img id="fullscreenZoomImage" style="transform-origin: 0 0; cursor: default; will-change: transform;" />
+      </div>
+    </div>
+
+    <div id="toastContainer" class="fixed top-4 right-4 z-50 space-y-2"></div>
+
     <script>
       // --- DOM (guarded, since some sections may be removed) ---
-      const peopleListEl = document.getElementById("peopleList");
-      const peopleCountEl = document.getElementById("peopleCount");
-      const existingSelect = document.getElementById("existingName");
-      const newNameInput = document.getElementById("newName");
-      const uploadMsg = document.getElementById("uploadMsg");
       const statusText = document.getElementById("statusText");
       const videoFeed = document.getElementById("videoFeed");
-      const startBtn = document.getElementById("startBtn");
-      const stopBtn = document.getElementById("stopBtn");
       const attendanceListEl = document.getElementById("attendanceList");
       const attendanceMetaEl = document.getElementById("attendanceMeta");
       const toastContainer = document.getElementById("toastContainer");
       const qrPrompt = document.getElementById("qrPrompt");
       const singleCamBtn = document.getElementById("singleCamBtn");
       const multiCamBtn = document.getElementById("multiCamBtn");
-      const singleCamDropdown = document.getElementById("singleCamDropdown");
       const multiCamDropdown = document.getElementById("multiCamDropdown");
-      const singleCamList = document.getElementById("singleCamList");
       const multiCamList = document.getElementById("multiCamList");
       const cameraMsg = document.getElementById("cameraMsg");
+      const carouselPrev = document.getElementById("carouselPrev");
+      const carouselNext = document.getElementById("carouselNext");
+      const carouselLabel = document.getElementById("carouselLabel");
+      const videoStage = document.getElementById("videoStage");
 
       let currentCamMode = "single"; // "single" or "multi"
-      let singleCamDevices = [];
+      let singleCamDevices = [];     // healthy single-camera devices only
+      function _looksLikeAddress(s) {
+        s = String(s || "");
+        return /rtsp:\/\/|https?:\/\/|@\d|\d+\.\d+\.\d+\.\d+/i.test(s);
+      }
+      function _sanitizeLocationLabel(s) {
+        s = String(s || "").trim();
+        if (!s) return "Unknown camera";
+        // Strip "Camera <url>" auto-generated names — never expose addresses.
+        if (/^Camera\s+/i.test(s) && _looksLikeAddress(s)) return "Unknown camera";
+        if (_looksLikeAddress(s)) return "Unknown camera";
+        return s;
+      }
+      function camLabelFor(src) {
+        const s = String(src || "");
+        const d = (allSingleCamDevices || []).find(d => String(d.value || "") === s);
+        if (d && d.label && !_looksLikeAddress(d.label)) return d.label;
+        return _sanitizeLocationLabel(s);
+      }
+      let allSingleCamDevices = [];  // unfiltered list (for probing)
       let multiCamLayouts = [];
+      let singleCamIndex = 0;
+      let gridOffset = 0;
+      let gridPageSize = 4;
+      let gridPageCount = 1;
+      const _deadCameras = new Set(); // session-only failure cache
 
       let attendanceES = null;
       let cameraRunning = false;
@@ -366,15 +406,6 @@
             ? "Camera running"
             : "Camera stopped";
 
-        if (startBtn) {
-          startBtn.disabled = running;
-          startBtn.classList.toggle("opacity-50", running);
-        }
-        if (stopBtn) {
-          stopBtn.disabled = !running;
-          stopBtn.classList.toggle("opacity-50", !running);
-        }
-
         // Keep MJPEG aligned — always restart to pick up new camera source
         if (running) {
           if (videoFeed) startStream();
@@ -387,40 +418,44 @@
         const r = await fetch("/api/camera");
         const j = await r.json();
         const devices = j.devices || [];
-        const currentSource = String(j.camera_source || "");
 
         // Split devices into single cameras vs grid layouts
-        singleCamDevices = devices.filter(d => !String(d.value || "").startsWith("grid_"));
+        allSingleCamDevices = devices.filter(d => !String(d.value || "").startsWith("grid_"));
         multiCamLayouts = devices.filter(d => String(d.value || "").startsWith("grid_"));
 
-        // Detect current mode
-        const isGrid = /^grid_\d+x\d+$/.test(currentSource);
-        currentCamMode = isGrid ? "multi" : "single";
+        // Apply known-dead filter from this session
+        singleCamDevices = allSingleCamDevices.filter(d => !_deadCameras.has(String(d.value)));
 
-        // Render single camera list
-        if (singleCamList) {
-          let html = "";
-          singleCamDevices.forEach(d => {
-            const val = String(d.value || "");
-            const active = !isGrid && val === currentSource;
-            html += `<button type="button" data-source="${val}"
-              class="w-full text-left px-3 py-2 text-xs hover:bg-slate-800 transition-colors flex items-center justify-between ${active ? 'bg-slate-800 text-emerald-400' : 'text-slate-300'}">
-              <span>${d.label || 'Camera ' + val}</span>
-              ${active ? '<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"/></svg>' : ''}
-            </button>`;
-          });
-          if (!singleCamDevices.length) {
-            html = '<div class="px-3 py-2 text-xs text-slate-500">No cameras detected</div>';
-          }
-          singleCamList.innerHTML = html;
+        // Viewer state comes from the new fields on /api/camera; fall back
+        // to whatever we already had if the backend doesn't supply them.
+        const viewerMode = j.viewer_mode || currentCamMode;
+        currentCamMode = viewerMode === "grid" ? "multi" : "single";
+
+        // Sync the single-mode carousel index with the viewer's source
+        const viewerSrc = String(j.viewer_source || "");
+        if (currentCamMode === "single" && viewerSrc) {
+          const idx = singleCamDevices.findIndex(d => String(d.value || "") === viewerSrc);
+          if (idx >= 0) singleCamIndex = idx;
         }
+        // Sync grid pagination
+        if (typeof j.viewer_grid_offset === "number") gridOffset = j.viewer_grid_offset;
+        if (typeof j.grid_page_size === "number") gridPageSize = j.grid_page_size;
+        if (typeof j.grid_page_count === "number") gridPageCount = j.grid_page_count;
+        updateCarouselUI();
+        // Note: we no longer pre-probe and prune the carousel. With NVRs
+        // hosting many channels under one IP, parallel probes overwhelm
+        // the device's RTSP session limit and falsely mark cameras dead.
+        // Cameras now only get hidden when an actual switchCamera() call
+        // fails (see switchCamera below).
 
-        // Render multi camera list
+        // Render multi camera list (active = currently selected layout)
+        const isGrid = currentCamMode === "multi";
+        const currentLayout = Array.isArray(j.grid_layout) ? `grid_${j.grid_layout[0]}x${j.grid_layout[1]}` : "";
         if (multiCamList) {
           let html = "";
           multiCamLayouts.forEach(d => {
             const val = String(d.value || "");
-            const active = isGrid && val === currentSource;
+            const active = isGrid && val === currentLayout;
             html += `<button type="button" data-source="${val}"
               class="w-full text-left px-3 py-2 text-xs hover:bg-slate-800 transition-colors flex items-center justify-between ${active ? 'bg-slate-800 text-emerald-400' : 'text-slate-300'}">
               <span>${d.label || val}</span>
@@ -436,14 +471,10 @@
         // Update mode button styling
         updateCamModeButtons();
 
-        if (cameraMsg)
-          cameraMsg.textContent = currentSource
-            ? `Current source: ${currentSource}`
-            : "Current source: (not set)";
-
-        // Show/hide grid panel based on current source
-        if (typeof updateGridPanelVisibility === "function") {
-          updateGridPanelVisibility();
+        if (cameraMsg) {
+          cameraMsg.textContent = isGrid
+            ? `Viewing grid (${currentLayout || "default"})`
+            : (viewerSrc ? `Viewing ${camLabelFor(viewerSrc)}` : "No camera selected");
         }
       }
 
@@ -459,8 +490,48 @@
       }
 
       function closeAllDropdowns() {
-        if (singleCamDropdown) singleCamDropdown.classList.add("hidden");
         if (multiCamDropdown) multiCamDropdown.classList.add("hidden");
+      }
+
+      function updateCarouselUI() {
+        // Arrows show when there's somewhere to go in either mode:
+        // - single: there are 2+ cameras to cycle through
+        // - grid: there are 2+ pages of cameras
+        const showSingle = currentCamMode === "single" && singleCamDevices.length > 1;
+        const showGrid = currentCamMode === "multi" && gridPageCount > 1;
+        const show = showSingle || showGrid;
+        if (carouselPrev) carouselPrev.classList.toggle("hidden", !show);
+        if (carouselNext) carouselNext.classList.toggle("hidden", !show);
+        // Show "Page X / Y" label in grid mode so the user knows where
+        // they are; stay quiet in single (one feed speaks for itself).
+        if (carouselLabel) {
+          if (showGrid) {
+            const pageIdx = Math.floor(gridOffset / Math.max(1, gridPageSize)) + 1;
+            carouselLabel.textContent = `Page ${pageIdx} / ${gridPageCount}`;
+            carouselLabel.classList.remove("hidden");
+          } else {
+            carouselLabel.classList.add("hidden");
+          }
+        }
+      }
+
+      async function showSingleCameraAt(index, _attemptsLeft) {
+        if (!singleCamDevices.length) {
+          if (cameraMsg) cameraMsg.textContent = "No working cameras available.";
+          updateCarouselUI();
+          return;
+        }
+        if (_attemptsLeft === undefined) _attemptsLeft = singleCamDevices.length;
+        const total = singleCamDevices.length;
+        singleCamIndex = ((index % total) + total) % total;
+        const cam = singleCamDevices[singleCamIndex];
+        updateCarouselUI();
+        const ok = await switchCamera(String(cam.value));
+        if (!ok && _attemptsLeft > 1) {
+          // switchCamera marked this dead and refreshed singleCamDevices.
+          // Try the next slot.
+          await showSingleCameraAt(singleCamIndex, _attemptsLeft - 1);
+        }
       }
 
       async function switchCamera(source) {
@@ -470,19 +541,32 @@
           const r = await fetch("/api/camera", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ source, restart: cameraRunning }),
+            body: JSON.stringify({ source }),
           });
           const j = await r.json();
           if (!r.ok || !j.ok) {
             if (cameraMsg) cameraMsg.textContent = `Switch failed: ${j.error || "unknown error"}`;
-            return;
+            return false;
           }
-          if (cameraMsg) cameraMsg.textContent = `Current source: ${j.camera_source}`;
-          await loadCameraOptions();
+          // Sync local mode + pagination state so the Single/Multi buttons
+          // and the carousel arrows reflect the new viewer.
+          currentCamMode = j.viewer_mode === "grid" ? "multi" : "single";
+          if (typeof j.viewer_grid_offset === "number") gridOffset = j.viewer_grid_offset;
+          if (typeof j.grid_page_size === "number") gridPageSize = j.grid_page_size;
+          if (typeof j.grid_page_count === "number") gridPageCount = j.grid_page_count;
+          updateCamModeButtons();
+          updateCarouselUI();
+          // Refresh the dropdown's "active" indicator (and other stale UI)
+          // by re-fetching the full state. Cheap; happens once per switch.
+          loadCameraOptions().catch(() => {});
+          if (cameraMsg) cameraMsg.textContent = j.viewer_mode === "single"
+            ? `Viewing ${camLabelFor(j.viewer_source)}`
+            : `Viewing grid`;
           if (j.running && videoFeed) startStream();
-          toast(`Camera source set to ${j.camera_source}`, "success");
+          return true;
         } catch (e) {
           if (cameraMsg) cameraMsg.textContent = `Switch failed: ${String(e)}`;
+          return false;
         }
       }
 
@@ -580,102 +664,32 @@
   `;
       }
 
-      // --- Mode UI for upload ---
-      function currentMode() {
-        return (
-          document.querySelector('input[name="mode"]:checked')?.value ||
-          "existing"
-        );
-      }
-
-      function setModeUI() {
-        const mode = currentMode();
-        if (!newNameInput || !existingSelect) return;
-
-        if (mode === "new") {
-          newNameInput.classList.remove("hidden");
-          existingSelect.classList.add("hidden");
-        } else {
-          newNameInput.classList.add("hidden");
-          existingSelect.classList.remove("hidden");
+      // --- Auto-start engine if not already running ---
+      async function ensureStreaming() {
+        try {
+          await fetch("/api/start", { method: "POST" });
+        } catch (e) {
+          if (cameraMsg) cameraMsg.textContent = "Auto-start failed: " + e;
         }
       }
-
-      document.querySelectorAll('input[name="mode"]').forEach((r) => {
-        r.addEventListener("change", () => { setModeUI(); validateNewName(); });
-      });
-
-      // --- New name duplicate validation ---
-      const nameValidation = document.getElementById("nameValidation");
-
-      function sanitizeName(raw) {
-        return raw.trim().replace(/ /g, "_").replace(/[^A-Za-z0-9_\-]/g, "").slice(0, 64);
-      }
-
-      function validateNewName() {
-        if (!nameValidation) return true;
-        if (currentMode() !== "new") {
-          nameValidation.classList.add("hidden");
-          return true;
-        }
-        const sanitized = sanitizeName(newNameInput.value);
-        if (sanitized && _knownPeopleNames.includes(sanitized.toLowerCase())) {
-          nameValidation.textContent = `"${sanitized}" already exists. Use "Existing" to add more images.`;
-          nameValidation.classList.remove("hidden");
-          return false;
-        }
-        nameValidation.classList.add("hidden");
-        return true;
-      }
-
-      if (newNameInput) {
-        newNameInput.addEventListener("input", validateNewName);
-      }
-
-      // --- People list (for dropdown; grid section can be removed safely) ---
-      let _knownPeopleNames = [];
-
-      async function refreshPeople() {
-        const r = await fetch("/api/people");
-        const j = await r.json();
-        const people = j.people || [];
-        _knownPeopleNames = people.map(p => p.name.toLowerCase());
-
-        if (peopleCountEl) peopleCountEl.textContent = `${people.length} total`;
-        if (peopleListEl) {
-          // If you remove the People grid section, this element may not exist — guarded.
-          // (No-op if missing.)
-        }
-
-        if (existingSelect) {
-          existingSelect.innerHTML = people.length
-            ? people
-                .map(
-                  (p) =>
-                    `<option value="${p.name}">${p.name} (${p.count})</option>`,
-                )
-                .join("")
-            : `<option value="">(no people yet)</option>`;
-        }
-      }
-
-      // --- Buttons ---
-      startBtn.onclick = async () => {
-        await fetch("/api/start", { method: "POST" });
-        // UI/stream will be aligned by SSE "state" event
-      };
-
-      stopBtn.onclick = async () => {
-        await fetch("/api/stop", { method: "POST" });
-        stopStream(); // close MJPEG immediately client-side
-      };
 
       // --- Single / Multi cam mode buttons ---
       if (singleCamBtn) {
+        // Single mode: jump straight to the first camera (no dropdown).
+        // If already in single mode, advance to the next camera.
         singleCamBtn.onclick = () => {
-          const wasOpen = !singleCamDropdown.classList.contains("hidden");
           closeAllDropdowns();
-          if (!wasOpen) singleCamDropdown.classList.remove("hidden");
+          if (!singleCamDevices.length) {
+            if (cameraMsg) cameraMsg.textContent = "No single cameras available.";
+            return;
+          }
+          if (currentCamMode !== "single") {
+            currentCamMode = "single";
+            updateCamModeButtons();
+            showSingleCameraAt(0);
+          } else {
+            showSingleCameraAt(singleCamIndex + 1);
+          }
         };
       }
       if (multiCamBtn) {
@@ -686,13 +700,65 @@
         };
       }
 
-      // Delegate clicks within dropdown lists
-      if (singleCamList) {
-        singleCamList.onclick = (e) => {
-          const btn = e.target.closest("[data-source]");
-          if (btn) switchCamera(btn.dataset.source);
+      async function pageGrid(delta) {
+        if (gridPageCount <= 1) return;
+        const pageSize = Math.max(1, gridPageSize);
+        const newOffset = gridOffset + delta * pageSize;
+        try {
+          const r = await fetch("/api/camera", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ grid_offset: newOffset }),
+          });
+          const j = await r.json();
+          if (!j.ok) return;
+          gridOffset = j.viewer_grid_offset ?? gridOffset;
+          if (typeof j.grid_page_count === "number") gridPageCount = j.grid_page_count;
+          updateCarouselUI();
+        } catch (_) { /* silent */ }
+      }
+
+      // Carousel arrow handlers — single mode cycles cameras, multi
+      // mode pages through the grid.
+      if (carouselPrev) {
+        carouselPrev.onclick = (e) => {
+          e.stopPropagation();
+          if (currentCamMode === "multi") pageGrid(-1);
+          else showSingleCameraAt(singleCamIndex - 1);
         };
       }
+      if (carouselNext) {
+        carouselNext.onclick = (e) => {
+          e.stopPropagation();
+          if (currentCamMode === "multi") pageGrid(1);
+          else showSingleCameraAt(singleCamIndex + 1);
+        };
+      }
+
+      // Touch swipe (left/right) on the video stage
+      if (videoStage) {
+        let touchStartX = 0;
+        let touchStartY = 0;
+        videoStage.addEventListener("touchstart", (e) => {
+          if (!e.touches.length) return;
+          touchStartX = e.touches[0].clientX;
+          touchStartY = e.touches[0].clientY;
+        }, { passive: true });
+        videoStage.addEventListener("touchend", (e) => {
+          if (!e.changedTouches.length) return;
+          const dx = e.changedTouches[0].clientX - touchStartX;
+          const dy = e.changedTouches[0].clientY - touchStartY;
+          if (!(Math.abs(dx) > 40 && Math.abs(dx) > Math.abs(dy))) return;
+          const dir = dx < 0 ? 1 : -1;
+          if (currentCamMode === "multi" && gridPageCount > 1) {
+            pageGrid(dir);
+          } else if (currentCamMode === "single" && singleCamDevices.length >= 2) {
+            showSingleCameraAt(singleCamIndex + dir);
+          }
+        }, { passive: true });
+      }
+
+      // Delegate clicks within dropdown lists
       if (multiCamList) {
         multiCamList.onclick = (e) => {
           const btn = e.target.closest("[data-source]");
@@ -706,488 +772,569 @@
         if (group && !group.contains(e.target)) closeAllDropdowns();
       });
 
-      // --- Grid configurator ---
-      const gridConfigPanel = document.getElementById("gridConfigPanel");
-      const gridLayoutSelect = document.getElementById("gridLayoutSelect");
-      const gridSlotsContainer = document.getElementById("gridSlotsContainer");
-      const applyGridBtn = document.getElementById("applyGridBtn");
-      const gridMsg = document.getElementById("gridMsg");
+      // --- initial ---
+      ensureStreaming().then(loadCameraOptions);
 
-      let gridAvailableCameras = [];
-      let gridCurrentLayout = [2, 2];
-      let gridSlots = {};
+      // ===================== HISTORY =====================
+      let _activityEnabled = true;
 
-      function showGridPanel(show) {
-        if (gridConfigPanel) {
-          gridConfigPanel.classList.toggle("hidden", !show);
+      document.querySelectorAll(".tab-btn").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          document.querySelectorAll(".tab-btn").forEach((b) => {
+            b.classList.remove("border-emerald-500", "text-emerald-400");
+            b.classList.add("border-transparent", "text-slate-400");
+          });
+          btn.classList.remove("border-transparent", "text-slate-400");
+          btn.classList.add("border-emerald-500", "text-emerald-400");
+          document.querySelectorAll(".tab-content").forEach((c) => c.classList.add("hidden"));
+          const target = document.getElementById("tab-" + btn.dataset.tab);
+          if (target) target.classList.remove("hidden");
+        });
+      });
+
+      function fmtTimeH(iso) {
+        if (!iso) return "--";
+        try { return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }); }
+        catch { return "--"; }
+      }
+      function fmtDateH(iso) {
+        if (!iso) return "--";
+        try { return new Date(iso).toLocaleDateString(); } catch { return "--"; }
+      }
+      function statusBadge(v) {
+        if (!v.ended) return `<span class="px-2 py-0.5 rounded text-xs bg-emerald-900 text-emerald-300">Active</span>`;
+        return `<span class="px-2 py-0.5 rounded text-xs bg-slate-800 text-slate-400">Ended</span>`;
+      }
+      function visitRow(v, opts = {}) {
+        const showDate = opts.showDate || false;
+        const showPerson = opts.showPerson !== false;
+        const showLocation = opts.showLocation !== false;
+        let media;
+        if (v.footage_url) {
+          media = `<video src="${v.footage_url}" class="w-28 h-20 rounded object-cover border border-slate-700 hover:border-emerald-500 transition-colors cursor-pointer" muted loop preload="metadata" onmouseenter="this.play()" onmouseleave="this.pause();this.currentTime=0" onclick="openVideoModal(this.src)" title="Click to enlarge"></video>`;
+        } else if (v.screenshot_url) {
+          media = `<a href="${v.screenshot_url}" target="_blank"><img src="${v.screenshot_url}" class="w-28 h-20 rounded object-cover border border-slate-700 hover:border-emerald-500 transition-colors"></a>`;
+        } else {
+          media = `<span class="text-slate-600 text-xs">--</span>`;
         }
+        let cols = `<td class="px-4 py-2">${media}</td>`;
+        if (showPerson) cols += `<td class="px-4 py-2 font-medium">${v.person_name}</td>`;
+        if (showLocation) {
+          cols += `<td class="px-4 py-2 text-slate-300">${v.location_display || "Unknown camera"}</td>`;
+        }
+        if (showDate) cols += `<td class="px-4 py-2 text-slate-400">${fmtDateH(v.first_seen)}</td>`;
+        cols += `<td class="px-4 py-2 text-slate-300">${fmtTimeH(v.first_seen)}</td>`;
+        cols += `<td class="px-4 py-2 text-slate-300">${fmtTimeH(v.last_seen)}</td>`;
+        cols += `<td class="px-4 py-2 text-slate-300">${v.duration_fmt}</td>`;
+        if (_activityEnabled) cols += `<td class="px-4 py-2 activity-col">${v.activity ? `<span class="px-2 py-0.5 rounded text-xs bg-blue-900 text-blue-300">${v.activity}</span>` : '<span class="text-slate-600 text-xs">--</span>'}</td>`;
+        cols += `<td class="px-4 py-2">${statusBadge(v)}</td>`;
+        return `<tr class="border-b border-slate-800/50 hover:bg-slate-800/30">${cols}</tr>`;
+      }
+      function todayStr() { return new Date().toISOString().split("T")[0]; }
+      function emptyRow(msg) {
+        const span = _activityEnabled ? 8 : 7;
+        return `<tr><td colspan="${span}" class="px-4 py-6 text-center text-slate-500">${msg}</td></tr>`;
       }
 
-      async function loadGridConfig() {
-        try {
-          const r = await fetch("/api/grid/config");
-          const j = await r.json();
-          gridAvailableCameras = j.available_cameras || [];
-          gridCurrentLayout = j.layout || [2, 2];
-          gridSlots = j.slots || {};
+      const dailyDate = document.getElementById("dailyDate");
+      const dailyLoadBtn = document.getElementById("dailyLoadBtn");
+      const dailyMsg = document.getElementById("dailyMsg");
+      const dailyTableBody = document.getElementById("dailyTableBody");
+      const dailyTotals = document.getElementById("dailyTotals");
+      dailyDate.value = todayStr();
+      window.addEventListener("DOMContentLoaded", async () => {
+        try { await loadCameraOptions(); } catch (e) {}
+        dailyLoadBtn.click();
+      });
 
-          // Populate layout selector
-          if (gridLayoutSelect) {
-            const layouts = j.available_layouts || [];
-            gridLayoutSelect.innerHTML = layouts
-              .map(
-                ([r, c]) =>
-                  `<option value="${r}x${c}" ${
-                    r === gridCurrentLayout[0] && c === gridCurrentLayout[1]
-                      ? "selected"
-                      : ""
-                  }>${r}x${c} (${r * c} slots)</option>`,
-              )
-              .join("");
+      dailyLoadBtn.addEventListener("click", async () => {
+        const d = dailyDate.value;
+        if (!d) return;
+        dailyMsg.textContent = "Loading...";
+        try {
+          const r = await fetch(`/api/history/daily?date=${d}`);
+          const j = await r.json();
+          if (!j.ok) { dailyMsg.textContent = j.error || "Error"; return; }
+          dailyMsg.textContent = `${j.visits.length} visit(s)`;
+          dailyTableBody.innerHTML = j.visits.length
+            ? j.visits.map((v) => visitRow(v)).join("")
+            : emptyRow("No visits on this date");
+          const totals = j.person_totals || {};
+          const names = Object.keys(totals).sort();
+          if (names.length) {
+            dailyTotals.innerHTML = `<div class="flex flex-wrap gap-2">${names.map((n) => `
+              <div class="rounded-lg border border-slate-800 bg-slate-900 px-3 py-2">
+                <div class="text-sm font-medium">${n}</div>
+                <div class="text-xs text-slate-400">Total: ${totals[n].total_fmt}</div>
+              </div>`).join("")}</div>`;
+          } else { dailyTotals.innerHTML = ""; }
+        } catch (e) { dailyMsg.textContent = String(e); }
+      });
+
+      const personSelect = document.getElementById("personSelect");
+      const personFrom = document.getElementById("personFrom");
+      const personTo = document.getElementById("personTo");
+      const personLoadBtn = document.getElementById("personLoadBtn");
+      const personTableBody = document.getElementById("personTableBody");
+      const personSummary = document.getElementById("personSummary");
+
+      async function loadPersons() {
+        try {
+          const r = await fetch("/api/history/persons");
+          const j = await r.json();
+          if (j.ok && j.persons) {
+            personSelect.innerHTML = `<option value="">Select...</option>` +
+              j.persons.map((n) => `<option value="${n}">${n}</option>`).join("");
           }
-          renderGridSlots();
+        } catch {}
+      }
+      personLoadBtn.addEventListener("click", async () => {
+        const name = personSelect.value;
+        if (!name) return;
+        let url = `/api/history/person/${encodeURIComponent(name)}`;
+        const params = [];
+        if (personFrom.value) params.push(`from=${personFrom.value}`);
+        if (personTo.value) params.push(`to=${personTo.value}`);
+        if (params.length) url += "?" + params.join("&");
+        try {
+          const r = await fetch(url);
+          const j = await r.json();
+          if (!j.ok) return;
+          personTableBody.innerHTML = j.visits.length
+            ? j.visits.map((v) => visitRow(v, { showDate: true, showPerson: false })).join("")
+            : emptyRow("No visits found");
+          personSummary.innerHTML = `<div class="rounded-lg border border-slate-800 bg-slate-900 px-4 py-3 inline-block">
+            <span class="text-sm font-medium">${name}</span>
+            <span class="text-xs text-slate-400 ml-2">Total: ${j.total_fmt} across ${j.visits.length} visit(s)</span>
+          </div>`;
+        } catch {}
+      });
+
+      const locationSelect = document.getElementById("locationSelect");
+      const locationFrom = document.getElementById("locationFrom");
+      const locationTo = document.getElementById("locationTo");
+      const locationLoadBtn = document.getElementById("locationLoadBtn");
+      const locationTableBody = document.getElementById("locationTableBody");
+
+      async function loadLocations() {
+        try {
+          const r = await fetch("/api/history/locations");
+          const j = await r.json();
+          if (j.ok && j.locations) {
+            locationSelect.innerHTML = `<option value="">Select...</option>` +
+              j.locations
+                .filter((l) => l.display_name && l.display_name !== "Unknown camera")
+                .map((l) => `<option value="${l.id}">${l.display_name}</option>`).join("");
+          }
+        } catch {}
+      }
+      locationLoadBtn.addEventListener("click", async () => {
+        const locId = locationSelect.value;
+        if (!locId) return;
+        let url = `/api/history/location/${locId}`;
+        const params = [];
+        if (locationFrom.value) params.push(`from=${locationFrom.value}`);
+        if (locationTo.value) params.push(`to=${locationTo.value}`);
+        if (params.length) url += "?" + params.join("&");
+        try {
+          const r = await fetch(url);
+          const j = await r.json();
+          if (!j.ok) return;
+          locationTableBody.innerHTML = j.visits.length
+            ? j.visits.map((v) => visitRow(v, { showDate: true, showLocation: false })).join("")
+            : emptyRow("No visits found");
+        } catch {}
+      });
+
+      async function clearAllData() {
+        if (!confirm("Delete ALL visits and sessions? This cannot be undone.")) return;
+        const btn = document.getElementById("clearDataBtn");
+        btn.disabled = true; btn.textContent = "Clearing...";
+        try {
+          const r = await fetch("/api/history/clear", { method: "POST" });
+          const j = await r.json();
+          if (j.ok) {
+            btn.textContent = "Cleared!";
+            dailyLoadBtn.click();
+            loadPersons();
+            loadLocations();
+            setTimeout(() => { btn.textContent = "Clear Visit Data"; btn.disabled = false; }, 1500);
+          } else {
+            alert("Error: " + (j.error || "unknown"));
+            btn.textContent = "Clear Visit Data"; btn.disabled = false;
+          }
         } catch (e) {
-          console.error("Failed to load grid config:", e);
+          alert("Failed: " + e);
+          btn.textContent = "Clear Visit Data"; btn.disabled = false;
         }
       }
 
-      // Helper: get the camera source from a slot value (object or null)
-      function slotSource(slot) {
-        if (!slot) return "";
-        if (typeof slot === "object") return slot.source || "";
-        return String(slot);
-      }
-      function slotName(slot) {
-        if (!slot) return "";
-        if (typeof slot === "object") return slot.name || "";
-        return "";
-      }
-
-      function renderGridSlots() {
-        if (!gridSlotsContainer) return;
-        const [rows, cols] = gridCurrentLayout;
-        const totalSlots = rows * cols;
-
-        gridSlotsContainer.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
-        gridSlotsContainer.innerHTML = "";
-
-        for (let i = 0; i < totalSlots; i++) {
-          const slotVal = gridSlots[String(i)];
-          const currentSource = slotSource(slotVal);
-          const currentName = slotName(slotVal);
-
-          const cell = document.createElement("div");
-          cell.className =
-            "rounded-lg border border-slate-700 bg-slate-950 p-2 space-y-1";
-
-          const label = document.createElement("div");
-          label.className = "text-xs text-slate-400 mb-1";
-          label.textContent = `Slot ${i + 1}`;
-          cell.appendChild(label);
-
-          // Camera select
-          const select = document.createElement("select");
-          select.className =
-            "w-full rounded bg-slate-900 border border-slate-700 px-2 py-1 text-xs";
-          select.dataset.slot = String(i);
-
-          let html = `<option value="">Empty</option>`;
-          gridAvailableCameras.forEach((cam) => {
-            const usedElsewhere = Object.entries(gridSlots).some(
-              ([k, v]) => k !== String(i) && slotSource(v) === cam.value,
-            );
-            const selected = currentSource === cam.value ? "selected" : "";
-            const disabled = usedElsewhere && !selected ? "disabled" : "";
-            html += `<option value="${cam.value}" ${selected} ${disabled}>${cam.label}${usedElsewhere && !selected ? " (in use)" : ""}</option>`;
-          });
-          select.innerHTML = html;
-          select.addEventListener("change", (e) => {
-            const slot = e.target.dataset.slot;
-            const val = e.target.value;
-            if (val) {
-              const existing = gridSlots[slot];
-              gridSlots[slot] = { source: val, name: slotName(existing) || `Camera ${val}` };
-            } else {
-              gridSlots[slot] = null;
-            }
-            renderGridSlots();
-          });
-          cell.appendChild(select);
-
-          // Location name input (only shown if a camera is selected)
-          if (currentSource) {
-            const nameInput = document.createElement("input");
-            nameInput.type = "text";
-            nameInput.placeholder = "Location name";
-            nameInput.value = currentName;
-            nameInput.className =
-              "w-full rounded bg-slate-900 border border-slate-700 px-2 py-1 text-xs mt-1";
-            nameInput.dataset.slot = String(i);
-            nameInput.addEventListener("input", (e) => {
-              const slot = e.target.dataset.slot;
-              const existing = gridSlots[slot];
-              if (existing && typeof existing === "object") {
-                existing.name = e.target.value;
-              }
-            });
-            cell.appendChild(nameInput);
-          }
-
-          gridSlotsContainer.appendChild(cell);
-        }
-      }
-
-      if (gridLayoutSelect) {
-        gridLayoutSelect.addEventListener("change", (e) => {
-          const parts = e.target.value.split("x");
-          const newRows = parseInt(parts[0], 10);
-          const newCols = parseInt(parts[1], 10);
-          const oldTotal = gridCurrentLayout[0] * gridCurrentLayout[1];
-          const newTotal = newRows * newCols;
-
-          gridCurrentLayout = [newRows, newCols];
-
-          // Preserve existing assignments, trim or pad
-          const newSlots = {};
-          for (let i = 0; i < newTotal; i++) {
-            newSlots[String(i)] =
-              i < oldTotal ? gridSlots[String(i)] || null : null;
-          }
-          gridSlots = newSlots;
-          renderGridSlots();
-        });
-      }
-
-      if (applyGridBtn) {
-        applyGridBtn.addEventListener("click", async () => {
-          // Client-side duplicate check (compare source values)
-          const sources = Object.values(gridSlots)
-            .map((v) => slotSource(v))
-            .filter((s) => s);
-          const seen = new Set();
-          const dupes = new Set();
-          sources.forEach((s) => {
-            if (seen.has(s)) dupes.add(s);
-            seen.add(s);
-          });
-          if (dupes.size > 0) {
-            if (gridMsg)
-              gridMsg.textContent = `Each camera can only be assigned to one slot.`;
-            return;
-          }
-
-          applyGridBtn.disabled = true;
-          if (gridMsg) gridMsg.textContent = "Applying...";
-
-          try {
-            const r = await fetch("/api/grid/config", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                layout: gridCurrentLayout,
-                slots: gridSlots,
-              }),
-            });
-            const j = await r.json();
-            if (!r.ok || !j.ok) {
-              if (gridMsg)
-                gridMsg.textContent = `Error: ${j.error || "unknown error"}`;
-              return;
-            }
-            if (gridMsg) gridMsg.textContent = "Grid applied.";
-            if (cameraMsg)
-              cameraMsg.textContent = `Current source: ${j.camera_source}`;
-            toast("Grid configuration applied", "success");
-            await loadCameraOptions();
-            // Force-restart stream so we don't wait for SSE to notice
-            if (j.running && videoFeed) startStream();
-          } catch (e) {
-            if (gridMsg) gridMsg.textContent = `Error: ${String(e)}`;
-          } finally {
-            applyGridBtn.disabled = false;
-          }
-        });
-      }
-
-      // Show/hide grid panel based on current mode
-      function updateGridPanelVisibility() {
-        const shouldShow = currentCamMode === "multi";
-        showGridPanel(shouldShow);
-        if (shouldShow) {
-          loadGridConfig();
-        }
-      }
-
-      // --- Reload faces ---
-      const reloadBtn = document.getElementById("reloadBtn");
-      if (reloadBtn) {
-        reloadBtn.onclick = async () => {
-          await fetch("/api/reload_faces", { method: "POST" });
-          await refreshPeople();
-          if (uploadMsg) uploadMsg.textContent = "Reloaded.";
-        };
-      }
-
-      // --- Upload ---
-      const uploadForm = document.getElementById("uploadForm");
-      const uploadBtn = document.getElementById("uploadBtn");
-      const uploadProgress = document.getElementById("uploadProgress");
-      const uploadProgressBar = document.getElementById("uploadProgressBar");
-      const uploadProgressText = document.getElementById("uploadProgressText");
-
-      function _setProgress(pct) {
-        if (!uploadProgress || !uploadProgressBar || !uploadProgressText) return;
-        uploadProgress.classList.remove("hidden");
-        uploadProgressBar.style.width = pct + "%";
-        uploadProgressText.textContent = pct < 100 ? pct + "%" : "Processing...";
-      }
-
-      function _hideProgress() {
-        if (uploadProgress) uploadProgress.classList.add("hidden");
-        if (uploadProgressBar) uploadProgressBar.style.width = "0%";
-        if (uploadProgressText) uploadProgressText.textContent = "0%";
-      }
-
-      function _setUploading(busy) {
-        if (uploadBtn) {
-          uploadBtn.disabled = busy;
-          uploadBtn.textContent = busy ? "Uploading..." : "Upload";
-        }
-      }
-
-      if (uploadForm) {
-        uploadForm.onsubmit = async (e) => {
-          e.preventDefault();
-          if (!validateNewName()) {
-            if (uploadMsg) uploadMsg.textContent = "Fix the name error above first.";
-            return;
-          }
-
-          const fd = new FormData(e.target);
-          fd.set("mode", currentMode());
-
-          // Clear previous messages
-          if (uploadMsg) { uploadMsg.textContent = ""; uploadMsg.className = "text-xs text-slate-300"; }
-          _setUploading(true);
-          _setProgress(0);
-
-          // Use XMLHttpRequest for upload progress tracking
-          const xhr = new XMLHttpRequest();
-
-          xhr.upload.addEventListener("progress", (ev) => {
-            if (ev.lengthComputable) {
-              const pct = Math.round((ev.loaded / ev.total) * 100);
-              _setProgress(pct);
-            }
-          });
-
-          xhr.addEventListener("load", async () => {
-            _hideProgress();
-            _setUploading(false);
-
-            let j;
-            try { j = JSON.parse(xhr.responseText); } catch { j = {}; }
-
-            if (xhr.status < 200 || xhr.status >= 300) {
-              if (uploadMsg) {
-                uploadMsg.textContent = "Error: " + (j.error || "upload failed");
-                uploadMsg.className = "text-xs text-red-400";
-              }
-              return;
-            }
-
-            // Success — show inline confirmation + toast
-            if (uploadMsg) {
-              uploadMsg.innerHTML =
-                '<span class="inline-flex items-center gap-1 text-emerald-400">' +
-                '<svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">' +
-                '<path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"/></svg>' +
-                'Saved to ' + (j.person || '') + '/</span>';
-              uploadMsg.className = "text-xs";
-            }
-            toast("Face image uploaded to " + (j.person || "folder"), "success");
-
-            // Refresh people list after successful upload
-            await refreshPeople();
-
-            // Reset form: clear file input, name, and radio buttons
-            uploadForm.reset();
-            setModeUI();
-            if (nameValidation) nameValidation.classList.add("hidden");
-
-            // Clear the success message after a few seconds
-            setTimeout(() => {
-              if (uploadMsg) { uploadMsg.textContent = ""; uploadMsg.className = "text-xs text-slate-300"; }
-            }, 4000);
-          });
-
-          xhr.addEventListener("error", () => {
-            _hideProgress();
-            _setUploading(false);
-            if (uploadMsg) {
-              uploadMsg.textContent = "Network error — check your connection.";
-              uploadMsg.className = "text-xs text-red-400";
-            }
-          });
-
-          xhr.addEventListener("abort", () => {
-            _hideProgress();
-            _setUploading(false);
-            if (uploadMsg) { uploadMsg.textContent = "Upload cancelled."; uploadMsg.className = "text-xs text-slate-300"; }
-          });
-
-          xhr.open("POST", "/api/upload_face");
-          xhr.send(fd);
-        };
-      }
-
-      // --- Camera Capture ---
-      let _captureStream = null;
-      let _engineCamIndices = [];   // camera indices currently held by the engine
-
-      async function _fetchEngineCameras() {
-        // Ask the backend which camera indices the engine currently holds open
-        try {
-          const r = await fetch('/api/camera');
-          const j = await r.json();
-          _engineCamIndices = (j.running && Array.isArray(j.active_cameras))
-            ? j.active_cameras : [];
-        } catch (_) {
-          _engineCamIndices = [];
-        }
-      }
-
-      function _cameraErrorMessage(err) {
-        const name = err.name || '';
-        if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
-          return 'Camera permission denied. Please allow camera access in your browser.';
-        }
-        if (name === 'NotReadableError' || name === 'AbortError' || name === 'TrackStartError') {
-          return 'Camera is in use by another application (possibly the recognition engine). Try a different camera or stop the engine first.';
-        }
-        if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
-          return 'No camera found on this device.';
-        }
-        if (name === 'OverconstrainedError') {
-          return 'Camera does not support the requested resolution.';
-        }
-        return 'Could not open camera: ' + (err.message || name);
-      }
-
-      async function openCaptureModal() {
-        const modal = document.getElementById('captureModal');
-        const select = document.getElementById('captureDeviceSelect');
-        const camMsg = document.getElementById('captureCamMsg');
-        if (camMsg) { camMsg.textContent = ''; camMsg.classList.add('hidden'); }
+      function openVideoModal(src) {
+        const modal = document.getElementById('videoModal');
+        const video = document.getElementById('modalVideo');
+        video.src = src; video.load();
         modal.classList.remove('hidden');
-
-        // Fetch engine camera info in parallel with permission probe
-        const engineProm = _fetchEngineCameras();
-
-        // Request permission first so device labels are available
-        try {
-          const tempStream = await navigator.mediaDevices.getUserMedia({ video: true });
-          tempStream.getTracks().forEach(t => t.stop());
-        } catch (err) {
-          console.warn('Camera probe failed:', err);
-          closeCaptureModal();
-          if (uploadMsg) uploadMsg.textContent = _cameraErrorMessage(err);
-          return;
-        }
-
-        await engineProm;
-
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const cameras = devices.filter(d => d.kind === 'videoinput');
-
-        select.innerHTML = cameras.map((d, i) => {
-          const label = d.label || 'Camera ' + i;
-          // Try to detect if this is one of the engine's cameras by matching the index in the label
-          const idxMatch = label.match(/\b(\d+)\b/);
-          const inUse = idxMatch && _engineCamIndices.includes(parseInt(idxMatch[1]));
-          const suffix = inUse ? ' (in use by engine)' : '';
-          return `<option value="${d.deviceId}">${label}${suffix}</option>`;
-        }).join('');
-
-        if (_engineCamIndices.length > 0 && camMsg) {
-          camMsg.textContent = 'Note: The recognition engine is using camera ' +
-            _engineCamIndices.join(', ') + '. If a camera fails to open, try a different one or stop the engine first.';
-          camMsg.classList.remove('hidden');
-        }
-
-        if (cameras.length > 0) {
-          await switchCaptureCamera();
-        }
       }
-
-      async function switchCaptureCamera() {
-        if (_captureStream) {
-          _captureStream.getTracks().forEach(t => t.stop());
-          _captureStream = null;
-        }
-
-        const select = document.getElementById('captureDeviceSelect');
-        const video = document.getElementById('capturePreview');
-        const camMsg = document.getElementById('captureCamMsg');
-        const deviceId = select.value;
-        if (!deviceId) return;
-
-        try {
-          _captureStream = await navigator.mediaDevices.getUserMedia({
-            video: { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
-          });
-          video.srcObject = _captureStream;
-          // Clear any previous per-camera error (keep the engine-note if present)
-        } catch (err) {
-          console.error('Camera error:', err);
-          video.srcObject = null;
-          if (camMsg) {
-            camMsg.textContent = _cameraErrorMessage(err);
-            camMsg.classList.remove('hidden');
-          }
-        }
-      }
-
-      function capturePhoto() {
-        const video = document.getElementById('capturePreview');
-        const canvas = document.getElementById('captureCanvas');
-        const fileInput = document.getElementById('fileInput');
-
-        if (!video.videoWidth) return;
-
-        // Draw unmirrored frame to canvas
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(video, 0, 0);
-
-        canvas.toBlob((blob) => {
-          if (!blob) return;
-          const file = new File([blob], 'capture.jpg', { type: 'image/jpeg' });
-          const dt = new DataTransfer();
-          dt.items.add(file);
-          fileInput.files = dt.files;
-
-          closeCaptureModal();
-          if (uploadMsg) uploadMsg.textContent = 'Photo captured. Click Upload to save.';
-        }, 'image/jpeg', 0.92);
-      }
-
-      function closeCaptureModal() {
-        if (_captureStream) {
-          _captureStream.getTracks().forEach(t => t.stop());
-          _captureStream = null;
-        }
-        const modal = document.getElementById('captureModal');
-        const video = document.getElementById('capturePreview');
-        video.srcObject = null;
+      function closeVideoModal() {
+        const modal = document.getElementById('videoModal');
+        const video = document.getElementById('modalVideo');
+        video.pause(); video.src = '';
         modal.classList.add('hidden');
       }
 
-      // --- initial ---
-      setModeUI();
-      loadCameraOptions();
-      refreshPeople();
+      async function initActionFlag() {
+        try {
+          const r = await fetch("/api/status");
+          const j = await r.json();
+          _activityEnabled = !!j.action_enabled;
+        } catch { _activityEnabled = true; }
+        if (!_activityEnabled) {
+          document.querySelectorAll(".activity-col").forEach(el => el.style.display = "none");
+        }
+        document.querySelectorAll(".empty-msg").forEach(td => {
+          const cols = td.closest("table").querySelectorAll("thead th:not([style*='display: none'])").length;
+          td.setAttribute("colspan", cols);
+        });
+      }
+      initActionFlag();
+      loadPersons();
+      loadLocations();
+
+      // ===================== ZOOM / PAN =====================
+      // Pan/zoom controller. Uses transform-origin: 0 0 so math is direct:
+      //   image-rect = (panX, panY, baseW * scale, baseH * scale)
+      // Pan is clamped so image edges never leave the container when zoomed
+      // in; image is centered when zoomed out / at 1x.
+      const fullscreenZoomModal = document.getElementById("fullscreenZoomModal");
+      const fullscreenZoomImage = document.getElementById("fullscreenZoomImage");
+      const fullscreenZoomContainer = document.getElementById("fullscreenZoomContainer");
+      const fullscreenCameraLabel = document.getElementById("fullscreenCameraLabel");
+      const gridOverlay = document.getElementById("gridOverlay");
+
+      class PanZoom {
+        constructor({ image, container, levelEl, minZoom = 1, maxZoom = 6, step = 0.25 }) {
+          this.image = image;
+          this.container = container;
+          this.levelEl = levelEl;
+          this.minZoom = minZoom;
+          this.maxZoom = maxZoom;
+          this.step = step;
+          this.scale = 1;
+          this.x = 0;
+          this.y = 0;
+          this._drag = null;
+          this._pinch = null;
+
+          this._onMouseDown = this._onMouseDown.bind(this);
+          this._onMouseMove = this._onMouseMove.bind(this);
+          this._onMouseUp = this._onMouseUp.bind(this);
+          this._onWheel = this._onWheel.bind(this);
+          this._onTouchStart = this._onTouchStart.bind(this);
+          this._onTouchMove = this._onTouchMove.bind(this);
+          this._onTouchEnd = this._onTouchEnd.bind(this);
+          this._onDragStart = (e) => e.preventDefault();
+
+          image.addEventListener("mousedown", this._onMouseDown);
+          window.addEventListener("mousemove", this._onMouseMove);
+          window.addEventListener("mouseup", this._onMouseUp);
+          container.addEventListener("wheel", this._onWheel, { passive: false });
+          container.addEventListener("touchstart", this._onTouchStart, { passive: false });
+          container.addEventListener("touchmove", this._onTouchMove, { passive: false });
+          container.addEventListener("touchend", this._onTouchEnd);
+          container.addEventListener("touchcancel", this._onTouchEnd);
+          image.addEventListener("dragstart", this._onDragStart);
+
+          this._apply();
+        }
+
+        // ---------- geometry ----------
+        _baseSize() {
+          // Untransformed size of the image element (the layout box).
+          // offsetWidth/Height ignore the CSS transform, which is what we want.
+          return { w: this.image.offsetWidth || 1, h: this.image.offsetHeight || 1 };
+        }
+
+        _containerSize() {
+          return { w: this.container.clientWidth, h: this.container.clientHeight };
+        }
+
+        _clamp(x, y, scale) {
+          const { w: bw, h: bh } = this._baseSize();
+          const { w: cw, h: ch } = this._containerSize();
+          const sw = bw * scale;
+          const sh = bh * scale;
+
+          // X
+          if (sw <= cw) {
+            x = (cw - sw) / 2;
+          } else {
+            const minX = cw - sw;
+            const maxX = 0;
+            if (x < minX) x = minX;
+            if (x > maxX) x = maxX;
+          }
+          // Y
+          if (sh <= ch) {
+            y = (ch - sh) / 2;
+          } else {
+            const minY = ch - sh;
+            const maxY = 0;
+            if (y < minY) y = minY;
+            if (y > maxY) y = maxY;
+          }
+          return { x, y };
+        }
+
+        _apply() {
+          const c = this._clamp(this.x, this.y, this.scale);
+          this.x = c.x;
+          this.y = c.y;
+          this.image.style.transform = `translate(${this.x}px, ${this.y}px) scale(${this.scale})`;
+          this.image.style.cursor = this.scale > 1 ? (this._drag ? "grabbing" : "grab") : "default";
+          if (this.levelEl) this.levelEl.textContent = Math.round(this.scale * 100) + "%";
+        }
+
+        // ---------- public ----------
+        reset() {
+          this.scale = 1;
+          this.x = 0;
+          this.y = 0;
+          this._apply();
+        }
+
+        // Zoom toward a focal point (clientX, clientY). When omitted, zooms
+        // toward container center.
+        zoomBy(deltaScale, focalClientX, focalClientY) {
+          const newScale = Math.max(this.minZoom, Math.min(this.maxZoom, this.scale + deltaScale));
+          this._zoomTo(newScale, focalClientX, focalClientY);
+        }
+
+        _zoomTo(newScale, focalClientX, focalClientY) {
+          if (newScale === this.scale) return;
+          const rect = this.container.getBoundingClientRect();
+          const fx = (focalClientX != null) ? (focalClientX - rect.left) : rect.width / 2;
+          const fy = (focalClientY != null) ? (focalClientY - rect.top) : rect.height / 2;
+          // Image-space coordinates of the focal point at the OLD transform.
+          const ix = (fx - this.x) / this.scale;
+          const iy = (fy - this.y) / this.scale;
+          this.scale = newScale;
+          // Solve so the same image-space point lands under the cursor.
+          this.x = fx - ix * this.scale;
+          this.y = fy - iy * this.scale;
+          this._apply();
+        }
+
+        // ---------- mouse ----------
+        _onMouseDown(e) {
+          if (e.button !== 0 || this.scale <= 1) return;
+          e.preventDefault();
+          this._drag = {
+            startClientX: e.clientX,
+            startClientY: e.clientY,
+            startX: this.x,
+            startY: this.y,
+          };
+          this._apply();
+        }
+
+        _onMouseMove(e) {
+          if (!this._drag) return;
+          this.x = this._drag.startX + (e.clientX - this._drag.startClientX);
+          this.y = this._drag.startY + (e.clientY - this._drag.startClientY);
+          this._apply();
+        }
+
+        _onMouseUp() {
+          if (!this._drag) return;
+          this._drag = null;
+          this._apply();
+        }
+
+        _onWheel(e) {
+          e.preventDefault();
+          const delta = e.deltaY < 0 ? this.step : -this.step;
+          this.zoomBy(delta, e.clientX, e.clientY);
+        }
+
+        // ---------- touch ----------
+        _onTouchStart(e) {
+          if (e.touches.length === 1 && this.scale > 1) {
+            const t = e.touches[0];
+            this._drag = {
+              startClientX: t.clientX,
+              startClientY: t.clientY,
+              startX: this.x,
+              startY: this.y,
+            };
+          } else if (e.touches.length === 2) {
+            this._drag = null;
+            this._pinch = this._readPinch(e.touches);
+            e.preventDefault();
+          }
+        }
+
+        _onTouchMove(e) {
+          if (e.touches.length === 1 && this._drag) {
+            const t = e.touches[0];
+            this.x = this._drag.startX + (t.clientX - this._drag.startClientX);
+            this.y = this._drag.startY + (t.clientY - this._drag.startClientY);
+            this._apply();
+            e.preventDefault();
+          } else if (e.touches.length === 2 && this._pinch) {
+            const cur = this._readPinch(e.touches);
+            const ratio = cur.dist / this._pinch.dist;
+            const newScale = Math.max(this.minZoom, Math.min(this.maxZoom, this._pinch.scale * ratio));
+            this._zoomTo(newScale, cur.cx, cur.cy);
+            e.preventDefault();
+          }
+        }
+
+        _onTouchEnd(e) {
+          if (e.touches.length < 2) this._pinch = null;
+          if (e.touches.length === 0) this._drag = null;
+        }
+
+        _readPinch(touches) {
+          const dx = touches[0].clientX - touches[1].clientX;
+          const dy = touches[0].clientY - touches[1].clientY;
+          return {
+            dist: Math.hypot(dx, dy) || 1,
+            cx: (touches[0].clientX + touches[1].clientX) / 2,
+            cy: (touches[0].clientY + touches[1].clientY) / 2,
+            scale: this.scale,
+          };
+        }
+      }
+
+      const inlinePZ = videoFeed && videoStage ? new PanZoom({
+        image: videoFeed,
+        container: videoStage,
+        levelEl: document.getElementById("zoomLevel"),
+      }) : null;
+
+      const fsPZ = fullscreenZoomImage && fullscreenZoomContainer ? new PanZoom({
+        image: fullscreenZoomImage,
+        container: fullscreenZoomContainer,
+        levelEl: document.getElementById("fsZoomLevel"),
+      }) : null;
+
+      const _bindZoomBtns = (pz, outId, inId, resetId) => {
+        if (!pz) return;
+        const out = document.getElementById(outId);
+        const inn = document.getElementById(inId);
+        const rst = document.getElementById(resetId);
+        if (out) out.addEventListener("click", () => pz.zoomBy(-pz.step));
+        if (inn) inn.addEventListener("click", () => pz.zoomBy(+pz.step));
+        if (rst) rst.addEventListener("click", () => pz.reset());
+      };
+      _bindZoomBtns(inlinePZ, "zoomOutBtn", "zoomInBtn", "zoomResetBtn");
+      _bindZoomBtns(fsPZ, "fsZoomOutBtn", "fsZoomInBtn", "fsZoomResetBtn");
+
+      // Re-clamp on viewport changes so the image doesn't get stranded
+      // outside the container after resize.
+      window.addEventListener("resize", () => {
+        if (inlinePZ) inlinePZ._apply();
+        if (fsPZ) fsPZ._apply();
+      });
+      if (videoFeed) videoFeed.addEventListener("load", () => {
+        if (inlinePZ) inlinePZ._apply();
+      });
+      if (fullscreenZoomImage) fullscreenZoomImage.addEventListener("load", () => {
+        if (fsPZ) fsPZ._apply();
+      });
+
+      function closeFullscreenZoom(event) {
+        if (event && event.target !== fullscreenZoomModal) return;
+        fullscreenZoomModal.classList.add("hidden");
+        if (fsPZ) fsPZ.reset();
+      }
+
+      function openFullscreenZoom(imageSrc, label = "Camera") {
+        fullscreenCameraLabel.textContent = label;
+        fullscreenZoomImage.src = imageSrc;
+        fullscreenZoomModal.classList.remove("hidden");
+        if (fsPZ) fsPZ.reset();
+      }
+
+      // Grid click detection - parse grid layout and make cameras clickable
+      function setupGridClickable() {
+        if (currentCamMode !== "multi") {
+          gridOverlay.classList.add("hidden");
+          return;
+        }
+
+        // Get grid info from the layout
+        const gridLayoutText = cameraMsg.textContent || "";
+        const matches = gridLayoutText.match(/grid \((\d+)x(\d+)\)/);
+        if (!matches) {
+          gridOverlay.classList.add("hidden");
+          return;
+        }
+
+        const rows = parseInt(matches[1]);
+        const cols = parseInt(matches[2]);
+        const totalCells = rows * cols;
+
+        const feedRect = videoFeed.getBoundingClientRect();
+        const stageRect = videoStage.getBoundingClientRect();
+        const cellWidth = videoFeed.width / cols;
+        const cellHeight = videoFeed.height / rows;
+
+        let html = "";
+        for (let i = 0; i < totalCells; i++) {
+          const row = Math.floor(i / cols);
+          const col = i % cols;
+          const x = col * cellWidth;
+          const y = row * cellHeight;
+          html += `<div class="grid-cell" data-index="${i}" 
+            style="position: absolute; left: ${x}px; top: ${y}px; width: ${cellWidth}px; height: ${cellHeight}px; 
+            cursor: pointer; transition: background-color 0.2s;"
+            onmouseover="this.style.backgroundColor='rgba(34,197,94,0.1)'"
+            onmouseout="this.style.backgroundColor='transparent'"
+            onclick="openCameraFullscreen('${videoFeed.src}', ${i}, ${rows}, ${cols})"></div>`;
+        }
+        gridOverlay.innerHTML = html;
+        gridOverlay.classList.remove("hidden");
+        gridOverlay.style.width = videoFeed.width + "px";
+        gridOverlay.style.height = videoFeed.height + "px";
+      }
+
+      function openCameraFullscreen(gridImageSrc, cellIndex, rows, cols) {
+        // Open the grid image in fullscreen with indication of which cell is selected
+        const label = `Grid Camera ${cellIndex + 1} (${Math.floor(cellIndex / cols) + 1}x${cellIndex % cols + 1})`;
+        openFullscreenZoom(gridImageSrc, label);
+      }
+
+      // Update grid overlay when switching modes or loading new image
+      const originalVideoFeedSrc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+      Object.defineProperty(videoFeed, 'src', {
+        set: function(value) {
+          originalVideoFeedSrc.set.call(this, value);
+          setupGridClickable();
+        },
+        get: function() {
+          return originalVideoFeedSrc.get.call(this);
+        }
+      });
+
+      // Also update when camera mode changes
+      const originalSwitchCamera = switchCamera;
+      window.switchCamera = async function(source) {
+        const result = await originalSwitchCamera(source);
+        setTimeout(setupGridClickable, 100);
+        return result;
+      };
+
+      // Keyboard support (fullscreen modal)
+      document.addEventListener("keydown", (e) => {
+        if (fullscreenZoomModal.classList.contains("hidden")) return;
+        if (!fsPZ) return;
+
+        if (e.key === "Escape") { closeFullscreenZoom(); return; }
+        if (e.key === "+" || e.key === "=") fsPZ.zoomBy(+fsPZ.step);
+        else if (e.key === "-" || e.key === "_") fsPZ.zoomBy(-fsPZ.step);
+        else if (e.key === "0") fsPZ.reset();
+      });
     </script>
   </body>
 </html>

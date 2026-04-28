@@ -95,9 +95,26 @@ class HeadDetector:
 
         import onnxruntime as ort
 
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        # Tune CUDA EP for many concurrent callers (40+ camera grid):
+        # - arena extend strategy keeps allocs cheap across calls
+        # - cudnn heuristic search is faster than exhaustive for tiny batches
+        provider_options = [
+            {
+                "arena_extend_strategy": "kSameAsRequested",
+                "cudnn_conv_algo_search": "HEURISTIC",
+                "do_copy_in_default_stream": "1",
+            },
+            {},
+        ]
+        providers = [
+            ("CUDAExecutionProvider", provider_options[0]),
+            "CPUExecutionProvider",
+        ]
         opts = ort.SessionOptions()
         opts.log_severity_level = 3  # suppress Memcpy/provider warnings
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        opts.enable_mem_pattern = True
         t0 = time.monotonic()
         self._session = ort.InferenceSession(
             self._model_path, sess_options=opts, providers=providers

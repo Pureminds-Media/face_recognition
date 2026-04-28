@@ -196,6 +196,26 @@ When `AUTO_CAPTURE_ENABLED=true`:
 
 This feature is designed for **small, controlled environments** (offices, labs). Disable it for large public spaces where dozens of strangers would quickly fill the 50-slot cap.
 
+## Maintenance
+
+### Clear all visit history
+
+The "Clear Visit Data" button is hidden in the UI to prevent accidental wipes. To wipe all recorded visits and sessions (keeps people, locations, and face images), run one of the following with the Flask server **stopped**:
+
+```bash
+# Option 1 — direct SQLite (fastest, no Python needed):
+sqlite3 face_recognition.db "DELETE FROM visits; DELETE FROM sessions; VACUUM;"
+
+# Option 2 — via the Python helper (same code path the API used):
+python3 -c "import db; print(db.clear_all_data(), 'visits deleted')"
+```
+
+If the server is running, you can also call the API directly:
+
+```bash
+curl -X POST http://localhost:5000/api/history/clear
+```
+
 ## Troubleshooting
 
 **Webcam won't open** — Close other apps using the camera. Try a different `cam_index`.

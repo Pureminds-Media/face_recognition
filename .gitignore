@@ -190,6 +190,9 @@ cython_debug/
 # Grid config (machine-specific camera assignments)
 grid_config.json
 
+# IP camera list (per-deployment, may contain credentials)
+ip_cameras.json
+
 # SQLite database
 *.db
 *.db-shm
@@ -207,3 +210,6 @@ models/
 
 # QR test artifacts
 qr_test/
+
+# Codex local artifacts
+.codex

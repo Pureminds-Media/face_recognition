@@ -1,0 +1,1575 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Settings</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+
+  <body class="bg-slate-950 text-slate-100">
+    <div class="min-h-screen">
+      <!-- Header -->
+      <div class="border-b border-slate-800">
+        <div class="mx-auto max-w-6xl px-4 py-4 flex items-center justify-between">
+          <div>
+            <div class="text-xl font-semibold">Face Recognition</div>
+            <div class="text-slate-400 text-sm">Settings</div>
+          </div>
+          <div class="flex gap-2">
+            <a
+              href="/"
+              class="rounded-lg bg-slate-800 hover:bg-slate-700 px-3 py-2 text-sm"
+            >
+              Home
+            </a>
+            <a
+              href="/settings"
+              class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium"
+            >
+              Settings
+            </a>
+          </div>
+        </div>
+      </div>
+
+      <div class="mx-auto max-w-6xl px-4 py-6 flex gap-6">
+          <!-- Sidebar -->
+          <aside class="w-48 shrink-0">
+            <nav class="space-y-1 sticky top-4">
+              <button
+                class="section-btn w-full text-left rounded-lg px-3 py-2 text-sm font-medium bg-slate-800 text-emerald-400"
+                data-section="people"
+              >
+                People
+              </button>
+              <button
+                class="section-btn w-full text-left rounded-lg px-3 py-2 text-sm font-medium text-slate-300 hover:bg-slate-800"
+                data-section="camera"
+              >
+                Camera
+              </button>
+            </nav>
+          </aside>
+
+          <div class="flex-1 min-w-0">
+
+          <!-- ================= PEOPLE SECTION ================= -->
+          <div id="section-people" class="section-content">
+            <!-- Add image -->
+            <div class="rounded-xl border border-slate-800 bg-slate-900 mb-6">
+              <div class="px-4 py-3 border-b border-slate-800">
+                <div class="font-medium">Add image</div>
+                <div class="text-xs text-slate-400">
+                  Saves as 1.jpg, 2.jpg, … in faces/&lt;person&gt;/
+                </div>
+              </div>
+
+              <form
+                id="uploadForm"
+                class="p-4 grid grid-cols-1 md:grid-cols-2 gap-4"
+                enctype="multipart/form-data"
+              >
+                <div class="space-y-2">
+                  <div class="text-sm text-slate-300">Person</div>
+                  <div class="flex items-center gap-3">
+                    <label class="flex items-center gap-2 text-sm">
+                      <input type="radio" name="mode" value="existing" checked class="accent-emerald-500" />
+                      Existing
+                    </label>
+                    <label class="flex items-center gap-2 text-sm">
+                      <input type="radio" name="mode" value="new" class="accent-emerald-500" />
+                      New
+                    </label>
+                  </div>
+
+                  <select
+                    id="existingName"
+                    name="existing_name"
+                    class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm"
+                  ></select>
+
+                  <input
+                    id="newName"
+                    name="new_name"
+                    placeholder="e.g. Ahmed_AlQahtani"
+                    class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm hidden"
+                  />
+                  <div id="nameValidation" class="text-xs text-red-400 hidden"></div>
+                  <div class="text-xs text-slate-400">
+                    Folder names are sanitized (letters/numbers/_-).
+                  </div>
+                </div>
+
+                <div class="space-y-2">
+                  <div class="text-sm text-slate-300">Image</div>
+                  <div class="flex items-center gap-2">
+                    <input
+                      name="file"
+                      id="fileInput"
+                      type="file"
+                      accept="image/*"
+                      required
+                      class="flex-1 min-w-0 text-sm text-slate-200 file:mr-3 file:rounded-lg file:border-0 file:bg-slate-800 file:px-3 file:py-2 file:text-sm file:text-slate-100 hover:file:bg-slate-700"
+                    />
+                    <button
+                      type="button"
+                      onclick="openCaptureModal()"
+                      class="shrink-0 rounded-lg bg-slate-800 hover:bg-slate-700 p-2 text-slate-300 hover:text-white transition-colors"
+                      title="Take photo with camera"
+                    >
+                      <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"/>
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z"/>
+                      </svg>
+                    </button>
+                  </div>
+
+                  <button
+                    type="submit"
+                    id="uploadBtn"
+                    class="w-full rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    Upload
+                  </button>
+
+                  <div id="uploadProgress" class="hidden space-y-1">
+                    <div class="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+                      <div id="uploadProgressBar" class="h-full rounded-full bg-emerald-500 transition-all duration-200" style="width: 0%"></div>
+                    </div>
+                    <div id="uploadProgressText" class="text-xs text-slate-400 text-center">0%</div>
+                  </div>
+
+                  <div id="uploadMsg" class="text-xs text-slate-300"></div>
+                </div>
+              </form>
+            </div>
+
+            <div class="flex items-center justify-between mb-3">
+              <div class="text-slate-400 text-sm" id="statsText">Loading...</div>
+            </div>
+
+            <div id="mergeBar" class="hidden flex flex-wrap items-center gap-2 mb-4 p-3 rounded-lg border border-slate-800 bg-slate-900 text-sm">
+              <span id="mergeSelCount" class="text-slate-300">0 selected</span>
+              <span class="flex-1"></span>
+              <label class="text-slate-400">Merge into:</label>
+              <select id="mergeTarget" class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-white text-xs"></select>
+              <span class="text-slate-500 text-xs">or new:</span>
+              <input id="mergeNewName" type="text" placeholder="new person name"
+                class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-white text-xs w-40" />
+              <button onclick="submitMerge()" class="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-xs font-medium">Merge</button>
+              <button onclick="clearPersonSelection()" class="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs">Clear</button>
+            </div>
+
+            <div id="peopleGrid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+              <!-- Cards rendered by JS -->
+            </div>
+
+            <div id="emptyState" class="hidden text-center py-20">
+              <div class="text-slate-500 text-lg">No people enrolled yet</div>
+              <div class="text-slate-600 text-sm mt-2">Use the form above to upload face images</div>
+            </div>
+          </div>
+
+          <!-- ================= CAMERA SECTION ================= -->
+          <div id="section-camera" class="section-content hidden space-y-6">
+            <!-- IP Cameras -->
+            <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-hidden">
+              <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between gap-3">
+                <div>
+                  <div class="font-medium">IP Cameras</div>
+                  <div class="text-xs text-slate-400">Group cameras under a shared RTSP base (e.g. an NVR). Add channels by number, or use the "Standalone" group for one-off URLs. All edits auto-save.</div>
+                </div>
+                <button
+                  id="addGroupBtn"
+                  type="button"
+                  class="shrink-0 rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium"
+                >
+                  + Add Group
+                </button>
+              </div>
+              <div class="p-4 space-y-4">
+                <div id="ipCamMsg" class="text-xs"></div>
+                <div id="ipCamGroups" class="space-y-4">
+                  <div class="text-slate-500 text-xs text-center py-6">Loading...</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+        </div>
+      </div>
+
+    <!-- ============ PEOPLE MODALS ============ -->
+
+    <!-- Rename Modal -->
+    <div id="renameModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+      <div class="bg-slate-900 border border-slate-700 rounded-xl p-6 w-full max-w-md mx-4">
+        <h3 class="text-lg font-semibold mb-4">Rename Person</h3>
+        <div class="mb-3">
+          <label class="block text-sm text-slate-400 mb-1">Current name</label>
+          <div id="renameOldName" class="text-white font-mono bg-slate-800 rounded px-3 py-2"></div>
+        </div>
+        <div class="mb-4">
+          <label class="block text-sm text-slate-400 mb-1">New name</label>
+          <input
+            id="renameNewName"
+            type="text"
+            class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500"
+            placeholder="e.g. john_doe"
+            maxlength="64"
+          />
+          <div id="renameError" class="text-red-400 text-sm mt-1 hidden"></div>
+        </div>
+        <div class="flex gap-3 justify-end">
+          <button
+            onclick="closeRenameModal()"
+            class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm"
+          >
+            Cancel
+          </button>
+          <button
+            id="renameSubmitBtn"
+            onclick="submitRename()"
+            class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-sm font-medium"
+          >
+            Rename
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Delete Confirm Modal -->
+    <div id="deleteModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+      <div class="bg-slate-900 border border-slate-700 rounded-xl p-6 w-full max-w-md mx-4">
+        <h3 class="text-lg font-semibold mb-2 text-red-400">Delete Person</h3>
+        <p class="text-slate-300 mb-1">Are you sure you want to delete <span id="deletePersonName" class="font-mono font-semibold text-white"></span>?</p>
+        <p class="text-slate-500 text-sm mb-4">This will remove all face images and visit history for this person. This action cannot be undone.</p>
+        <div class="flex gap-3 justify-end">
+          <button
+            onclick="closeDeleteModal()"
+            class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm"
+          >
+            Cancel
+          </button>
+          <button
+            id="deleteSubmitBtn"
+            onclick="submitDelete()"
+            class="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-500 text-sm font-medium"
+          >
+            Delete
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Image Gallery Modal -->
+    <div id="galleryModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+      <div class="bg-slate-900 border border-slate-700 rounded-xl p-6 w-full max-w-3xl mx-4 max-h-[80vh] overflow-y-auto">
+        <div class="flex items-center justify-between mb-4">
+          <h3 class="text-lg font-semibold"><span id="galleryPersonName"></span> &mdash; Face Images</h3>
+          <button onclick="closeGalleryModal()" class="text-slate-400 hover:text-white text-xl">&times;</button>
+        </div>
+        <div class="flex flex-wrap items-center gap-2 mb-3 text-xs">
+          <button onclick="gallerySelectAll()" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700">Select all</button>
+          <button onclick="gallerySelectClear()" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700">Clear</button>
+          <span id="gallerySelCount" class="text-slate-400">0 selected</span>
+          <span class="flex-1"></span>
+          <button id="galleryBulkMoveBtn" onclick="openBulkTransferModal()" disabled
+            class="px-3 py-1 rounded bg-blue-700 hover:bg-blue-600 disabled:bg-slate-800 disabled:text-slate-600">Move selected</button>
+          <button id="galleryBulkDelBtn" onclick="bulkDeleteImages()" disabled
+            class="px-3 py-1 rounded bg-red-700 hover:bg-red-600 disabled:bg-slate-800 disabled:text-slate-600">Delete selected</button>
+        </div>
+        <div id="galleryImages" class="grid grid-cols-2 sm:grid-cols-3 gap-3">
+          <!-- Images rendered by JS -->
+        </div>
+      </div>
+    </div>
+
+    <!-- Transfer Image Modal -->
+    <div id="transferModal" class="hidden fixed inset-0 z-[60] flex items-center justify-center bg-black/60">
+      <div class="bg-slate-900 border border-slate-700 rounded-xl p-6 w-full max-w-md mx-4">
+        <h3 class="text-lg font-semibold mb-3">Transfer Image</h3>
+        <div class="mb-3">
+          <div class="text-sm text-slate-400 mb-1">Moving image from <span id="transferFrom" class="font-mono text-white"></span></div>
+          <img id="transferPreview" class="w-24 h-24 object-cover rounded border border-slate-600 mt-1" />
+        </div>
+        <div class="mb-4">
+          <label class="block text-sm text-slate-400 mb-1">Transfer to</label>
+          <select
+            id="transferTarget"
+            class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500"
+          >
+            <!-- Options rendered by JS -->
+          </select>
+          <div class="mt-2">
+            <label class="block text-xs text-slate-500 mb-1">Or create new person</label>
+            <input
+              id="transferNewName"
+              type="text"
+              class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500"
+              placeholder="e.g. john_doe"
+              maxlength="64"
+            />
+          </div>
+          <div id="transferError" class="text-red-400 text-sm mt-2 hidden"></div>
+        </div>
+        <div class="flex gap-3 justify-end">
+          <button
+            onclick="closeTransferModal()"
+            class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm"
+          >
+            Cancel
+          </button>
+          <button
+            id="transferSubmitBtn"
+            onclick="submitTransfer()"
+            class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-sm font-medium"
+          >
+            Transfer
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast container -->
+    <div id="toastContainer" class="fixed top-4 right-4 z-50 space-y-2"></div>
+
+    <!-- Camera Capture Modal -->
+    <div id="captureModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
+      <div class="relative bg-slate-900 rounded-xl border border-slate-700 shadow-2xl p-4 max-w-lg w-full mx-4 space-y-3">
+        <div class="flex items-center justify-between">
+          <div class="text-sm font-medium">Take Photo</div>
+          <button onclick="closeCaptureModal()" class="text-slate-400 hover:text-red-400 text-xl font-bold transition-colors">&times;</button>
+        </div>
+        <select id="captureDeviceSelect" onchange="switchCaptureCamera()"
+          class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm">
+        </select>
+        <div id="captureCamMsg" class="text-xs text-yellow-400 hidden"></div>
+        <div class="relative rounded-lg overflow-hidden bg-black aspect-video">
+          <video id="capturePreview" autoplay playsinline
+            class="w-full h-full object-cover" style="transform: scaleX(-1)"></video>
+        </div>
+        <canvas id="captureCanvas" class="hidden"></canvas>
+        <button type="button" onclick="capturePhoto()"
+          class="w-full rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium">
+          Capture
+        </button>
+      </div>
+    </div>
+
+    <script>
+      /* ===================== Section toggle ===================== */
+      document.querySelectorAll(".section-btn").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          document.querySelectorAll(".section-btn").forEach((b) => {
+            b.classList.remove("bg-slate-800", "text-emerald-400");
+            b.classList.add("text-slate-300", "hover:bg-slate-800");
+          });
+          btn.classList.remove("text-slate-300", "hover:bg-slate-800");
+          btn.classList.add("bg-slate-800", "text-emerald-400");
+
+          document.querySelectorAll(".section-content").forEach((c) => c.classList.add("hidden"));
+          const target = document.getElementById("section-" + btn.dataset.section);
+          if (target) target.classList.remove("hidden");
+
+          // Load IP cameras when Camera tab is opened
+          if (btn.dataset.section === "camera" && typeof loadIpCameras === "function") {
+            loadIpCameras();
+          }
+        });
+      });
+
+      /* ===================== PEOPLE ===================== */
+      let _people = [];
+      let _renameTarget = null;
+      let _deleteTarget = null;
+      let _galleryPerson = null;
+      let _transferSource = null;
+
+      let _knownPeopleNames = [];
+
+      async function loadPeople() {
+        try {
+          const res = await fetch("/api/people");
+          const data = await res.json();
+          _people = data.people || [];
+          _knownPeopleNames = _people.map(p => p.name.toLowerCase());
+          // Prune selections for people that no longer exist
+          if (typeof _selectedPeople !== "undefined") {
+            const live = new Set(_people.map(p => p.name));
+            Array.from(_selectedPeople).forEach(n => { if (!live.has(n)) _selectedPeople.delete(n); });
+            _updateMergeBar();
+          }
+
+          // Populate upload form's existing-name dropdown
+          const existingSelect = document.getElementById("existingName");
+          if (existingSelect) {
+            existingSelect.innerHTML = _people.length
+              ? _people.map((p) => `<option value="${p.name}">${p.name} (${p.count})</option>`).join("")
+              : `<option value="">(no people yet)</option>`;
+          }
+
+          renderPeople();
+        } catch (e) {
+          console.error("Failed to load people:", e);
+        }
+      }
+
+      let _selectedPeople = new Set();
+
+      function togglePersonSelection(name) {
+        if (_selectedPeople.has(name)) _selectedPeople.delete(name);
+        else _selectedPeople.add(name);
+        renderPeople();
+        _updateMergeBar();
+      }
+      function clearPersonSelection() {
+        _selectedPeople.clear();
+        renderPeople();
+        _updateMergeBar();
+      }
+      function _updateMergeBar() {
+        const bar = document.getElementById("mergeBar");
+        const cnt = document.getElementById("mergeSelCount");
+        const sel = document.getElementById("mergeTarget");
+        const n = _selectedPeople.size;
+        if (n < 1) { bar.classList.add("hidden"); return; }
+        bar.classList.remove("hidden");
+        cnt.textContent = `${n} selected`;
+        // Target options: every person (including selected ones — picking a
+        // selected folder makes it the keeper, others merge into it).
+        sel.innerHTML = _people.length
+          ? _people.map(p => {
+              const tag = _selectedPeople.has(p.name) ? " — keep" : "";
+              return `<option value="${p.name}">${p.name} (${p.count})${tag}</option>`;
+            }).join("")
+          : `<option value="" disabled>(no people yet — use "or new" field)</option>`;
+      }
+      async function submitMerge() {
+        const newName = document.getElementById("mergeNewName").value.trim();
+        const sel = document.getElementById("mergeTarget").value;
+        const target = newName || sel;
+        if (!target) { alert("Pick a target or enter a new name"); return; }
+        // Effective sources = selected minus the chosen keeper.
+        const sources = Array.from(_selectedPeople).filter(n => n !== target);
+        if (sources.length < 1) {
+          alert("Select at least one source folder to merge into the target.");
+          return;
+        }
+        if (!confirm(`Merge ${sources.length} folder(s) into "${target}"?`)) return;
+        try {
+          const res = await fetch("/api/people/merge", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sources, target }),
+          });
+          const data = await res.json();
+          if (!data.ok) { alert(data.error || "Merge failed"); return; }
+          _selectedPeople.clear();
+          document.getElementById("mergeNewName").value = "";
+          await loadPeople();
+        } catch (e) { alert("Network error"); }
+      }
+
+      function renderPeople() {
+        const grid = document.getElementById("peopleGrid");
+        const empty = document.getElementById("emptyState");
+        const stats = document.getElementById("statsText");
+
+        if (_people.length === 0) {
+          grid.classList.add("hidden");
+          empty.classList.remove("hidden");
+          stats.textContent = "0 people enrolled";
+          return;
+        }
+
+        grid.classList.remove("hidden");
+        empty.classList.add("hidden");
+
+        const unknowns = _people.filter(p => p.name.match(/^unknown_\d+$/)).length;
+        const known = _people.length - unknowns;
+        let statsStr = `${_people.length} people enrolled`;
+        if (unknowns > 0) {
+          statsStr += ` (${known} known, ${unknowns} auto-captured)`;
+        }
+        stats.textContent = statsStr;
+
+        grid.innerHTML = _people.map(p => {
+          const isUnknown = /^unknown_\d+$/.test(p.name);
+          const borderColor = isUnknown ? "border-amber-500/50" : "border-slate-700";
+          const badge = isUnknown
+            ? `<span class="ml-2 text-xs bg-amber-500/20 text-amber-400 px-2 py-0.5 rounded-full">auto</span>`
+            : "";
+
+          const checked = _selectedPeople.has(p.name) ? "checked" : "";
+          const ringCls = _selectedPeople.has(p.name) ? "ring-2 ring-emerald-500" : "";
+          return `
+            <div class="bg-slate-900 border ${borderColor} rounded-xl overflow-hidden relative ${ringCls}">
+              <label class="absolute top-2 left-2 z-10 bg-slate-900/80 rounded px-1 py-0.5 cursor-pointer">
+                <input type="checkbox" ${checked} onchange="togglePersonSelection('${p.name}')" class="align-middle" />
+              </label>
+              <div class="cursor-pointer" onclick="openGallery('${p.name}')">
+                ${p.thumbnail_url
+                  ? `<img src="${p.thumbnail_url}" alt="${p.name}" class="w-full h-48 object-cover bg-slate-800" />`
+                  : `<div class="w-full h-48 bg-slate-800 flex items-center justify-center text-slate-600">No image</div>`
+                }
+              </div>
+              <div class="p-3">
+                <div class="flex items-center justify-between mb-2">
+                  <div class="flex items-center">
+                    <span class="font-mono text-sm font-medium truncate max-w-[140px]" title="${p.name}">${p.name}</span>
+                    ${badge}
+                  </div>
+                  <span class="text-xs text-slate-500">${p.count} image${p.count !== 1 ? "s" : ""}</span>
+                </div>
+                <div class="flex gap-2">
+                  <button
+                    onclick="openRenameModal('${p.name}')"
+                    class="flex-1 text-center px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-xs text-slate-300"
+                  >
+                    Rename
+                  </button>
+                  <button
+                    onclick="openDeleteModal('${p.name}')"
+                    class="px-2 py-1.5 rounded bg-slate-800 hover:bg-red-900/50 text-xs text-red-400"
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+            </div>
+          `;
+        }).join("");
+      }
+
+      function openRenameModal(name) {
+        _renameTarget = name;
+        document.getElementById("renameOldName").textContent = name;
+        document.getElementById("renameNewName").value = "";
+        document.getElementById("renameError").classList.add("hidden");
+        document.getElementById("renameModal").classList.remove("hidden");
+        setTimeout(() => document.getElementById("renameNewName").focus(), 100);
+      }
+
+      function closeRenameModal() {
+        document.getElementById("renameModal").classList.add("hidden");
+        _renameTarget = null;
+      }
+
+      async function submitRename() {
+        const newName = document.getElementById("renameNewName").value.trim();
+        const errEl = document.getElementById("renameError");
+        const btn = document.getElementById("renameSubmitBtn");
+
+        if (!newName) {
+          errEl.textContent = "Name cannot be empty";
+          errEl.classList.remove("hidden");
+          return;
+        }
+
+        btn.disabled = true;
+        btn.textContent = "Renaming...";
+
+        try {
+          const res = await fetch("/api/rename_person", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ old_name: _renameTarget, new_name: newName }),
+          });
+          const data = await res.json();
+
+          if (!data.ok) {
+            errEl.textContent = data.error || "Rename failed";
+            errEl.classList.remove("hidden");
+            return;
+          }
+
+          closeRenameModal();
+          loadPeople();
+        } catch (e) {
+          errEl.textContent = "Network error";
+          errEl.classList.remove("hidden");
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "Rename";
+        }
+      }
+
+      function openDeleteModal(name) {
+        _deleteTarget = name;
+        document.getElementById("deletePersonName").textContent = name;
+        document.getElementById("deleteModal").classList.remove("hidden");
+      }
+
+      function closeDeleteModal() {
+        document.getElementById("deleteModal").classList.add("hidden");
+        _deleteTarget = null;
+      }
+
+      async function submitDelete() {
+        const btn = document.getElementById("deleteSubmitBtn");
+        btn.disabled = true;
+        btn.textContent = "Deleting...";
+
+        try {
+          const res = await fetch(`/api/person/${encodeURIComponent(_deleteTarget)}`, {
+            method: "DELETE",
+          });
+          const data = await res.json();
+
+          if (!data.ok) {
+            alert(data.error || "Delete failed");
+            return;
+          }
+
+          closeDeleteModal();
+          loadPeople();
+        } catch (e) {
+          alert("Network error");
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "Delete";
+        }
+      }
+
+      async function openGallery(name) {
+        _galleryPerson = name;
+        document.getElementById("galleryPersonName").textContent = name;
+        document.getElementById("galleryImages").innerHTML = `
+          <div class="col-span-full text-center text-slate-500 py-8">Loading...</div>
+        `;
+        document.getElementById("galleryModal").classList.remove("hidden");
+        await refreshGallery(name);
+      }
+
+      let _gallerySelected = new Set();
+
+      function _updateGalleryToolbar() {
+        const n = _gallerySelected.size;
+        document.getElementById("gallerySelCount").textContent = `${n} selected`;
+        document.getElementById("galleryBulkMoveBtn").disabled = n === 0;
+        document.getElementById("galleryBulkDelBtn").disabled = n === 0;
+      }
+      function _toggleGallerySel(filename) {
+        if (_gallerySelected.has(filename)) _gallerySelected.delete(filename);
+        else _gallerySelected.add(filename);
+        const card = document.querySelector(`[data-img-card="${CSS.escape(filename)}"]`);
+        if (card) {
+          const on = _gallerySelected.has(filename);
+          card.classList.toggle("ring-2", on);
+          card.classList.toggle("ring-emerald-500", on);
+          const cb = card.querySelector("input[type=checkbox]");
+          if (cb) cb.checked = on;
+        }
+        _updateGalleryToolbar();
+      }
+      function gallerySelectAll() {
+        document.querySelectorAll("[data-img-card]").forEach(el => {
+          const fn = el.getAttribute("data-img-card");
+          if (!_gallerySelected.has(fn)) _toggleGallerySel(fn);
+        });
+      }
+      function gallerySelectClear() {
+        Array.from(_gallerySelected).forEach(fn => _toggleGallerySel(fn));
+      }
+
+      async function refreshGallery(name) {
+        try {
+          const res = await fetch(`/api/person/${encodeURIComponent(name)}/images`);
+          const data = await res.json();
+
+          _gallerySelected.clear();
+          _updateGalleryToolbar();
+
+          if (!data.ok || !data.images.length) {
+            document.getElementById("galleryImages").innerHTML = `
+              <div class="col-span-full text-center text-slate-500 py-8">No images</div>
+            `;
+            return;
+          }
+
+          document.getElementById("galleryImages").innerHTML = data.images.map(img => `
+            <div data-img-card="${img.filename}" class="rounded-lg overflow-hidden border border-slate-700 group relative">
+              <label class="absolute top-1 left-1 z-10 bg-slate-900/80 rounded px-1 py-0.5 cursor-pointer">
+                <input type="checkbox" onchange="_toggleGallerySel('${img.filename}')" class="align-middle" />
+              </label>
+              <img src="${img.url}?t=${Date.now()}" alt="${img.filename}"
+                   onclick="_toggleGallerySel('${img.filename}')"
+                   class="w-full h-40 object-cover bg-slate-800 cursor-pointer" />
+              <div class="px-2 py-1.5 flex items-center justify-between bg-slate-800/50">
+                <span class="text-xs text-slate-500">${img.filename}</span>
+                <div class="flex gap-1">
+                  <button
+                    onclick="openTransferModal('${name}', '${img.filename}', '${img.url}')"
+                    class="px-2 py-1 rounded text-xs bg-slate-700 hover:bg-blue-600 text-slate-300 hover:text-white transition-colors"
+                    title="Transfer to another person"
+                  >
+                    Move
+                  </button>
+                  <button
+                    onclick="deleteImage('${name}', '${img.filename}')"
+                    class="px-2 py-1 rounded text-xs bg-slate-700 hover:bg-red-600 text-slate-300 hover:text-white transition-colors"
+                    title="Delete this image"
+                  >
+                    Del
+                  </button>
+                </div>
+              </div>
+            </div>
+          `).join("");
+        } catch (e) {
+          document.getElementById("galleryImages").innerHTML = `
+            <div class="col-span-full text-center text-red-400 py-8">Failed to load images</div>
+          `;
+        }
+      }
+
+      async function bulkDeleteImages() {
+        if (!_galleryPerson || _gallerySelected.size === 0) return;
+        const filenames = Array.from(_gallerySelected);
+        if (!confirm(`Delete ${filenames.length} image(s) from ${_galleryPerson}?`)) return;
+        try {
+          const res = await fetch(`/api/person/${encodeURIComponent(_galleryPerson)}/images/bulk_delete`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ filenames }),
+          });
+          const data = await res.json();
+          if (!data.ok) { alert(data.error || "Bulk delete failed"); return; }
+          if (data.person_removed) { closeGalleryModal(); }
+          else { await refreshGallery(_galleryPerson); }
+          loadPeople();
+        } catch (e) { alert("Network error"); }
+      }
+
+      function openBulkTransferModal() {
+        if (!_galleryPerson || _gallerySelected.size === 0) return;
+        // Reuse the existing transfer modal but flag that it's a bulk op.
+        _transferSource = { person: _galleryPerson, filename: null, url: "", bulk: true,
+                            filenames: Array.from(_gallerySelected) };
+        document.getElementById("transferFrom").textContent =
+          `${_galleryPerson} (${_gallerySelected.size} images)`;
+        document.getElementById("transferPreview").src = "";
+        document.getElementById("transferPreview").classList.add("hidden");
+        document.getElementById("transferNewName").value = "";
+        document.getElementById("transferError").classList.add("hidden");
+
+        const select = document.getElementById("transferTarget");
+        const others = _people.filter(p => p.name !== _galleryPerson);
+        select.innerHTML = others.length
+          ? others.map(p => `<option value="${p.name}">${p.name} (${p.count} images)</option>`).join("")
+          : `<option value="" disabled>No other people</option>`;
+
+        document.getElementById("transferModal").classList.remove("hidden");
+      }
+
+      function closeGalleryModal() {
+        document.getElementById("galleryModal").classList.add("hidden");
+        _galleryPerson = null;
+      }
+
+      async function deleteImage(person, filename) {
+        if (!confirm(`Delete ${filename} from ${person}?`)) return;
+
+        try {
+          const res = await fetch(
+            `/api/person/${encodeURIComponent(person)}/image/${encodeURIComponent(filename)}`,
+            { method: "DELETE" }
+          );
+          const data = await res.json();
+
+          if (!data.ok) {
+            alert(data.error || "Delete failed");
+            return;
+          }
+
+          if (data.person_removed) {
+            closeGalleryModal();
+            loadPeople();
+          } else {
+            await refreshGallery(person);
+            loadPeople();
+          }
+        } catch (e) {
+          alert("Network error");
+        }
+      }
+
+      function openTransferModal(person, filename, url) {
+        _transferSource = { person, filename, url, bulk: false };
+        document.getElementById("transferFrom").textContent = person;
+        document.getElementById("transferPreview").classList.remove("hidden");
+        document.getElementById("transferPreview").src = url;
+        document.getElementById("transferNewName").value = "";
+        document.getElementById("transferError").classList.add("hidden");
+
+        const select = document.getElementById("transferTarget");
+        const others = _people.filter(p => p.name !== person);
+        select.innerHTML = others.length
+          ? others.map(p => `<option value="${p.name}">${p.name} (${p.count} images)</option>`).join("")
+          : `<option value="" disabled>No other people</option>`;
+
+        document.getElementById("transferModal").classList.remove("hidden");
+      }
+
+      function closeTransferModal() {
+        document.getElementById("transferModal").classList.add("hidden");
+        _transferSource = null;
+      }
+
+      async function submitTransfer() {
+        if (!_transferSource) return;
+
+        const srcPerson = _transferSource.person;
+        const srcFilename = _transferSource.filename;
+        const newName = document.getElementById("transferNewName").value.trim();
+        const selectVal = document.getElementById("transferTarget").value;
+        const target = newName || selectVal;
+        const errEl = document.getElementById("transferError");
+        const btn = document.getElementById("transferSubmitBtn");
+
+        if (!target) {
+          errEl.textContent = "Select a target person or enter a new name";
+          errEl.classList.remove("hidden");
+          return;
+        }
+
+        btn.disabled = true;
+        btn.textContent = "Transferring...";
+
+        try {
+          const isBulk = !!_transferSource.bulk;
+          const url = isBulk
+            ? `/api/person/${encodeURIComponent(srcPerson)}/images/bulk_transfer`
+            : `/api/person/${encodeURIComponent(srcPerson)}/image/${encodeURIComponent(srcFilename)}/transfer`;
+          const body = isBulk
+            ? { target, filenames: _transferSource.filenames }
+            : { target };
+          const res = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          const data = await res.json();
+
+          if (!data.ok) {
+            errEl.textContent = data.error || "Transfer failed";
+            errEl.classList.remove("hidden");
+            return;
+          }
+
+          closeTransferModal();
+
+          if (data.person_removed) {
+            closeGalleryModal();
+          } else {
+            await refreshGallery(srcPerson);
+          }
+          loadPeople();
+        } catch (e) {
+          errEl.textContent = "Network error";
+          errEl.classList.remove("hidden");
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "Transfer";
+        }
+      }
+
+      /* ===================== Keyboard shortcuts ===================== */
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") {
+          if (_transferSource) { closeTransferModal(); return; }
+          closeRenameModal();
+          closeDeleteModal();
+          closeGalleryModal();
+        }
+        if (e.key === "Enter" && _renameTarget && !document.getElementById("renameModal").classList.contains("hidden")) {
+          submitRename();
+        }
+      });
+
+      /* ===================== Init ===================== */
+      loadPeople();
+      setInterval(loadPeople, 10000);
+
+      /* ===================== Toast ===================== */
+      const toastContainer = document.getElementById("toastContainer");
+      function toast(message, kind = "info") {
+        if (!toastContainer) return;
+        const el = document.createElement("div");
+        el.className = "rounded-lg border border-slate-700 bg-slate-900/95 px-3 py-2 text-sm shadow-lg";
+        if (kind === "success") el.classList.add("border-emerald-700");
+        if (kind === "warn") el.classList.add("border-amber-700");
+        el.textContent = message;
+        toastContainer.appendChild(el);
+        setTimeout(() => {
+          el.classList.add("opacity-0");
+          setTimeout(() => el.remove(), 250);
+        }, 2500);
+      }
+
+      /* ===================== Upload form ===================== */
+      const existingSelect = document.getElementById("existingName");
+      const newNameInput = document.getElementById("newName");
+      const nameValidation = document.getElementById("nameValidation");
+      const uploadMsg = document.getElementById("uploadMsg");
+      const uploadForm = document.getElementById("uploadForm");
+      const uploadBtn = document.getElementById("uploadBtn");
+      const uploadProgress = document.getElementById("uploadProgress");
+      const uploadProgressBar = document.getElementById("uploadProgressBar");
+      const uploadProgressText = document.getElementById("uploadProgressText");
+
+      function currentMode() {
+        return document.querySelector('input[name="mode"]:checked')?.value || "existing";
+      }
+
+      function setModeUI() {
+        const mode = currentMode();
+        if (!newNameInput || !existingSelect) return;
+        if (mode === "new") {
+          newNameInput.classList.remove("hidden");
+          existingSelect.classList.add("hidden");
+        } else {
+          newNameInput.classList.add("hidden");
+          existingSelect.classList.remove("hidden");
+        }
+      }
+
+      function sanitizeName(raw) {
+        return raw.trim().replace(/ /g, "_").replace(/[^A-Za-z0-9_\-]/g, "").slice(0, 64);
+      }
+
+      function validateNewName() {
+        if (!nameValidation) return true;
+        if (currentMode() !== "new") {
+          nameValidation.classList.add("hidden");
+          return true;
+        }
+        const sanitized = sanitizeName(newNameInput.value);
+        if (sanitized && _knownPeopleNames.includes(sanitized.toLowerCase())) {
+          nameValidation.textContent = `"${sanitized}" already exists. Use "Existing" to add more images.`;
+          nameValidation.classList.remove("hidden");
+          return false;
+        }
+        nameValidation.classList.add("hidden");
+        return true;
+      }
+
+      document.querySelectorAll('input[name="mode"]').forEach((r) => {
+        r.addEventListener("change", () => { setModeUI(); validateNewName(); });
+      });
+      if (newNameInput) newNameInput.addEventListener("input", validateNewName);
+
+      function _setProgress(pct) {
+        if (!uploadProgress || !uploadProgressBar || !uploadProgressText) return;
+        uploadProgress.classList.remove("hidden");
+        uploadProgressBar.style.width = pct + "%";
+        uploadProgressText.textContent = pct < 100 ? pct + "%" : "Processing...";
+      }
+      function _hideProgress() {
+        if (uploadProgress) uploadProgress.classList.add("hidden");
+        if (uploadProgressBar) uploadProgressBar.style.width = "0%";
+        if (uploadProgressText) uploadProgressText.textContent = "0%";
+      }
+      function _setUploading(busy) {
+        if (uploadBtn) {
+          uploadBtn.disabled = busy;
+          uploadBtn.textContent = busy ? "Uploading..." : "Upload";
+        }
+      }
+
+      if (uploadForm) {
+        uploadForm.onsubmit = async (e) => {
+          e.preventDefault();
+          if (!validateNewName()) {
+            if (uploadMsg) uploadMsg.textContent = "Fix the name error above first.";
+            return;
+          }
+          const fd = new FormData(e.target);
+          fd.set("mode", currentMode());
+          if (uploadMsg) { uploadMsg.textContent = ""; uploadMsg.className = "text-xs text-slate-300"; }
+          _setUploading(true);
+          _setProgress(0);
+
+          const xhr = new XMLHttpRequest();
+          xhr.upload.addEventListener("progress", (ev) => {
+            if (ev.lengthComputable) {
+              const pct = Math.round((ev.loaded / ev.total) * 100);
+              _setProgress(pct);
+            }
+          });
+          xhr.addEventListener("load", async () => {
+            _hideProgress();
+            _setUploading(false);
+            let j;
+            try { j = JSON.parse(xhr.responseText); } catch { j = {}; }
+            if (xhr.status < 200 || xhr.status >= 300) {
+              if (uploadMsg) {
+                uploadMsg.textContent = "Error: " + (j.error || "upload failed");
+                uploadMsg.className = "text-xs text-red-400";
+              }
+              return;
+            }
+            if (uploadMsg) {
+              uploadMsg.innerHTML =
+                '<span class="inline-flex items-center gap-1 text-emerald-400">' +
+                '<svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">' +
+                '<path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"/></svg>' +
+                'Saved to ' + (j.person || '') + '/</span>';
+              uploadMsg.className = "text-xs";
+            }
+            toast("Face image uploaded to " + (j.person || "folder"), "success");
+            await loadPeople();
+            uploadForm.reset();
+            setModeUI();
+            if (nameValidation) nameValidation.classList.add("hidden");
+            setTimeout(() => {
+              if (uploadMsg) { uploadMsg.textContent = ""; uploadMsg.className = "text-xs text-slate-300"; }
+            }, 4000);
+          });
+          xhr.addEventListener("error", () => {
+            _hideProgress();
+            _setUploading(false);
+            if (uploadMsg) {
+              uploadMsg.textContent = "Network error — check your connection.";
+              uploadMsg.className = "text-xs text-red-400";
+            }
+          });
+          xhr.addEventListener("abort", () => {
+            _hideProgress();
+            _setUploading(false);
+            if (uploadMsg) { uploadMsg.textContent = "Upload cancelled."; uploadMsg.className = "text-xs text-slate-300"; }
+          });
+          xhr.open("POST", "/api/upload_face");
+          xhr.send(fd);
+        };
+      }
+
+      setModeUI();
+
+      /* ===================== Capture modal ===================== */
+      let _captureStream = null;
+      let _engineCamIndices = [];
+
+      async function _fetchEngineCameras() {
+        try {
+          const r = await fetch('/api/camera');
+          const j = await r.json();
+          _engineCamIndices = (j.running && Array.isArray(j.active_cameras)) ? j.active_cameras : [];
+        } catch (_) {
+          _engineCamIndices = [];
+        }
+      }
+
+      function _cameraErrorMessage(err) {
+        const name = err.name || '';
+        if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+          return 'Camera permission denied. Please allow camera access in your browser.';
+        }
+        if (name === 'NotReadableError' || name === 'AbortError' || name === 'TrackStartError') {
+          return 'Camera is in use by another application (possibly the recognition engine). Try a different camera or stop the engine first.';
+        }
+        if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+          return 'No camera found on this device.';
+        }
+        if (name === 'OverconstrainedError') {
+          return 'Camera does not support the requested resolution.';
+        }
+        return 'Could not open camera: ' + (err.message || name);
+      }
+
+      async function openCaptureModal() {
+        const modal = document.getElementById('captureModal');
+        const select = document.getElementById('captureDeviceSelect');
+        const camMsg = document.getElementById('captureCamMsg');
+        if (camMsg) { camMsg.textContent = ''; camMsg.classList.add('hidden'); }
+        modal.classList.remove('hidden');
+        const engineProm = _fetchEngineCameras();
+        try {
+          const tempStream = await navigator.mediaDevices.getUserMedia({ video: true });
+          tempStream.getTracks().forEach(t => t.stop());
+        } catch (err) {
+          closeCaptureModal();
+          if (uploadMsg) uploadMsg.textContent = _cameraErrorMessage(err);
+          return;
+        }
+        await engineProm;
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const cameras = devices.filter(d => d.kind === 'videoinput');
+        select.innerHTML = cameras.map((d, i) => {
+          const label = d.label || 'Camera ' + i;
+          const idxMatch = label.match(/\b(\d+)\b/);
+          const inUse = idxMatch && _engineCamIndices.includes(parseInt(idxMatch[1]));
+          const suffix = inUse ? ' (in use by engine)' : '';
+          return `<option value="${d.deviceId}">${label}${suffix}</option>`;
+        }).join('');
+        if (_engineCamIndices.length > 0 && camMsg) {
+          camMsg.textContent = 'Note: The recognition engine is using camera ' +
+            _engineCamIndices.join(', ') + '. If a camera fails to open, try a different one or stop the engine first.';
+          camMsg.classList.remove('hidden');
+        }
+        if (cameras.length > 0) await switchCaptureCamera();
+      }
+
+      async function switchCaptureCamera() {
+        if (_captureStream) {
+          _captureStream.getTracks().forEach(t => t.stop());
+          _captureStream = null;
+        }
+        const select = document.getElementById('captureDeviceSelect');
+        const video = document.getElementById('capturePreview');
+        const camMsg = document.getElementById('captureCamMsg');
+        const deviceId = select.value;
+        if (!deviceId) return;
+        try {
+          _captureStream = await navigator.mediaDevices.getUserMedia({
+            video: { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+          });
+          video.srcObject = _captureStream;
+        } catch (err) {
+          video.srcObject = null;
+          if (camMsg) {
+            camMsg.textContent = _cameraErrorMessage(err);
+            camMsg.classList.remove('hidden');
+          }
+        }
+      }
+
+      function capturePhoto() {
+        const video = document.getElementById('capturePreview');
+        const canvas = document.getElementById('captureCanvas');
+        const fileInput = document.getElementById('fileInput');
+        if (!video.videoWidth) return;
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(video, 0, 0);
+        canvas.toBlob((blob) => {
+          if (!blob) return;
+          const file = new File([blob], 'capture.jpg', { type: 'image/jpeg' });
+          const dt = new DataTransfer();
+          dt.items.add(file);
+          fileInput.files = dt.files;
+          closeCaptureModal();
+          if (uploadMsg) uploadMsg.textContent = 'Photo captured. Click Upload to save.';
+        }, 'image/jpeg', 0.92);
+      }
+
+      function closeCaptureModal() {
+        if (_captureStream) {
+          _captureStream.getTracks().forEach(t => t.stop());
+          _captureStream = null;
+        }
+        const modal = document.getElementById('captureModal');
+        const video = document.getElementById('capturePreview');
+        video.srcObject = null;
+        modal.classList.add('hidden');
+      }
+
+      /* ===================== IP Cameras (multi-group, auto-save) ===================== */
+      const ipCamGroupsEl = document.getElementById("ipCamGroups");
+      const ipCamMsg = document.getElementById("ipCamMsg");
+      const addGroupBtn = document.getElementById("addGroupBtn");
+
+      const _saveTimers = new Map();        // key -> setTimeout id
+
+      function _ipCamMsg(text, kind = "info") {
+        if (!ipCamMsg) return;
+        ipCamMsg.textContent = text;
+        ipCamMsg.className = "text-xs " +
+          (kind === "error" ? "text-red-400" :
+           kind === "success" ? "text-emerald-400" : "text-slate-400");
+      }
+
+      function escapeHtml(s) {
+        return String(s ?? "").replace(/[&<>"']/g, c =>
+          ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+      }
+
+      function _saveIndicator(key) {
+        return `<span data-save-indicator="${escapeHtml(key)}" class="text-xs text-slate-500"></span>`;
+      }
+
+      function _setSaveIndicator(key, text, kind = "info") {
+        const el = ipCamGroupsEl.querySelector(`[data-save-indicator="${CSS.escape(key)}"]`);
+        if (!el) return;
+        el.textContent = text;
+        el.className = "text-xs " +
+          (kind === "error" ? "text-red-400" :
+           kind === "success" ? "text-emerald-400" : "text-slate-500");
+      }
+
+      function _scheduleSave(key, delay, fn) {
+        const prev = _saveTimers.get(key);
+        if (prev) clearTimeout(prev);
+        _saveTimers.set(key, setTimeout(fn, delay));
+      }
+
+      function _flushSave(key) {
+        const t = _saveTimers.get(key);
+        if (t) {
+          clearTimeout(t);
+          _saveTimers.delete(key);
+        }
+      }
+
+      function renderGroup(g) {
+        const isStandalone = !g.base_url;
+        const baseFieldKey = `group:${g.id}:base`;
+        const nameFieldKey = `group:${g.id}:name`;
+
+        const camRows = (g.cameras || []).length
+          ? g.cameras.map(c => renderCameraRow(g, c)).join("")
+          : `<tr><td colspan="3" class="px-3 py-3 text-center text-slate-500 text-xs">No cameras yet.</td></tr>`;
+
+        const addForm = isStandalone
+          ? `<form data-add-form data-group="${g.id}" data-mode="url"
+                class="grid grid-cols-1 md:grid-cols-[1fr_2fr_auto] gap-2 items-start mt-3">
+              <input data-field="name" type="text" placeholder="Name" maxlength="64"
+                class="rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm" />
+              <input data-field="url" type="text" placeholder="rtsp://..."
+                class="rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm font-mono" />
+              <button type="submit"
+                class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-4 py-2 text-sm font-medium">+ Add</button>
+            </form>`
+          : `<form data-add-form data-group="${g.id}" data-mode="channel"
+                class="grid grid-cols-1 md:grid-cols-[1fr_1fr_auto] gap-2 items-start mt-3">
+              <input data-field="name" type="text" placeholder="Name (e.g. Front Door)" maxlength="64"
+                class="rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm" />
+              <input data-field="channel" type="text" placeholder="Channel (e.g. 102)" maxlength="16"
+                class="rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm font-mono" />
+              <button type="submit"
+                class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-4 py-2 text-sm font-medium">+ Add</button>
+            </form>`;
+
+        return `
+          <div class="rounded-lg border border-slate-800 bg-slate-950/50" data-group-id="${g.id}">
+            <div class="px-3 py-3 border-b border-slate-800 flex items-center gap-2 flex-wrap">
+              <input data-group-field="name" data-key="${nameFieldKey}"
+                value="${escapeHtml(g.name)}" placeholder="Group name"
+                class="font-medium bg-transparent border-b border-slate-800 focus:border-slate-600 outline-none px-1 py-0.5 text-sm w-48" />
+              <input data-group-field="base_url" data-key="${baseFieldKey}"
+                value="${escapeHtml(g.base_url)}"
+                placeholder="rtsp://user:pass@host:554/Streaming/Channels/   (leave blank for standalone URLs)"
+                class="flex-1 min-w-64 bg-slate-950 border border-slate-800 rounded px-2 py-1 text-xs font-mono" />
+              ${_saveIndicator(`group:${g.id}`)}
+              <button type="button" data-group-action="delete"
+                class="rounded bg-slate-800 hover:bg-red-600 text-xs text-red-400 hover:text-white px-2 py-1">
+                Delete group
+              </button>
+            </div>
+            <div class="p-3">
+              <table class="w-full text-sm">
+                <thead>
+                  <tr class="border-b border-slate-800/50 text-slate-400 text-xs">
+                    <th class="px-2 py-1 text-left w-48">Name</th>
+                    <th class="px-2 py-1 text-left">${isStandalone ? "URL" : "Channel"}</th>
+                    <th class="px-2 py-1 text-right w-44">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>${camRows}</tbody>
+              </table>
+              ${addForm}
+            </div>
+          </div>
+        `;
+      }
+
+      function renderCameraRow(g, c) {
+        // Rule: the field we show matches the column header for the group.
+        // Standalone group (no base_url) → URL input.
+        // NVR-style group (base_url set) → Channel input. We preload the
+        // channel from c.url when the legacy data stored a channel-only
+        // value there; if c.url is a full URL that starts with the base,
+        // strip the base so the user sees just the channel suffix.
+        const isStandalone = !g.base_url;
+        let value, fieldName, placeholder, fieldKey;
+        if (isStandalone) {
+          fieldName = "url";
+          placeholder = "rtsp://...";
+          value = c.url || c.channel || "";
+          fieldKey = `cam:${c.id}:url`;
+        } else {
+          fieldName = "channel";
+          placeholder = "e.g. 102";
+          if (c.channel) {
+            value = c.channel;
+          } else if (c.url && c.url.startsWith(g.base_url)) {
+            value = c.url.slice(g.base_url.length);
+          } else {
+            value = c.url || "";
+          }
+          fieldKey = `cam:${c.id}:channel`;
+        }
+        return `<tr data-camera-id="${c.id}" data-group-id="${g.id}" data-resolved="${escapeHtml(c.resolved_url || "")}" class="border-b border-slate-800/30">
+          <td class="px-2 py-1">
+            <input data-cam-field="name" data-key="cam:${c.id}:name"
+              value="${escapeHtml(c.name)}" placeholder="Name"
+              class="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-sm" />
+          </td>
+          <td class="px-2 py-1">
+            <input data-cam-field="${fieldName}" data-key="${fieldKey}"
+              value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}"
+              class="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-sm font-mono" />
+          </td>
+          <td class="px-2 py-1 text-right whitespace-nowrap">
+            ${_saveIndicator(`cam:${c.id}`)}
+            <button type="button" data-cam-action="test"
+              class="ml-1 px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-medium">Test</button>
+            <button type="button" data-cam-action="delete"
+              class="ml-1 px-2 py-1 rounded bg-slate-800 hover:bg-red-600 text-xs text-red-400 hover:text-white">Delete</button>
+          </td>
+        </tr>`;
+      }
+
+      async function loadIpCameras() {
+        if (!ipCamGroupsEl) return;
+        try {
+          const r = await fetch("/api/ip_cameras");
+          const j = await r.json();
+          if (!j.ok) { _ipCamMsg(j.error || "Failed to load", "error"); return; }
+          const groups = j.groups || [];
+          if (!groups.length) {
+            ipCamGroupsEl.innerHTML = `<div class="text-slate-500 text-xs text-center py-6">No groups yet. Click "+ Add Group" to create one.</div>`;
+          } else {
+            ipCamGroupsEl.innerHTML = groups.map(renderGroup).join("");
+          }
+        } catch (e) {
+          ipCamGroupsEl.innerHTML = `<div class="text-red-400 text-xs text-center py-6">Failed to load: ${escapeHtml(String(e))}</div>`;
+        }
+      }
+
+      // ---- Auto-save handlers ----
+
+      async function _saveGroup(groupId, payload) {
+        const key = `group:${groupId}`;
+        _setSaveIndicator(key, "Saving...");
+        try {
+          const r = await fetch(`/api/ip_cameras/groups/${encodeURIComponent(groupId)}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const j = await r.json();
+          if (!j.ok) { _setSaveIndicator(key, j.error || "Save failed", "error"); return; }
+          _setSaveIndicator(key, "Saved", "success");
+          if (Object.prototype.hasOwnProperty.call(payload, "base_url")) {
+            await loadIpCameras();
+          }
+          setTimeout(() => _setSaveIndicator(key, ""), 1200);
+        } catch (_) {
+          _setSaveIndicator(key, "Network error", "error");
+        }
+      }
+
+      async function _saveCamera(camId, payload) {
+        const key = `cam:${camId}`;
+        _setSaveIndicator(key, "Saving...");
+        try {
+          const r = await fetch(`/api/ip_cameras/cameras/${encodeURIComponent(camId)}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const j = await r.json();
+          if (!j.ok) { _setSaveIndicator(key, j.error || "Save failed", "error"); return; }
+          _setSaveIndicator(key, "Saved", "success");
+          // Keep the row's resolved-URL up to date so the Test button picks
+          // the right URL after a name/channel/url change.
+          const tr = ipCamGroupsEl.querySelector(`tr[data-camera-id="${camId}"]`);
+          if (tr && j.camera && typeof j.camera.resolved_url === "string") {
+            tr.setAttribute("data-resolved", j.camera.resolved_url);
+          }
+          setTimeout(() => _setSaveIndicator(key, ""), 1200);
+        } catch (_) {
+          _setSaveIndicator(key, "Network error", "error");
+        }
+      }
+
+      function _onAutoSaveInput(e) {
+        const inp = e.target.closest("input[data-key]");
+        if (!inp) return;
+        const key = inp.dataset.key;
+        const tr = inp.closest("tr[data-camera-id]");
+        const groupRoot = inp.closest("[data-group-id]");
+        if (tr) {
+          const camId = tr.getAttribute("data-camera-id");
+          const field = inp.dataset.camField;
+          const value = inp.value.trim();
+          _scheduleSave(key, 600, () => {
+            _saveTimers.delete(key);
+            _saveCamera(camId, { [field]: value });
+          });
+        } else if (groupRoot && inp.dataset.groupField) {
+          const groupId = groupRoot.getAttribute("data-group-id");
+          const field = inp.dataset.groupField;
+          const value = inp.value;
+          _scheduleSave(key, 600, () => {
+            _saveTimers.delete(key);
+            _saveGroup(groupId, { [field]: value });
+          });
+        }
+      }
+
+      function _onAutoSaveBlur(e) {
+        const inp = e.target.closest("input[data-key]");
+        if (!inp) return;
+        const key = inp.dataset.key;
+        if (_saveTimers.has(key)) {
+          _flushSave(key);
+          const tr = inp.closest("tr[data-camera-id]");
+          const groupRoot = inp.closest("[data-group-id]");
+          if (tr) {
+            _saveCamera(tr.getAttribute("data-camera-id"),
+              { [inp.dataset.camField]: inp.value.trim() });
+          } else if (groupRoot && inp.dataset.groupField) {
+            _saveGroup(groupRoot.getAttribute("data-group-id"),
+              { [inp.dataset.groupField]: inp.value });
+          }
+        }
+      }
+
+      if (ipCamGroupsEl) {
+        ipCamGroupsEl.addEventListener("input", _onAutoSaveInput);
+        ipCamGroupsEl.addEventListener("blur", _onAutoSaveBlur, true);
+
+        ipCamGroupsEl.addEventListener("click", async (e) => {
+          const gAction = e.target.closest("button[data-group-action]");
+          if (gAction) {
+            const action = gAction.dataset.groupAction;
+            const root = gAction.closest("[data-group-id]");
+            if (!root) return;
+            const groupId = root.getAttribute("data-group-id");
+            if (action === "delete") {
+              if (!confirm("Delete this group and all its cameras?")) return;
+              try {
+                const r = await fetch(`/api/ip_cameras/groups/${encodeURIComponent(groupId)}`, { method: "DELETE" });
+                const j = await r.json();
+                if (!j.ok) { _ipCamMsg(j.error || "Delete failed", "error"); return; }
+                await loadIpCameras();
+              } catch (_) {
+                _ipCamMsg("Network error", "error");
+              }
+            }
+            return;
+          }
+          const cAction = e.target.closest("button[data-cam-action]");
+          if (cAction) {
+            const action = cAction.dataset.camAction;
+            const tr = cAction.closest("tr[data-camera-id]");
+            if (!tr) return;
+            const camId = tr.getAttribute("data-camera-id");
+            if (action === "delete") {
+              if (!confirm("Delete this camera?")) return;
+              try {
+                const r = await fetch(`/api/ip_cameras/cameras/${encodeURIComponent(camId)}`, { method: "DELETE" });
+                const j = await r.json();
+                if (!j.ok) { _ipCamMsg(j.error || "Delete failed", "error"); return; }
+                await loadIpCameras();
+              } catch (_) {
+                _ipCamMsg("Network error", "error");
+              }
+            } else if (action === "test") {
+              const url = tr.getAttribute("data-resolved") || "";
+              const indicatorKey = `cam:${camId}`;
+              if (!url) {
+                _setSaveIndicator(indicatorKey, "No URL", "error");
+                return;
+              }
+              // Cancel any pending save indicator clear-out for this row
+              cAction.disabled = true;
+              const orig = cAction.textContent;
+              cAction.textContent = "Testing...";
+              _setSaveIndicator(indicatorKey, "Testing…");
+              try {
+                const r = await fetch(`/api/ip_cameras/cameras/${encodeURIComponent(camId)}/test`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ url }),
+                });
+                const j = await r.json();
+                const fullMsg = j.ok
+                  ? `Reachable${j.message ? " — " + j.message : ""}`
+                  : `Not reachable${j.message || j.error ? " — " + (j.message || j.error) : ""}`;
+                // Show a short label inline (with resolution if the probe
+                // returned one); full text remains in the tooltip.
+                let short;
+                if (j.ok) {
+                  const m = j.message && j.message.match(/(\d+x\d+)/);
+                  short = m ? `Live (${m[1]})` : "Live";
+                } else {
+                  short = "Not reachable";
+                }
+                _setSaveIndicator(indicatorKey, short, j.ok ? "success" : "error");
+                const el = ipCamGroupsEl.querySelector(`[data-save-indicator="${CSS.escape(indicatorKey)}"]`);
+                if (el) el.title = fullMsg;
+                // Auto-clear after a while
+                setTimeout(() => {
+                  _setSaveIndicator(indicatorKey, "");
+                  if (el) el.removeAttribute("title");
+                }, 6000);
+              } catch (_) {
+                _setSaveIndicator(indicatorKey, "Network error", "error");
+              } finally {
+                cAction.disabled = false;
+                cAction.textContent = orig;
+              }
+            }
+          }
+        });
+
+        ipCamGroupsEl.addEventListener("submit", async (e) => {
+          const form = e.target.closest("form[data-add-form]");
+          if (!form) return;
+          e.preventDefault();
+          const groupId = form.dataset.group;
+          const name = form.querySelector('input[data-field="name"]')?.value.trim() || "";
+          const channel = form.querySelector('input[data-field="channel"]')?.value.trim() || "";
+          const url = form.querySelector('input[data-field="url"]')?.value.trim() || "";
+          const payload = { name };
+          if (channel) payload.channel = channel;
+          if (url) payload.url = url;
+          if (!channel && !url) { _ipCamMsg("Channel or URL is required", "error"); return; }
+          try {
+            const r = await fetch(`/api/ip_cameras/groups/${encodeURIComponent(groupId)}/cameras`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(payload),
+            });
+            const j = await r.json();
+            if (!j.ok) { _ipCamMsg(j.error || "Add failed", "error"); return; }
+            _ipCamMsg(`Added "${j.camera.name}"`, "success");
+            await loadIpCameras();
+          } catch (_) {
+            _ipCamMsg("Network error", "error");
+          }
+        });
+      }
+
+      if (addGroupBtn) {
+        addGroupBtn.addEventListener("click", async () => {
+          const name = prompt("Name for the new group:", "NVR");
+          if (name === null) return;
+          const base_url = prompt(
+            "Shared base URL for cameras in this group (leave blank for a standalone group):",
+            "rtsp://admin:password@192.168.1.1:554/Streaming/Channels/"
+          ) ?? "";
+          try {
+            const r = await fetch("/api/ip_cameras/groups", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ name, base_url }),
+            });
+            const j = await r.json();
+            if (!j.ok) { _ipCamMsg(j.error || "Add failed", "error"); return; }
+            await loadIpCameras();
+          } catch (_) {
+            _ipCamMsg("Network error", "error");
+          }
+        });
+      }
+    </script>
+  </body>
+</html>
