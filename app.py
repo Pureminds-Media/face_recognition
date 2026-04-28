@@ -48,6 +48,56 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+# --- Public API auth ---------------------------------------------------------
+# When API_KEY is set, every /api/* and stream route requires the same key
+# in either an X-API-Key header or an api_key query string. Page routes
+# (HTML templates) stay open so the locally served UI keeps working without
+# a cookie/session layer. The local UI auto-attaches the key (injected into
+# the templates via render_template); external clients must send it themselves.
+API_KEY = os.getenv("API_KEY", "").strip()
+
+_PROTECTED_PREFIXES = ("/api/", "/video", "/screenshots/", "/footage/", "/faces/")
+
+
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "[::1]", "::1"}
+
+
+def _is_local_request():
+    """True when the client connected to the local Flask socket directly
+    (e.g. curl on the host, the same-machine browser). ngrok rewrites the
+    Host header to its public hostname so tunneled traffic does NOT match
+    here, which is what we want — the API key is still required externally.
+    """
+    host = (request.headers.get("Host") or "").split(":", 1)[0].lower()
+    return host in _LOCAL_HOSTS
+
+
+@app.before_request
+def _require_api_key():
+    """Gate protected routes on X-API-Key when API_KEY is configured.
+
+    Skipped for requests with a localhost Host header so curl on the host
+    and the locally served browser UI work without supplying the key.
+    """
+    if not API_KEY:
+        return None
+    if _is_local_request():
+        return None
+    path = request.path or ""
+    if not path.startswith(_PROTECTED_PREFIXES):
+        return None
+    supplied = request.headers.get("X-API-Key") or request.args.get("api_key") or ""
+    if supplied != API_KEY:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return None
+
+
+@app.context_processor
+def _inject_api_key():
+    """Make API_KEY available to Jinja templates so the local UI can attach
+    it to every fetch() automatically."""
+    return {"API_KEY": API_KEY}
+
 ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 FACES_DIR = "faces"
 TEST_UPLOAD_DIR = os.path.join("test_runs", "uploads")

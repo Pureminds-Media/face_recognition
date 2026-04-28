@@ -5,6 +5,45 @@
     <title>Settings</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      (function () {
+        const KEY = "{{ API_KEY|default('', true)|e }}";
+        if (!KEY) return;
+        const origFetch = window.fetch.bind(window);
+        window.fetch = function (input, init) {
+          init = init || {};
+          const headers = new Headers(init.headers || (input && input.headers) || {});
+          if (!headers.has("X-API-Key")) headers.set("X-API-Key", KEY);
+          init.headers = headers;
+          return origFetch(input, init);
+        };
+        const OrigES = window.EventSource;
+        if (OrigES) {
+          window.EventSource = function (url, opts) {
+            const sep = String(url).includes("?") ? "&" : "?";
+            return new OrigES(url + sep + "api_key=" + encodeURIComponent(KEY), opts);
+          };
+          window.EventSource.prototype = OrigES.prototype;
+        }
+        const PROTECTED = /^\/(?:video|screenshots|footage|faces)(?:\/|$|\?)/;
+        function patchSrc(proto) {
+          const desc = Object.getOwnPropertyDescriptor(proto, "src");
+          if (!desc || !desc.set) return;
+          Object.defineProperty(proto, "src", {
+            configurable: true, enumerable: desc.enumerable, get: desc.get,
+            set: function (v) {
+              const s = String(v || "");
+              if (PROTECTED.test(s) && !/[?&]api_key=/.test(s)) {
+                const sep = s.includes("?") ? "&" : "?";
+                v = s + sep + "api_key=" + encodeURIComponent(KEY);
+              }
+              return desc.set.call(this, v);
+            },
+          });
+        }
+        [HTMLImageElement, HTMLVideoElement, HTMLSourceElement].forEach(c => { if (c) patchSrc(c.prototype); });
+      })();
+    </script>
   </head>
 
   <body class="bg-slate-950 text-slate-100">
