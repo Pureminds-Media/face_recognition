@@ -855,7 +855,35 @@ def next_image_filename(person_dir: str, ext: str) -> str:
     return f"{max_id + 1}{ext}"
 
 
+_people_cache = {"sig": None, "data": []}
+_people_cache_lock = threading.Lock()
+
+
+def _people_signature():
+    """Cheap fingerprint of the faces tree: top-level mtime + per-folder mtimes.
+
+    Changes whenever a person folder is added/removed or any image inside
+    one is added/removed/renamed. Avoids the per-image stat the actual
+    scan does.
+    """
+    try:
+        os.makedirs(FACES_DIR, exist_ok=True)
+        parts = [os.path.getmtime(FACES_DIR)]
+        for entry in sorted(os.scandir(FACES_DIR), key=lambda e: e.name):
+            if entry.is_dir():
+                parts.append(entry.name)
+                parts.append(entry.stat().st_mtime)
+        return tuple(parts)
+    except OSError:
+        return None
+
+
 def list_people():
+    sig = _people_signature()
+    with _people_cache_lock:
+        if sig is not None and sig == _people_cache["sig"]:
+            return _people_cache["data"]
+
     os.makedirs(FACES_DIR, exist_ok=True)
     people = []
     for person in sorted(os.listdir(FACES_DIR)):
@@ -874,6 +902,10 @@ def list_people():
                 "thumbnail_url": f"/faces/{person}/{thumb}" if thumb else None,
             }
         )
+
+    with _people_cache_lock:
+        _people_cache["sig"] = sig
+        _people_cache["data"] = people
     return people
 
 

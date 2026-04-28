@@ -931,7 +931,10 @@
 
       /* ===================== Init ===================== */
       loadPeople();
-      setInterval(loadPeople, 10000);
+      // Poll every 30s as a safety net — explicit mutations (upload, rename,
+      // delete, move, merge) already call loadPeople() directly. The cache
+      // in /api/people makes unchanged polls cheap.
+      setInterval(loadPeople, 30000);
 
       /* ===================== Toast ===================== */
       const toastContainer = document.getElementById("toastContainer");
