@@ -40,10 +40,25 @@ try:
 except Exception:
     pass
 from dotenv import load_dotenv
-from face_engine import FaceEngine, AVAILABLE_LAYOUTS
+from face_engine import FaceEngine, AVAILABLE_LAYOUTS  # FaceEngine kept for static helpers
+from engine_client import EngineClient
+import multiprocessing as _mp
+import engine_runner as _engine_runner
 import db
 
 load_dotenv()
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="[web]    %(asctime)s %(levelname)s %(message)s",
+)
+# Suppress "Client disconnected while serving …" noise — these fire every
+# time a browser closes an SSE/MJPEG/footage stream, which is normal.
+logging.getLogger("werkzeug").addFilter(
+    lambda r: "Client disconnected" not in r.getMessage()
+)
+logging.getLogger("waitress").addFilter(
+    lambda r: "Client disconnected" not in r.getMessage()
+)
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -251,7 +266,11 @@ ALLOWED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 os.makedirs(FOOTAGE_DIR, exist_ok=True)
 
-engine = FaceEngine(
+# The engine runs in a subprocess. We can't spawn it at module-import time
+# because Python's `spawn` start method re-imports app.py in the child;
+# any unguarded mp.Process() / Manager() at module level recurses.
+# Instead, expose a bootstrap function that the __main__ block calls.
+_ENGINE_KWARGS = dict(
     known_dir=FACES_DIR,
     detector="retinaface",
     model="Facenet512",
@@ -265,14 +284,64 @@ engine = FaceEngine(
     jpeg_quality=80,
 )
 
-# Load saved grid config (if any) and default to multi-camera mode
-_saved_grid = FaceEngine.load_grid_config()
-if _saved_grid is not None:
+# Module-level placeholder so route handlers (which only resolve `engine`
+# at request time) can be defined before bootstrap runs.
+engine = None
+_engine_manager = None
+_engine_state = None
+_engine_proc = None
+_engine_parent_conn = None
+
+
+def _bootstrap_engine():
+    """Spawn the engine subprocess and bind the EngineClient.
+
+    Called once from the __main__ block. Idempotent: subsequent calls
+    are no-ops so any accidental double-call (e.g. waitress reload) is
+    safe.
+    """
+    global engine, _engine_manager, _engine_state, _engine_proc, _engine_parent_conn
+    if engine is not None:
+        return
+
     try:
-        engine.set_grid_layout(*_saved_grid["layout"])
-        engine.cam_index = _saved_grid["cam_index"]
-    except (ValueError, KeyError):
-        pass  # invalid layout/config, keep default
+        _mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass  # already set
+
+    _engine_manager = _mp.Manager()
+    _engine_state = _engine_manager.dict()
+    parent_conn, child_conn = _mp.Pipe()
+    _engine_proc = _mp.Process(
+        target=_engine_runner.run,
+        args=(child_conn, _engine_state, _ENGINE_KWARGS),
+        daemon=False,
+        name="face-engine",
+    )
+    _engine_proc.start()
+    _engine_parent_conn = parent_conn
+    engine = EngineClient(parent_conn, _engine_state, threading.Lock())
+
+    import atexit as _atexit
+    def _shutdown_engine():
+        try: parent_conn.send("shutdown")
+        except Exception: pass
+        try: _engine_proc.join(timeout=5)
+        except Exception: pass
+        if _engine_proc.is_alive():
+            _engine_proc.terminate()
+    _atexit.register(_shutdown_engine)
+
+    log.info("waiting for engine subprocess to publish state...")
+    t0 = time.time()
+    while "cam_index" not in _engine_state and (time.time() - t0) < 30:
+        time.sleep(0.1)
+    if "cam_index" not in _engine_state:
+        log.warning("engine subprocess slow to boot — continuing with defaults "
+                    "(state keys so far: %s)", list(_engine_state.keys()))
+    else:
+        log.info("engine ready, cam_index=%s, identities=%s",
+                 _engine_state.get("cam_index"), _engine_state.get("identities"))
 
 # Engine stays stopped until user clicks Start in the UI
 # engine.start()
@@ -300,23 +369,31 @@ test_job_run_lock = threading.Lock()
 test_jobs = {}  # job_id -> {status, progress, error, result_url, ...}
 
 # --- Database init ---
+# init_db is engine-independent; run at import. Session bootstrap (which
+# needs engine.cam_index) runs from _bootstrap_post_engine() below.
 db.init_db()
 _current_session_id = None
-if db.is_available():
-    _current_session_id = db.create_session(
-        camera_source=str(engine.cam_index) if engine.cam_index is not None else None
-    )
-    # Sync locations from grid config
-    _saved_grid = FaceEngine.load_grid_config()
-    if _saved_grid and _saved_grid.get("slots"):
-        for _src, _name in FaceEngine.get_slot_locations(_saved_grid["slots"]).items():
-            db.upsert_location(_src, _name)
-    # Ensure single-camera source has a location too
-    if not engine._is_grid_mode():
-        _src = str(engine.cam_index)
-        db.upsert_location(_src, f"Camera {_src}")
 
-    log.info("DB session started: %s", _current_session_id)
+
+def _bootstrap_post_engine():
+    """Engine-dependent boot steps. Called from __main__ after the engine
+    subprocess is up. Sets the DB session and starts the attendance / QR
+    background loops that read tracks from the engine."""
+    global _current_session_id
+    if db.is_available() and _current_session_id is None:
+        _current_session_id = db.create_session(
+            camera_source=str(engine.cam_index) if engine.cam_index is not None else None
+        )
+        _saved_grid = FaceEngine.load_grid_config()
+        if _saved_grid and _saved_grid.get("slots"):
+            for _src, _name in FaceEngine.get_slot_locations(_saved_grid["slots"]).items():
+                db.upsert_location(_src, _name)
+        if not engine._is_grid_mode():
+            _src = str(engine.cam_index)
+            db.upsert_location(_src, f"Camera {_src}")
+        log.info("DB session started: %s", _current_session_id)
+    threading.Thread(target=_attendance_loop, daemon=True).start()
+    threading.Thread(target=_qr_loop, daemon=True).start()
 
 # In-memory visit tracking state: person_name -> {location_id, visit_id, camera_source}
 _active_visits = {}
@@ -824,8 +901,8 @@ def _qr_loop():
 
         time.sleep(0.1)
 
-threading.Thread(target=_attendance_loop, daemon=True).start()
-threading.Thread(target=_qr_loop, daemon=True).start()
+# Threads now started from _bootstrap_post_engine() so they don't run
+# in the engine subprocess (which re-imports this module under spawn).
 
 def safe_person_name(name: str) -> str:
     """
@@ -2424,5 +2501,24 @@ def attendance_stream():
 
 
 if __name__ == "__main__":
-    # IMPORTANT: don’t use the reloader with a webcam engine (it runs twice)
-    app.run(host="0.0.0.0", port=5000, debug=True, threaded=True, use_reloader=False)
+    # Spawn the engine subprocess and run engine-dependent boot steps
+    # (DB session, background loops). Doing this here, after the
+    # `if __name__ == "__main__"` guard, prevents Python's spawn start
+    # method from recursing when the child re-imports this module.
+    _bootstrap_engine()
+    _bootstrap_post_engine()
+
+    # The Werkzeug dev server stalls under load: long-lived MJPEG / SSE
+    # streams hog its workers, so polling endpoints time out under load.
+    # Use waitress (pure-Python production server) when available — it
+    # handles many concurrent connections cleanly. Never enable the
+    # Flask reloader: it would start the engine subprocess twice.
+    host, port = "0.0.0.0", 5000
+    try:
+        from waitress import serve  # type: ignore
+        log.info("Serving with waitress on %s:%s", host, port)
+        serve(app, host=host, port=port, threads=32, channel_timeout=300)
+    except ImportError:
+        log.warning("waitress not installed — falling back to Werkzeug dev server. "
+                    "pip install waitress for production-grade concurrency.")
+        app.run(host=host, port=port, debug=False, threaded=True, use_reloader=False)

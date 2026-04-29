@@ -213,3 +213,6 @@ qr_test/
 
 # Codex local artifacts
 .codex
+
+# Per-person embedding cache (rebuilt on demand)
+**/.embeddings.npz

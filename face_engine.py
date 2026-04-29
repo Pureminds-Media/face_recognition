@@ -1516,7 +1516,17 @@ class FaceEngine:
             del pending[tid]
 
     def reload_faces(self):
-        """Rebuild known embeddings from faces/{name}/*"""
+        """Rebuild known embeddings from faces/{name}/*.
+
+        Per-person embedding cache (``<person>/.embeddings.npz``) keyed by
+        filename + mtime. Files whose mtime hasn't changed since the cache
+        was written reuse the stored embedding instead of running the
+        detector + represent pipeline again. The detector pass is the
+        slow part of startup, so this turns subsequent boots from O(N
+        images) into O(only-new-or-modified images).
+        """
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
         known = []
         if not os.path.isdir(self.known_dir):
             os.makedirs(self.known_dir, exist_ok=True)
@@ -1526,11 +1536,39 @@ class FaceEngine:
             if not os.path.isdir(person_dir):
                 continue
 
+            cache_path = os.path.join(person_dir, ".embeddings.npz")
+            cache = {}  # filename -> (mtime, embedding ndarray)
+            if os.path.isfile(cache_path):
+                try:
+                    npz = np.load(cache_path, allow_pickle=False)
+                    names = npz["names"]
+                    mtimes = npz["mtimes"]
+                    embs_arr = npz["embs"]
+                    for i, nm in enumerate(names):
+                        cache[str(nm)] = (float(mtimes[i]), embs_arr[i])
+                except Exception:
+                    cache = {}
+
+            new_cache = {}
             embs = []
+            cache_hits = 0
+            cache_misses = 0
             for file in os.listdir(person_dir):
                 if not file.lower().endswith(self.allowed_exts):
                     continue
                 path = os.path.join(person_dir, file)
+                try:
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    continue
+
+                cached = cache.get(file)
+                if cached is not None and abs(cached[0] - mtime) < 1e-6:
+                    embs.append(cached[1])
+                    new_cache[file] = (mtime, cached[1])
+                    cache_hits += 1
+                    continue
+
                 try:
                     faces = DeepFace.extract_faces(
                         img_path=path,
@@ -1538,8 +1576,6 @@ class FaceEngine:
                         enforce_detection=False,
                         align=True,
                     )
-                    # Filter out the "no face found" placeholder DeepFace
-                    # returns when enforce_detection=False (confidence==0).
                     faces = [
                         f for f in (faces or [])
                         if float(f.get("confidence", 0.0)) >= 0.90
@@ -1547,20 +1583,35 @@ class FaceEngine:
                     ]
                     if not faces:
                         continue
-                    face_img = faces[0]["face"]
                     rep = DeepFace.represent(
-                        img_path=face_img,
+                        img_path=faces[0]["face"],
                         model_name=self.model,
                         detector_backend="skip",
                         enforce_detection=False,
                     )
                     if rep and "embedding" in rep[0]:
-                        embs.append(l2norm(rep[0]["embedding"]))
+                        emb = l2norm(rep[0]["embedding"])
+                        embs.append(emb)
+                        new_cache[file] = (mtime, emb)
+                        cache_misses += 1
                 except Exception as e:
-                    # Don't spam — bad crops are expected with auto-capture.
-                    import logging as _logging
-                    _logging.getLogger(__name__).debug("reload_faces: skip %s (%s)", path, e)
+                    _log.debug("reload_faces: skip %s (%s)", path, e)
                     continue
+
+            # Write the cache back if anything changed.
+            if new_cache and (cache_hits + cache_misses) > 0:
+                if cache != {fn: v for fn, v in new_cache.items()}:
+                    try:
+                        names = np.array(list(new_cache.keys()))
+                        mtimes = np.array([v[0] for v in new_cache.values()], dtype=np.float64)
+                        embs_arr = np.stack([v[1] for v in new_cache.values()])
+                        np.savez(cache_path, names=names, mtimes=mtimes, embs=embs_arr)
+                    except Exception as e:
+                        _log.debug("reload_faces: failed to write cache for %s (%s)", person, e)
+
+            if cache_misses > 0:
+                _log.info("reload_faces: %s — %d cached, %d recomputed",
+                          person, cache_hits, cache_misses)
 
             if embs:
                 template = l2norm(np.mean(np.asarray(embs), axis=0))
