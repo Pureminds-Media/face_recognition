@@ -1590,6 +1590,9 @@ def api_merge_people():
     })
 
 
+_STATIC_CACHE_HEADER = "public, max-age=86400"
+
+
 @app.route("/faces/<person>/<path:filename>")
 def faces_file(person, filename):
     # prevent path traversal / weird names
@@ -1597,18 +1600,23 @@ def faces_file(person, filename):
     if not person:
         return ("", 404)
 
-    # serve actual file
-    return send_from_directory(os.path.join(FACES_DIR, person), filename)
+    resp = send_from_directory(os.path.join(FACES_DIR, person), filename, conditional=True)
+    resp.headers["Cache-Control"] = _STATIC_CACHE_HEADER
+    return resp
 
 @app.route("/screenshots/<path:filename>")
 def screenshot_file(filename):
     """Serve visit screenshot images."""
-    return send_from_directory(SCREENSHOTS_DIR, filename)
+    resp = send_from_directory(SCREENSHOTS_DIR, filename, conditional=True)
+    resp.headers["Cache-Control"] = _STATIC_CACHE_HEADER
+    return resp
 
 @app.route("/footage/<path:filename>")
 def footage_file(filename):
     """Serve visit footage video clips (supports Range requests for streaming)."""
-    return send_from_directory(FOOTAGE_DIR, filename, conditional=True)
+    resp = send_from_directory(FOOTAGE_DIR, filename, conditional=True)
+    resp.headers["Cache-Control"] = _STATIC_CACHE_HEADER
+    return resp
 
 @app.route("/api/status")
 def api_status():
@@ -1990,6 +1998,43 @@ def api_ip_cameras_camera_delete(camera_id):
         group["cameras"] = [c for c in group["cameras"] if c.get("id") != camera_id]
         _save_ip_cameras(state)
     return jsonify({"ok": True})
+
+
+@app.route("/api/ip_cameras/groups/<group_id>/reorder", methods=["POST"])
+def api_ip_cameras_group_reorder(group_id):
+    """Reorder cameras within a group. Body: {"order": ["cam_id", ...]}.
+
+    Cameras whose IDs aren't in the list are kept in their existing
+    relative order, appended after the supplied ones. Unknown IDs are
+    ignored.
+    """
+    data = request.get_json(silent=True) or {}
+    order = data.get("order") or []
+    if not isinstance(order, list):
+        return jsonify({"ok": False, "error": "order must be a list of camera ids"}), 400
+
+    with _ip_cameras_lock:
+        state = _load_ip_cameras()
+        group = next((g for g in state.get("groups", []) if g.get("id") == group_id), None)
+        if not group:
+            return jsonify({"ok": False, "error": "group not found"}), 404
+
+        cams_by_id = {c.get("id"): c for c in group.get("cameras", [])}
+        seen = set()
+        new_list = []
+        for cid in order:
+            cam = cams_by_id.get(cid)
+            if cam and cid not in seen:
+                new_list.append(cam)
+                seen.add(cid)
+        # Append any cameras the client didn't include, preserving order.
+        for cam in group.get("cameras", []):
+            if cam.get("id") not in seen:
+                new_list.append(cam)
+        group["cameras"] = new_list
+        _save_ip_cameras(state)
+
+    return jsonify({"ok": True, "count": len(new_list)})
 
 
 @app.route("/api/grid/config", methods=["GET"])

@@ -1306,6 +1306,7 @@
               <table class="w-full text-sm">
                 <thead>
                   <tr class="border-b border-slate-800/50 text-slate-400 text-xs">
+                    <th class="px-1 py-1 w-6"></th>
                     <th class="px-2 py-1 text-left w-48">Name</th>
                     <th class="px-2 py-1 text-left">${isStandalone ? "URL" : "Channel"}</th>
                     <th class="px-2 py-1 text-right w-44">Actions</th>
@@ -1345,7 +1346,8 @@
           }
           fieldKey = `cam:${c.id}:channel`;
         }
-        return `<tr data-camera-id="${c.id}" data-group-id="${g.id}" data-resolved="${escapeHtml(c.resolved_url || "")}" class="border-b border-slate-800/30">
+        return `<tr draggable="true" data-camera-id="${c.id}" data-group-id="${g.id}" data-resolved="${escapeHtml(c.resolved_url || "")}" class="border-b border-slate-800/30">
+          <td class="px-1 py-1 w-6 text-center cursor-grab select-none text-slate-600 hover:text-slate-300" title="Drag to reorder">⋮⋮</td>
           <td class="px-2 py-1">
             <input data-cam-field="name" data-key="cam:${c.id}:name"
               value="${escapeHtml(c.name)}" placeholder="Name"
@@ -1473,9 +1475,53 @@
         }
       }
 
+      // ----- Drag-to-reorder cameras within a group -----
+      let _dragRow = null;
+      function _onDragStart(e) {
+        const tr = e.target.closest("tr[data-camera-id]");
+        if (!tr) return;
+        // Don't start a drag if the user grabbed an input — they're editing.
+        if (e.target.tagName === "INPUT" || e.target.tagName === "BUTTON") return;
+        _dragRow = tr;
+        tr.classList.add("opacity-50");
+        try { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", tr.dataset.cameraId); } catch (_) {}
+      }
+      function _onDragOver(e) {
+        if (!_dragRow) return;
+        const tr = e.target.closest("tr[data-camera-id]");
+        if (!tr || tr === _dragRow) return;
+        // Only allow reorder within the same group.
+        if (tr.dataset.groupId !== _dragRow.dataset.groupId) return;
+        e.preventDefault();
+        const rect = tr.getBoundingClientRect();
+        const before = (e.clientY - rect.top) < rect.height / 2;
+        tr.parentNode.insertBefore(_dragRow, before ? tr : tr.nextSibling);
+      }
+      async function _onDragEnd() {
+        if (!_dragRow) return;
+        const tr = _dragRow;
+        tr.classList.remove("opacity-50");
+        const groupId = tr.dataset.groupId;
+        _dragRow = null;
+        const tbody = tr.parentNode;
+        const order = Array.from(tbody.querySelectorAll("tr[data-camera-id]"))
+          .map(r => r.dataset.cameraId);
+        try {
+          await fetch(`/api/ip_cameras/groups/${encodeURIComponent(groupId)}/reorder`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ order }),
+          });
+        } catch (_) {}
+      }
+
       if (ipCamGroupsEl) {
         ipCamGroupsEl.addEventListener("input", _onAutoSaveInput);
         ipCamGroupsEl.addEventListener("blur", _onAutoSaveBlur, true);
+        ipCamGroupsEl.addEventListener("dragstart", _onDragStart);
+        ipCamGroupsEl.addEventListener("dragover", _onDragOver);
+        ipCamGroupsEl.addEventListener("dragend", _onDragEnd);
+        ipCamGroupsEl.addEventListener("drop", (e) => e.preventDefault());
 
         ipCamGroupsEl.addEventListener("click", async (e) => {
           const gAction = e.target.closest("button[data-group-action]");
