@@ -14,7 +14,8 @@ Uses InsightFace (RetinaFace + ArcFace, ONNX Runtime GPU) for face detection and
 
 ## Features
 
-- **Multi-camera grid** — 2x2, 3x3, or 4x4 camera grid with per-tile face detection and tracking. RTSP streams decode on the GPU's NVDEC engine when available (PyAV + CUDA hwaccel), keeping CPU free for the rest of the pipeline. Per-camera fallback to software decode if hardware decode init fails.
+- **Multi-camera analysis** — every configured camera runs concurrently in a shared analysis pool: face detection, recognition, tracking, visit bookkeeping, and footage capture all happen for every camera at once regardless of which one is on screen. RTSP streams decode on the GPU's NVDEC engine when available (PyAV + CUDA hwaccel), keeping CPU free for the rest of the pipeline. Per-camera fallback to software decode if hardware decode init fails.
+- **UI is single-camera-only** — the live preview cycles between cameras one at a time (carousel arrows / swipe). Boxes and name labels are intentionally **not drawn** on the live feed — with many people in frame the overlays become illegible. Annotations are still rendered into the recorded footage and per-visit screenshots for after-the-fact review.
 - **Face recognition** — InsightFace `buffalo_l` model pack (RetinaFace detector + ArcFace embeddings, ONNX Runtime on GPU) with CSRT tracking. Thread-safe so multiple cameras detect concurrently in a single shared FaceAnalysis instance.
 - **Head detection** — YOLOv8n (ONNX Runtime GPU) supplements face detection to sustain tracking when face is not visible (e.g. turned sideways). Always on when model file exists, graceful fallback if missing.
 - **Visit tracking** — Per-location visits with flip-flop prevention, automatic timeout, and transition detection
@@ -193,20 +194,22 @@ Key parameters in `app.py` engine initialization:
 | `detect_scale` | `1.0` | Scale factor for detection (lower = faster, less accurate) |
 | `width` / `height` | `1280` / `720` | Camera resolution |
 | `out_fps` | `15` | Target FPS for MJPEG stream and footage |
-| `threshold` | `0.4` | Cosine distance threshold for face matching |
+| `threshold` | `0.5` | Cosine distance threshold for ArcFace face matching. Below this distance → recognised as that person. Raise (toward 0.6) if same person is being mis-labeled "unknown"; lower (toward 0.4) if different people are being collapsed together. |
 | `tracker_type` | `CSRT` | OpenCV tracker (`CSRT` or `KCF`) |
 
 ## Auto-Capture Unknowns
 
 When `AUTO_CAPTURE_ENABLED=true`:
 
-1. The engine tracks unrecognised faces and accumulates consecutive face-detector-confirmed detections
-2. After 4 consecutive detections (~1.2 seconds), it saves a cropped face image to `faces/unknown_N/1.jpg`
-3. The face is immediately enrolled — on reappearance, it's recognised as `unknown_N` (not generic "unknown")
-4. Maximum 50 auto-captured unknowns (configurable in `face_engine.py`)
-5. Use the **People** page (`/people`) to rename `unknown_N` entries to real names, or delete false captures
+1. An unrecognised face is tracked. The engine keeps the largest crop seen during the tracking window as the "best frame".
+2. After **5 seconds** of continuous tracking (`_unknown_capture_min_seconds`), the best frame is gated through a quality check — InsightFace must re-detect a face in that crop with `det_score ≥ 0.50` and dimensions `≥ 60×60 px`. Crops that fail (motion blur, profile shots, tracker drift onto hands/shoulders) are silently rejected and we wait for a better frame on the next track.
+3. On pass: the crop is saved to `faces/unknown_N/1.jpg` and the track is promoted to `unknown_N`.
+4. **Bootstrap sample accumulation:** for the first 10 frames after enrolment, additional samples are saved with only a 5-second per-camera cooldown (instead of the steady-state 10 minutes). This builds a diverse averaged template fast, fixing the "single-frame template never matches re-appearances" failure mode.
+5. After the bootstrap phase the per-camera cooldown reverts to 10 minutes; a different camera's view of the same person is always allowed immediately. Maximum 30 images per person, 150 auto-captured `unknown_N` folders total.
+6. Tracks that lose recognition for 12 consecutive frames (~3.6 s at default cadence) are demoted from `unknown_N` back to "unknown" and become eligible for new enrolment. This patience window is what prevents one person from generating dozens of duplicate folders.
+7. Use the **People** page (`/people`) to rename `unknown_N` entries to real names, or delete false captures.
 
-This feature is designed for **small, controlled environments** (offices, labs). Disable it for large public spaces where dozens of strangers would quickly fill the 50-slot cap.
+Designed for **small, controlled environments** (offices, labs). Disable it for large public spaces where many strangers would quickly fill the 150-slot cap.
 
 ## Maintenance
 

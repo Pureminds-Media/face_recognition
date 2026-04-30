@@ -174,8 +174,8 @@ development only.
 
 | Method | Path                                          | Description                                                 |
 | ------ | --------------------------------------------- | ----------------------------------------------------------- |
-| GET    | `/api/camera`                                 | List devices + current viewer state.                        |
-| POST   | `/api/camera`                                 | Body: `{source}`. Switch viewer to a camera or `grid_RxC`.  |
+| GET    | `/api/camera`                                 | List devices + current viewer state. The `devices` list still includes `grid_RxC` layout entries; the in-tree UI now hides them since it operates in single-camera viewer mode only, but the layouts work via direct API calls. |
+| POST   | `/api/camera`                                 | Body: `{source}`. Switch viewer to a camera URL/index, or to a `grid_RxC` layout (e.g. `"grid_2x2"`). Also accepts `{grid_offset: int}` to page through cameras when in grid mode. **Note:** the analysis pool always covers every configured camera regardless of viewer mode — switching viewer mode never starts/stops detection on any camera. |
 | POST   | `/api/camera/reload`                          | Re-probe devices.                                           |
 | GET    | `/api/ip_cameras`                             | Configured IP-camera groups + cameras.                      |
 | POST   | `/api/ip_cameras/groups`                      | Body: `{name, base_url?}`. Create group.                    |
@@ -201,6 +201,8 @@ development only.
 | POST   | `/api/history/clear`                       | Wipe visits, sessions, screenshots, footage. Destructive.   |
 
 Visit objects include: `id, person_name, location_name, location_display, camera_source, first_seen, last_seen, duration_secs, duration_fmt, ended, confidence, screenshot_url, footage_url, activity`.
+
+`duration_secs` = `last_seen − first_seen` (wall-clock duration of the visit). It is **not** the on-camera/visible time. A visit with `duration_secs = 0` typically means a single-frame detection that closed before any subsequent frame refreshed `last_seen`. The `visible_duration` column tracked by the footage writer (real on-camera seconds) is currently not exposed in the visit serializer.
 
 ### 4.5 Attendance
 
@@ -247,6 +249,20 @@ Append `?api_key=<key>`. Standard `EventSource` works. Events:
 Append `?api_key=<key>`. Drop the URL into an `<img>` tag. The viewer
 follows whatever camera/grid is currently active — switch via
 `POST /api/camera`.
+
+The MJPEG stream is intentionally **clean** — no per-person bounding
+boxes or name labels are drawn on the live feed (they cluttered the
+view when many people were present). Boxes/labels remain on the saved
+footage clips and per-visit screenshots for after-the-fact review. If
+your client UI wants to overlay boxes, poll `GET /api/tracks` (or read
+the bbox field on `/api/attendance/stream`'s state events) and render
+them as a transparent layer over the `<img>`.
+
+In single-camera viewer mode the source-frame is downscaled to the
+engine's `width × height` (defaults `1280 × 720`) before JPEG encoding,
+so the bitrate stays reasonable even when the camera itself is 4K.
+Recordings, screenshots and face crops still use the camera's native
+resolution.
 
 ---
 
