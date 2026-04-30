@@ -121,34 +121,19 @@
                     </svg>
                   </button>
                 </div>
-                <!-- Single / Multi cam mode selector -->
-                <div class="relative" id="camModeGroup">
+                <!-- Single / Multi cam mode selector
+                     Hidden: the UI is single-mode-only. Cameras still all run
+                     in grid analysis mode in the engine; users just cycle
+                     between live feeds via the carousel arrows. The buttons
+                     and multi dropdown stay in the DOM so the existing JS
+                     handlers can reference them without null checks. -->
+                <div class="relative hidden" id="camModeGroup">
                   <div class="flex rounded-lg overflow-hidden border border-slate-700">
-                    <!-- Single camera button -->
-                    <button id="singleCamBtn" type="button" title="Single camera"
-                      class="flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors bg-slate-800 hover:bg-slate-700">
-                      <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <rect x="2" y="5" width="20" height="14" rx="2"/>
-                        <circle cx="12" cy="12" r="3"/>
-                      </svg>
-                      <span class="text-xs">Single</span>
-                    </button>
-                    <!-- Multi camera button -->
-                    <button id="multiCamBtn" type="button" title="Multi camera grid"
-                      class="flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors bg-slate-800 hover:bg-slate-700 border-l border-slate-700">
-                      <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <rect x="2" y="2" width="9" height="9" rx="1"/>
-                        <rect x="13" y="2" width="9" height="9" rx="1"/>
-                        <rect x="2" y="13" width="9" height="9" rx="1"/>
-                        <rect x="13" y="13" width="9" height="9" rx="1"/>
-                      </svg>
-                      <span class="text-xs">Multi</span>
-                    </button>
+                    <button id="singleCamBtn" type="button" class="hidden"></button>
+                    <button id="multiCamBtn" type="button" class="hidden"></button>
                   </div>
-                  <!-- Multi camera dropdown -->
-                  <div id="multiCamDropdown"
-                    class="hidden absolute top-full left-0 mt-1 z-50 min-w-52 rounded-lg border border-slate-700 bg-slate-900 shadow-xl overflow-hidden">
-                    <div id="multiCamList" class="max-h-60 overflow-y-auto"></div>
+                  <div id="multiCamDropdown" class="hidden">
+                    <div id="multiCamList"></div>
                   </div>
                 </div>
               </div>
@@ -270,6 +255,7 @@
                     <tr><td class="px-4 py-6 text-center text-slate-500 empty-msg">Select a date and click Load</td></tr>
                   </tbody>
                 </table>
+                <div id="dailyPager" class="px-4 py-3 border-t border-slate-800 hidden"></div>
               </div>
             </div>
 
@@ -303,6 +289,7 @@
                     <tr><td class="px-4 py-6 text-center text-slate-500 empty-msg">Select a person and click Load</td></tr>
                   </tbody>
                 </table>
+                <div id="personPager" class="px-4 py-3 border-t border-slate-800 hidden"></div>
               </div>
             </div>
 
@@ -335,6 +322,7 @@
                     <tr><td class="px-4 py-6 text-center text-slate-500 empty-msg">Select a location and click Load</td></tr>
                   </tbody>
                 </table>
+                <div id="locationPager" class="px-4 py-3 border-t border-slate-800 hidden"></div>
               </div>
             </div>
           </div>
@@ -473,14 +461,21 @@
         // Apply known-dead filter from this session
         singleCamDevices = allSingleCamDevices.filter(d => !_deadCameras.has(String(d.value)));
 
-        // Viewer state comes from the new fields on /api/camera; fall back
-        // to whatever we already had if the backend doesn't supply them.
+        // UI is single-mode only. If the backend currently has the viewer
+        // in grid mode (e.g. from a saved layout), force it to single on
+        // the first available camera. Backend keeps all cameras running
+        // in its grid analysis pool regardless of viewer mode.
         const viewerMode = j.viewer_mode || currentCamMode;
-        currentCamMode = viewerMode === "grid" ? "multi" : "single";
+        currentCamMode = "single";
+        if (viewerMode === "grid" && singleCamDevices.length > 0) {
+          // Fire-and-forget — switchCamera() updates the carousel state
+          // and starts the stream when it returns.
+          switchCamera(String(singleCamDevices[0].value)).catch(() => {});
+        }
 
         // Sync the single-mode carousel index with the viewer's source
         const viewerSrc = String(j.viewer_source || "");
-        if (currentCamMode === "single" && viewerSrc) {
+        if (viewerSrc) {
           const idx = singleCamDevices.findIndex(d => String(d.value || "") === viewerSrc);
           if (idx >= 0) singleCamIndex = idx;
         }
@@ -597,7 +592,8 @@
           }
           // Sync local mode + pagination state so the Single/Multi buttons
           // and the carousel arrows reflect the new viewer.
-          currentCamMode = j.viewer_mode === "grid" ? "multi" : "single";
+          // UI is single-only; ignore engine's reported grid mode in viewer.
+          currentCamMode = "single";
           if (typeof j.viewer_grid_offset === "number") gridOffset = j.viewer_grid_offset;
           if (typeof j.grid_page_size === "number") gridPageSize = j.grid_page_size;
           if (typeof j.grid_page_count === "number") gridPageCount = j.grid_page_count;
@@ -856,11 +852,23 @@
         const showDate = opts.showDate || false;
         const showPerson = opts.showPerson !== false;
         const showLocation = opts.showLocation !== false;
+        // Footage column: a download link rendered as an icon. Browsers
+        // fetch nothing until the user clicks (the ``download`` attribute
+        // also bypasses the in-browser player so the file is saved
+        // straight to disk instead of buffered for playback). Rendering
+        // <video preload="metadata"> here previously caused the browser
+        // to hammer every visit's WebM in the background.
         let media;
         if (v.footage_url) {
-          media = `<video src="${v.footage_url}" class="w-28 h-20 rounded object-cover border border-slate-700 hover:border-emerald-500 transition-colors cursor-pointer" muted loop preload="metadata" onmouseenter="this.play()" onmouseleave="this.pause();this.currentTime=0" onclick="openVideoModal(this.src)" title="Click to enlarge"></video>`;
-        } else if (v.screenshot_url) {
-          media = `<a href="${v.screenshot_url}" target="_blank"><img src="${v.screenshot_url}" class="w-28 h-20 rounded object-cover border border-slate-700 hover:border-emerald-500 transition-colors"></a>`;
+          // Click → modal player (no preload until clicked).
+          const escAttr = String(v.footage_url).replace(/'/g, "%27");
+          media = `<button type="button" onclick="openVideoModal('${escAttr}')"
+                      class="inline-flex w-28 h-20 rounded border border-slate-700 hover:border-emerald-500 transition-colors items-center justify-center bg-slate-800 cursor-pointer"
+                      title="Click to play">
+              <svg class="w-8 h-8 text-slate-400" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M8 5v14l11-7z"/>
+              </svg>
+            </button>`;
         } else {
           media = `<span class="text-slate-600 text-xs">--</span>`;
         }
@@ -883,6 +891,53 @@
         return `<tr><td colspan="${span}" class="px-4 py-6 text-center text-slate-500">${msg}</td></tr>`;
       }
 
+      // Paginate a visit list into a tbody + pager. Stores the full list
+      // and current page on the tbody dataset so prev/next clicks don't
+      // need a closure or refetch.
+      const VISITS_PAGE_SIZE = 10;
+      const _visitState = new WeakMap();  // tbody -> {visits, page, opts}
+      function renderVisitsPage(tbody, pager) {
+        const st = _visitState.get(tbody);
+        if (!st) return;
+        const { visits, opts } = st;
+        if (!visits.length) {
+          tbody.innerHTML = emptyRow("No visits found");
+          pager.classList.add("hidden");
+          return;
+        }
+        const totalPages = Math.max(1, Math.ceil(visits.length / VISITS_PAGE_SIZE));
+        st.page = Math.min(Math.max(0, st.page), totalPages - 1);
+        const start = st.page * VISITS_PAGE_SIZE;
+        const slice = visits.slice(start, start + VISITS_PAGE_SIZE);
+        tbody.innerHTML = slice.map((v) => visitRow(v, opts)).join("");
+        if (totalPages <= 1) {
+          pager.classList.add("hidden");
+          pager.innerHTML = "";
+          return;
+        }
+        pager.classList.remove("hidden");
+        const btnCls = "px-2 py-1 rounded border border-slate-700 hover:border-emerald-500 disabled:opacity-40 disabled:hover:border-slate-700 text-xs";
+        pager.innerHTML = `
+          <div class="flex items-center justify-between text-xs text-slate-400">
+            <div>Showing ${start + 1}–${Math.min(start + VISITS_PAGE_SIZE, visits.length)} of ${visits.length}</div>
+            <div class="flex items-center gap-2">
+              <button type="button" data-act="prev" class="${btnCls}" ${st.page === 0 ? "disabled" : ""}>Prev</button>
+              <span>Page ${st.page + 1} / ${totalPages}</span>
+              <button type="button" data-act="next" class="${btnCls}" ${st.page >= totalPages - 1 ? "disabled" : ""}>Next</button>
+            </div>
+          </div>`;
+        pager.querySelectorAll("button[data-act]").forEach((b) => {
+          b.onclick = () => {
+            st.page += b.dataset.act === "next" ? 1 : -1;
+            renderVisitsPage(tbody, pager);
+          };
+        });
+      }
+      function setVisits(tbody, pager, visits, opts) {
+        _visitState.set(tbody, { visits: visits || [], page: 0, opts: opts || {} });
+        renderVisitsPage(tbody, pager);
+      }
+
       const dailyDate = document.getElementById("dailyDate");
       const dailyLoadBtn = document.getElementById("dailyLoadBtn");
       const dailyMsg = document.getElementById("dailyMsg");
@@ -903,11 +958,16 @@
           const j = await r.json();
           if (!j.ok) { dailyMsg.textContent = j.error || "Error"; return; }
           dailyMsg.textContent = `${j.visits.length} visit(s)`;
-          dailyTableBody.innerHTML = j.visits.length
-            ? j.visits.map((v) => visitRow(v)).join("")
-            : emptyRow("No visits on this date");
+          setVisits(dailyTableBody, document.getElementById("dailyPager"), j.visits, {});
           const totals = j.person_totals || {};
-          const names = Object.keys(totals).sort();
+          // Sort by total time descending; ties break alphabetically so the
+          // ordering is stable across reloads.
+          const names = Object.keys(totals).sort((a, b) => {
+            const da = Number(totals[a].total_secs || 0);
+            const db = Number(totals[b].total_secs || 0);
+            if (db !== da) return db - da;
+            return a.localeCompare(b);
+          });
           if (names.length) {
             dailyTotals.innerHTML = `<div class="flex flex-wrap gap-2">${names.map((n) => `
               <div class="rounded-lg border border-slate-800 bg-slate-900 px-3 py-2">
@@ -947,9 +1007,7 @@
           const r = await fetch(url);
           const j = await r.json();
           if (!j.ok) return;
-          personTableBody.innerHTML = j.visits.length
-            ? j.visits.map((v) => visitRow(v, { showDate: true, showPerson: false })).join("")
-            : emptyRow("No visits found");
+          setVisits(personTableBody, document.getElementById("personPager"), j.visits, { showDate: true, showPerson: false });
           personSummary.innerHTML = `<div class="rounded-lg border border-slate-800 bg-slate-900 px-4 py-3 inline-block">
             <span class="text-sm font-medium">${name}</span>
             <span class="text-xs text-slate-400 ml-2">Total: ${j.total_fmt} across ${j.visits.length} visit(s)</span>
@@ -987,9 +1045,7 @@
           const r = await fetch(url);
           const j = await r.json();
           if (!j.ok) return;
-          locationTableBody.innerHTML = j.visits.length
-            ? j.visits.map((v) => visitRow(v, { showDate: true, showLocation: false })).join("")
-            : emptyRow("No visits found");
+          setVisits(locationTableBody, document.getElementById("locationPager"), j.visits, { showDate: true, showLocation: false });
         } catch {}
       });
 

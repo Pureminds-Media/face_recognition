@@ -215,4 +215,4 @@ qr_test/
 .codex
 
 # Per-person embedding cache (rebuilt on demand)
-**/.embeddings.npz
+**/.embeddings*.npz

@@ -3,7 +3,7 @@
 
 A Flask-based face recognition and attendance system with multi-camera support, visit tracking, footage recording, CLIP-based action detection, YOLO head detection, and auto-capture of unknown persons.
 
-Uses DeepFace for face recognition, OpenCV for tracking, CLIP (ONNX Runtime) for zero-shot action classification, and YOLOv8n for head detection.
+Uses InsightFace (RetinaFace + ArcFace, ONNX Runtime GPU) for face detection and recognition, OpenCV for tracking, CLIP (ONNX Runtime) for zero-shot action classification, and YOLOv8n for head detection.
 
 ## Branches
 
@@ -14,8 +14,8 @@ Uses DeepFace for face recognition, OpenCV for tracking, CLIP (ONNX Runtime) for
 
 ## Features
 
-- **Multi-camera grid** — 2x2, 3x3, or 4x4 camera grid with per-tile face detection and tracking
-- **Face recognition** — DeepFace (RetinaFace detector + Facenet512 embeddings) with CSRT tracking
+- **Multi-camera grid** — 2x2, 3x3, or 4x4 camera grid with per-tile face detection and tracking. RTSP streams decode on the GPU's NVDEC engine when available (PyAV + CUDA hwaccel), keeping CPU free for the rest of the pipeline. Per-camera fallback to software decode if hardware decode init fails.
+- **Face recognition** — InsightFace `buffalo_l` model pack (RetinaFace detector + ArcFace embeddings, ONNX Runtime on GPU) with CSRT tracking. Thread-safe so multiple cameras detect concurrently in a single shared FaceAnalysis instance.
 - **Head detection** — YOLOv8n (ONNX Runtime GPU) supplements face detection to sustain tracking when face is not visible (e.g. turned sideways). Always on when model file exists, graceful fallback if missing.
 - **Visit tracking** — Per-location visits with flip-flop prevention, automatic timeout, and transition detection
 - **Footage recording** — Continuous VP8/WebM recording from visit start to end at native camera resolution
@@ -71,11 +71,21 @@ pip install -r requirements.txt
 
 #### OpenCV tracker errors
 
-If you see "OpenCV tracker not available":
+If you see "OpenCV tracker not available" or boxes/labels never appear in the
+UI even though detection logs show faces, only `opencv-contrib-python` should
+be installed. Both `opencv-python` and `opencv-python-headless` shadow the
+contrib build and silently remove the CSRT/KCF trackers — and
+`pip install insightface` pulls in `opencv-python-headless` transitively.
 
 ```bash
-pip uninstall -y opencv-python
+pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python
 pip install opencv-contrib-python
+```
+
+Verify with:
+
+```bash
+python -c "import cv2; print(hasattr(cv2, 'TrackerCSRT_create'))"   # must print True
 ```
 
 ### 4) Configure environment
@@ -95,6 +105,7 @@ Key settings in `.env`:
 | `VISIT_TRANSITION_SECS` | `2.0` | Grace period before transitioning to a new camera |
 | `ACTION_DETECTION_ENABLED` | `false` | Enable/disable CLIP action detection |
 | `AUTO_CAPTURE_ENABLED` | `false` | Enable/disable auto-capture of unknown persons (best for small crowds) |
+| `USE_NVDEC` | `1` | Use GPU-side video decode (NVDEC) for RTSP streams. Set to `0` to force CPU decode (debugging / non-NVIDIA hosts). |
 
 ### 5) Add face images
 
@@ -143,6 +154,7 @@ models/
   head-yolov8n-onnx/    # YOLOv8n head detector ONNX model (~12MB)
   clip-vit-base-patch32-onnx/  # CLIP ViT-B/32 ONNX model (~600MB)
 grid_config.json        # Saved grid layout + camera slot assignments
+hw_capture.py           # NVDEC-accelerated RTSP capture wrapper (cv2.VideoCapture-compatible)
 docker-compose.yml      # Optional PostgreSQL via Docker (not required for SQLite)
 .env                    # Environment configuration (not committed)
 .env.example            # Example environment file
@@ -227,3 +239,11 @@ curl -X POST http://localhost:5000/api/history/clear
 **Footage won't play in browser** — Files are VP8/WebM. All modern browsers support this. The OpenCV "tag VP80 is not supported" warning is misleading — the files are valid.
 
 **Camera lag on repeated start/stop** — Fixed in recent updates. The engine now fully cleans up GPU models, footage writers, frame buffers, and pending state on stop.
+
+**No bounding boxes / labels appear in UI even though detection logs show faces** — Almost always means the OpenCV CSRT tracker isn't available. Run the OpenCV cleanup in the setup section. `pip install insightface` pulls in `opencv-python-headless` which silently shadows `opencv-contrib-python`.
+
+**Stale `.embeddings.npz` files** — Legacy DeepFace/Facenet512 caches. The current code uses `.arcface.npz` (InsightFace). On first run the new caches regenerate automatically; the old files are unused but can be deleted with `find faces -name ".embeddings.npz" -delete`.
+
+**Recognition threshold tuning** — InsightFace's ArcFace embeddings are more discriminative than the previous Facenet512. If you see too many "unknown" labels for known faces, raise `threshold` in `app.py` (e.g., 0.4 → 0.5). If you see false matches between different people, lower it (0.4 → 0.35).
+
+**NVDEC not engaging** — Check `nvidia-smi dmon -s u` while cameras are running; the `dec` column should be > 0 if NVDEC is active. If it stays at 0, the hardware decode init is silently falling back to CPU. Common causes: codec the GPU doesn't support (older Pascal-and-earlier cards lack HEVC 10-bit / AV1 hardware decode), or stale FFmpeg shared libraries the PyAV wheel can't find. Force-disable NVDEC with `USE_NVDEC=0` in `.env` to confirm it's the culprit.

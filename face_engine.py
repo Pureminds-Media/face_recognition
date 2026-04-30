@@ -8,7 +8,7 @@ import collections
 from queue import Queue, Empty, Full
 import cv2
 import numpy as np
-from deepface import DeepFace
+from insightface.app import FaceAnalysis
 from action_detector import ActionDetector
 from head_detector import HeadDetector
 
@@ -178,7 +178,7 @@ class FaceEngine:
         self,
         known_dir="faces",
         detector="retinaface",
-        model="Facenet512",
+        model="buffalo_l",
         threshold=0.4,
         detect_every=1.0,
         detect_scale=1.0,
@@ -202,6 +202,11 @@ class FaceEngine:
         self.out_fps = out_fps
         self.jpeg_quality = jpeg_quality
         self.allowed_exts = (".jpg", ".png", ".jpeg", ".webp")
+
+        # InsightFace shared FaceAnalysis instance (loaded eagerly in start()
+        # via _preload_inference_models). Thread-safe — multiple camera
+        # workers can call _face_app.get() concurrently.
+        self._face_app = None
         self.known_embeddings = []
         self.tracks = []
         self.in_q = Queue(maxsize=1)
@@ -222,12 +227,11 @@ class FaceEngine:
         self._worker_t = None
         self._main_t = None
         self._lock = threading.Lock()
-        # Serialize all DeepFace inference calls. With many simultaneous
-        # detect_loops the underlying TensorFlow models race during lazy
-        # model load / state mutation; the symptom is that *no* boxes
-        # ever appear because every call either crashes silently or
-        # returns garbage. The lock costs us parallelism but the GPU
-        # was already the bottleneck anyway.
+        # Vestigial: previously serialised DeepFace/TF inference because the
+        # TF/Keras path was not thread-safe. With the InsightFace+ONNX backend
+        # this lock is unused — onnxruntime handles concurrent get() calls
+        # natively. Kept as an attribute in case any external/legacy code
+        # references it.
         self._inference_lock = threading.Lock()
         self._latest_jpeg = None
         # Per-camera annotated full-resolution JPEG for the source the
@@ -302,21 +306,79 @@ class FaceEngine:
         self._unknown_max_images_per_person = 30
         self._unknown_extra_capture_min_interval = 1.0  # seconds between extra saves
         # Per-(person, camera_source) cooldown for extra captures. Saving a
-        # fresh sample on the *same* camera is rate-limited (default 10 min)
-        # since consecutive frames look near-identical, but a different
-        # camera produces genuinely new viewpoints/lighting and is allowed
-        # immediately. Applies to both unknown_N folders and human-named
-        # people once enrolled.
+        # fresh sample on the *same* camera is rate-limited so consecutive
+        # frames don't bloat the folder, but a different camera produces
+        # genuinely new viewpoints/lighting and is allowed immediately.
+        # Applies to both unknown_N folders and human-named people.
+        # Bootstrap behaviour: until a person has at least
+        # ``_extra_capture_bootstrap_count`` samples, the cooldown is reduced
+        # to ``_extra_capture_bootstrap_cooldown`` so a fresh enrolment can
+        # rapidly accumulate a diverse template instead of being stuck with
+        # one noisy first-frame embedding.
         self._extra_capture_per_cam_cooldown = 600.0
+        self._extra_capture_bootstrap_cooldown = 5.0
+        self._extra_capture_bootstrap_count = 10
         self._last_extra_capture_at = {}  # (name, camera_source) -> monotonic ts
         self._last_extra_capture_lock = threading.Lock()
 
+        # Single-flight guard for the background reload_faces() thread.
+        # Without this, every extra-capture event could spawn a parallel
+        # embedding load — memory spikes if several fire within seconds.
+        self._reload_faces_running = False
+        self._reload_faces_lock = threading.Lock()
+
+        # Per-snapshot timestamps so the janitor can TTL-prune entries that
+        # were never claimed via get_snapshot() (e.g., visit closed before
+        # the screenshot saver got to it).
+        self._snapshot_buf_t = {}  # key -> monotonic insertion time
+        # Per-writer last-fed timestamp for orphan detection.
+        self._writer_last_fed = {}  # visit_id -> monotonic last write
+        # Janitor thread handle.
+        self._janitor_t = None
+        self._janitor_stop = threading.Event()
+
     # ---------- public ----------
+    def _preload_inference_models(self):
+        """Eagerly load InsightFace detector + recognition models on GPU.
+
+        InsightFace's FaceAnalysis loads RetinaFace (detection) and ArcFace
+        (recognition) ONNX models. Loaded once on a single thread before any
+        camera worker starts; subsequent get() calls from many threads run
+        concurrently without locking — onnxruntime is thread-safe.
+        """
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+        if self._face_app is not None:
+            return
+        t0 = time.monotonic()
+        try:
+            app = FaceAnalysis(
+                name=self.model,
+                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+                # We only need detection + recognition for matching. Skip
+                # landmark/age/gender models — they cost VRAM and load time
+                # but we never use their outputs.
+                allowed_modules=["detection", "recognition"],
+            )
+            # det_size: larger captures small/distant faces in 4K frames
+            #   (640 default is too small for wide cameras).
+            # det_thresh: 0.3 is more permissive than the 0.5 default;
+            #   the recognition step will reject false positives anyway,
+            #   so it's safe to widen here.
+            app.prepare(ctx_id=0, det_size=(960, 960), det_thresh=0.3)
+            self._face_app = app
+            elapsed = (time.monotonic() - t0) * 1000
+            _log.info("preloaded InsightFace (%s) in %.0f ms", self.model, elapsed)
+        except Exception as e:
+            _log.error("InsightFace preload failed: %s", e)
+            self._face_app = None
+
     def start(self):
         if self._running:
             return
 
         self.stop_evt.clear()
+        self._preload_inference_models()
         self.reload_faces()
 
         if self._is_grid_mode():
@@ -358,7 +420,55 @@ class FaceEngine:
             self._activity_t = threading.Thread(target=self._activity_loop, daemon=True)
             self._activity_t.start()
 
+        # Janitor thread: prunes stale state to keep memory flat over long runs.
+        self._janitor_stop.clear()
+        self._janitor_t = threading.Thread(target=self._janitor_loop, daemon=True, name="engine-janitor")
+        self._janitor_t.start()
+
         self._running = True
+
+    def _janitor_loop(self):
+        """Periodically prune unbounded in-memory state."""
+        # Tunables — keep generous so we never drop something still in use.
+        SNAPSHOT_TTL = 120.0       # JPEGs not claimed in 2 min: drop
+        ACTIVITY_RESULT_TTL = 60.0 # stale activity results
+        ORPHAN_WRITER_TTL = 900.0  # writer not fed for 15 min: orphan
+        TICK = 30.0
+        while not self._janitor_stop.wait(TICK):
+            now = time.monotonic()
+            try:
+                # 1) snapshot_buf TTL prune
+                with self._snapshot_lock:
+                    stale = [k for k, t in self._snapshot_buf_t.items()
+                             if (now - t) > SNAPSHOT_TTL]
+                    for k in stale:
+                        self._snapshot_buf.pop(k, None)
+                        self._snapshot_buf_t.pop(k, None)
+                # 2) activity_results stale prune (entries already expire on
+                #    read, but the dict slot stays; reclaim it)
+                with self._activity_results_lock:
+                    cutoff = now - ACTIVITY_RESULT_TTL
+                    stale = [pid for pid, r in self._activity_results.items()
+                             if float(r.get("t", 0.0)) < cutoff]
+                    for pid in stale:
+                        self._activity_results.pop(pid, None)
+                # 3) orphan writer prune — close writers that haven't been fed
+                with self._writers_lock:
+                    orphans = [vid for vid, last in self._writer_last_fed.items()
+                               if (now - last) > ORPHAN_WRITER_TTL
+                               and vid in self._active_writers]
+                    for vid in orphans:
+                        rec = self._active_writers.pop(vid, None)
+                        self._writer_last_fed.pop(vid, None)
+                        if rec is not None:
+                            try: rec["writer"].release()
+                            except Exception: pass
+                    # also drop last_fed entries for already-closed writers
+                    for vid in list(self._writer_last_fed.keys()):
+                        if vid not in self._active_writers:
+                            self._writer_last_fed.pop(vid, None)
+            except Exception:
+                pass
 
     def stop(self):
         if not self._running:
@@ -372,6 +482,10 @@ class FaceEngine:
         # inside read() (e.g. on RTSP) is a use-after-free → segfault.
         self._running = False
         self.stop_evt.set()
+        self._janitor_stop.set()
+        if self._janitor_t is not None:
+            self._janitor_t.join(timeout=2.0)
+            self._janitor_t = None
 
         # Tear down grid workers (their own cleanup joins+releases safely)
         self._cleanup_grid_mode()
@@ -454,6 +568,7 @@ class FaceEngine:
         # Clear snapshot buffer
         with self._snapshot_lock:
             self._snapshot_buf.clear()
+            self._snapshot_buf_t.clear()
 
         # Clear unknown pending accumulator
         self._unknown_pending.clear()
@@ -647,6 +762,7 @@ class FaceEngine:
         """
         key = (person_name, str(camera_source) if camera_source is not None else None)
         with self._snapshot_lock:
+            self._snapshot_buf_t.pop(key, None)
             return self._snapshot_buf.pop(key, None)
 
     def _push_frame_to_ring(self, camera_source, frame):
@@ -730,6 +846,7 @@ class FaceEngine:
                 "frame_count": 0,      # frames written so far (throttle pacing)
                 "total_frames": 0,     # same as frame_count (no pause/resume)
             }
+            self._writer_last_fed[visit_id] = now
         return True, fname
 
     def _feed_active_writers(self, camera_source, frame, visible_persons):
@@ -770,6 +887,7 @@ class FaceEngine:
                         rec["writer"].write(f)
                     rec["frame_count"] += deficit
                     rec["total_frames"] += deficit
+                    self._writer_last_fed[vid] = now
                 except Exception:
                     pass  # writer may have been released
 
@@ -782,6 +900,7 @@ class FaceEngine:
         """
         with self._writers_lock:
             rec = self._active_writers.pop(visit_id, None)
+            self._writer_last_fed.pop(visit_id, None)
         if rec is None:
             return None, 0.0
         try:
@@ -811,6 +930,7 @@ class FaceEngine:
                 visible_secs = rec["total_frames"] / max(1, rec["fps"])
                 results[vid] = (rec["fname"], visible_secs)
             self._active_writers.clear()
+            self._writer_last_fed.clear()
         return results
 
     def get_qr(self):
@@ -1360,12 +1480,52 @@ class FaceEngine:
             pending.pop(tid, None)
             return None
 
+        # Quality gate: re-run InsightFace on the captured crop. We
+        # require a single, large, high-confidence frontal face before
+        # enrolling — this rejects profile shots, motion-blurred frames,
+        # tracker drift onto hands/shoulders, and false-positive boxes
+        # that slipped through the per-frame detector at low det_thresh.
+        # Tuned for InsightFace's RetinaFace (det_10g) scoring — its
+        # values run lower than DeepFace's RetinaFace, so 0.5 here is
+        # roughly equivalent to DeepFace's old ~0.9 confidence gate.
+        MIN_ENROLL_DET_SCORE = 0.50
+        MIN_ENROLL_FACE_PX = 60
+        if self._face_app is None:
+            pending.pop(tid, None)
+            return None
+        try:
+            qc_faces = self._face_app.get(crop)
+        except Exception:
+            qc_faces = []
+        # Keep only confident faces
+        qc_faces = [
+            f for f in (qc_faces or [])
+            if float(getattr(f, "det_score", 0.0)) >= MIN_ENROLL_DET_SCORE
+        ]
+        if not qc_faces:
+            print(f"[auto-capture] {next_name} candidate REJECTED — no face >= {MIN_ENROLL_DET_SCORE} det_score in crop. Will retry on next track.")
+            pending.pop(tid, None)
+            return None
+        # Pick the largest face in the crop
+        qc_faces.sort(
+            key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
+            reverse=True,
+        )
+        qf = qc_faces[0]
+        qbb = qf.bbox
+        qw = int(qbb[2] - qbb[0])
+        qh = int(qbb[3] - qbb[1])
+        if qw < MIN_ENROLL_FACE_PX or qh < MIN_ENROLL_FACE_PX:
+            print(f"[auto-capture] {next_name} candidate REJECTED — face too small ({qw}x{qh} < {MIN_ENROLL_FACE_PX}px).")
+            pending.pop(tid, None)
+            return None
+
         # Save to faces/unknown_N/1.jpg
         person_dir = os.path.join(self.known_dir, next_name)
         os.makedirs(person_dir, exist_ok=True)
         save_path = os.path.join(person_dir, "1.jpg")
         cv2.imwrite(save_path, crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        print(f"[auto-capture] Saved {next_name} -> {save_path}  (face area={entry['best_area']})")
+        print(f"[auto-capture] Saved {next_name} -> {save_path}  (face {qw}x{qh} det={float(qf.det_score):.2f})")
 
         # Promote track
         track["name"] = next_name
@@ -1400,10 +1560,6 @@ class FaceEngine:
             return False
 
         cam_key = str(camera_source) if camera_source is not None else ""
-        with self._last_extra_capture_lock:
-            last_t = float(self._last_extra_capture_at.get((name, cam_key), 0.0))
-        if (now - last_t) < self._extra_capture_per_cam_cooldown:
-            return False
 
         person_dir = os.path.join(self.known_dir, name)
         if not os.path.isdir(person_dir):
@@ -1415,6 +1571,19 @@ class FaceEngine:
         ]
         n = len(existing)
         if n >= self._unknown_max_images_per_person:
+            return False
+
+        # Bootstrap: a freshly-enrolled person with very few samples has
+        # a noisy template; speed up sample accumulation until we have
+        # enough images to form a stable averaged embedding.
+        cooldown = (
+            self._extra_capture_bootstrap_cooldown
+            if n < self._extra_capture_bootstrap_count
+            else self._extra_capture_per_cam_cooldown
+        )
+        with self._last_extra_capture_lock:
+            last_t = float(self._last_extra_capture_at.get((name, cam_key), 0.0))
+        if (now - last_t) < cooldown:
             return False
 
         bx, by, bw, bh = (int(v) for v in crop_bbox)
@@ -1446,34 +1615,32 @@ class FaceEngine:
         if template is not None:
             try:
                 tight = crop_frame[by:by + bh, bx:bx + bw]
-                if tight.size == 0:
+                if tight.size == 0 or self._face_app is None:
                     return False
-                with self._inference_lock:
-                    faces = DeepFace.extract_faces(
-                        img_path=tight,
-                        detector_backend=self.detector,
-                        enforce_detection=False,
-                        align=True,
-                    )
-                faces = [
-                    f for f in (faces or [])
-                    if float(f.get("confidence", 0.0)) >= 0.90
-                    and f.get("face") is not None
-                ]
-                if not faces:
+                detected = self._face_app.get(tight)
+                detected = [f for f in detected if float(getattr(f, "det_score", 0.0)) >= 0.50]
+                if not detected:
                     return False
-                with self._inference_lock:
-                    rep = DeepFace.represent(
-                        img_path=faces[0]["face"],
-                        model_name=self.model,
-                        detector_backend="skip",
-                        enforce_detection=False,
-                    )
-                if not rep:
+                detected.sort(
+                    key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
+                    reverse=True,
+                )
+                _bb = detected[0].bbox
+                if (int(_bb[2] - _bb[0]) < 60) or (int(_bb[3] - _bb[1]) < 60):
                     return False
-                emb_new = l2norm(rep[0]["embedding"])
+                emb_new = l2norm(detected[0].embedding)
                 d = cosine_distance(emb_new, template)
-                if d > self.threshold:
+                # During bootstrap (few samples → noisy template), be more
+                # permissive — otherwise the noisy template rejects all
+                # legitimate same-person frames and we never improve it.
+                # After bootstrap, enforce the strict threshold to prevent
+                # cross-identity contamination via tracker drift.
+                effective_threshold = (
+                    min(0.85, self.threshold + 0.25)
+                    if n < self._extra_capture_bootstrap_count
+                    else self.threshold
+                )
+                if d > effective_threshold:
                     return False
             except Exception:
                 return False
@@ -1497,13 +1664,22 @@ class FaceEngine:
             self._last_extra_capture_at[(name, cam_key)] = now
 
         # Reload embeddings in the background so the new sample is used
-        # the next time this person enters the frame. Cheap relative to
-        # the once-per-second cap.
+        # the next time this person enters the frame. Single-flight: if
+        # one is already running, skip — without this guard, bursts of
+        # captures could spawn many parallel reloads, each loading the
+        # full embedding set into memory simultaneously.
+        with self._reload_faces_lock:
+            if self._reload_faces_running:
+                return True
+            self._reload_faces_running = True
         def _bg_reload():
             try:
                 self.reload_faces()
             except Exception:
                 pass
+            finally:
+                with self._reload_faces_lock:
+                    self._reload_faces_running = False
         threading.Thread(target=_bg_reload, daemon=True).start()
         return True
 
@@ -1518,15 +1694,17 @@ class FaceEngine:
     def reload_faces(self):
         """Rebuild known embeddings from faces/{name}/*.
 
-        Per-person embedding cache (``<person>/.embeddings.npz``) keyed by
+        Per-person embedding cache (``<person>/.arcface.npz``) keyed by
         filename + mtime. Files whose mtime hasn't changed since the cache
         was written reuse the stored embedding instead of running the
-        detector + represent pipeline again. The detector pass is the
+        detector + recognition pipeline again. The detector pass is the
         slow part of startup, so this turns subsequent boots from O(N
         images) into O(only-new-or-modified images).
         """
         import logging as _logging
         _log = _logging.getLogger(__name__)
+        if self._face_app is None:
+            self._preload_inference_models()
         known = []
         if not os.path.isdir(self.known_dir):
             os.makedirs(self.known_dir, exist_ok=True)
@@ -1536,7 +1714,7 @@ class FaceEngine:
             if not os.path.isdir(person_dir):
                 continue
 
-            cache_path = os.path.join(person_dir, ".embeddings.npz")
+            cache_path = os.path.join(person_dir, ".arcface.npz")
             cache = {}  # filename -> (mtime, embedding ndarray)
             if os.path.isfile(cache_path):
                 try:
@@ -1570,30 +1748,23 @@ class FaceEngine:
                     continue
 
                 try:
-                    faces = DeepFace.extract_faces(
-                        img_path=path,
-                        detector_backend=self.detector,
-                        enforce_detection=False,
-                        align=True,
-                    )
-                    faces = [
-                        f for f in (faces or [])
-                        if float(f.get("confidence", 0.0)) >= 0.90
-                        and f.get("face") is not None
-                    ]
-                    if not faces:
+                    img = cv2.imread(path)
+                    if img is None or self._face_app is None:
                         continue
-                    rep = DeepFace.represent(
-                        img_path=faces[0]["face"],
-                        model_name=self.model,
-                        detector_backend="skip",
-                        enforce_detection=False,
+                    detected = self._face_app.get(img)
+                    detected = [f for f in detected if float(getattr(f, "det_score", 0.0)) >= 0.50]
+                    if not detected:
+                        continue
+                    # If the file has multiple faces, take the largest —
+                    # enrolment crops are expected to be one person per image.
+                    detected.sort(
+                        key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
+                        reverse=True,
                     )
-                    if rep and "embedding" in rep[0]:
-                        emb = l2norm(rep[0]["embedding"])
-                        embs.append(emb)
-                        new_cache[file] = (mtime, emb)
-                        cache_misses += 1
+                    emb = l2norm(detected[0].embedding)
+                    embs.append(emb)
+                    new_cache[file] = (mtime, emb)
+                    cache_misses += 1
                 except Exception as e:
                     _log.debug("reload_faces: skip %s (%s)", path, e)
                     continue
@@ -1623,41 +1794,41 @@ class FaceEngine:
         H, W = frame_full.shape[:2]
         results = []
 
+        if self._face_app is None:
+            return results
+
         try:
             used_scale = self.detect_scale
-            small = cv2.resize(frame_full, None, fx=used_scale, fy=used_scale)
+            if used_scale != 1.0:
+                small = cv2.resize(frame_full, None, fx=used_scale, fy=used_scale)
+            else:
+                small = frame_full
 
-            with self._inference_lock:
-                faces = DeepFace.extract_faces(
-                    img_path=small,
-                    detector_backend=self.detector,
-                    enforce_detection=False,
-                    align=True,
-                )
+            # Detection + embedding in one GPU pass per frame.
+            faces = self._face_app.get(small)
 
-                if not faces:
-                    faces = DeepFace.extract_faces(
-                        img_path=frame_full,
-                        detector_backend=self.detector,
-                        enforce_detection=False,
-                        align=True,
-                    )
-                    used_scale = 1.0
+            # Fallback: if a downscale missed the face, retry full-res once.
+            if not faces and used_scale != 1.0:
+                faces = self._face_app.get(frame_full)
+                used_scale = 1.0
 
             inv = 1.0 / used_scale
         except Exception as _ext_err:
             import logging as _logging
-            _logging.getLogger(__name__).warning("extract_faces failed: %s", _ext_err)
+            _logging.getLogger(__name__).warning("face detection failed: %s", _ext_err)
             faces = []
             inv = 1.0
 
-
         for face in faces:
-            fa = face.get("facial_area", {})
-            x = int(fa.get("x", 0) * inv)
-            y = int(fa.get("y", 0) * inv)
-            w = int(fa.get("w", 0) * inv)
-            h = int(fa.get("h", 0) * inv)
+            # InsightFace bbox is (x1, y1, x2, y2) float ndarray
+            try:
+                bx1, by1, bx2, by2 = face.bbox
+            except Exception:
+                continue
+            x = int(bx1 * inv)
+            y = int(by1 * inv)
+            w = int((bx2 - bx1) * inv)
+            h = int((by2 - by1) * inv)
 
             x = max(0, x)
             y = max(0, y)
@@ -1671,33 +1842,16 @@ class FaceEngine:
             ar = w / float(h)
             if ar < 0.6 or ar > 1.7:
                 continue
-            conf = face.get("confidence", None)
-            if conf is not None and conf < 0.90:
+            conf = float(getattr(face, "det_score", 0.0))
+            if conf < 0.30:
                 continue
 
-            face_img = face.get("face")
-            if face_img is None or getattr(face_img, "size", 0) == 0:
-                continue
-
-            try:
-                with self._inference_lock:
-                    rep_live = DeepFace.represent(
-                        img_path=face_img,
-                        model_name=self.model,
-                        detector_backend="skip",
-                        enforce_detection=False,
-                    )
-                if not rep_live:
-                    if keep_unembedded_unknown:
-                        results.append((x, y, w, h, "unknown", 1.0))
-                    continue
-                emb_live = l2norm(rep_live[0]["embedding"])
-            except Exception as _rep_err:
-                import logging as _logging
-                _logging.getLogger(__name__).warning("represent failed: %s", _rep_err)
+            emb = getattr(face, "embedding", None)
+            if emb is None:
                 if keep_unembedded_unknown:
                     results.append((x, y, w, h, "unknown", 1.0))
                 continue
+            emb_live = l2norm(emb)
 
             name = "unknown"
             best = 1.0
@@ -1963,7 +2117,13 @@ class FaceEngine:
                 ordered_sources.append(None)
                 continue
 
-            cap = cv2.VideoCapture(source)
+            # Use NVDEC for RTSP/HTTP sources when available; the opener
+            # transparently falls back to cv2.VideoCapture if hardware
+            # decode init fails for any reason (codec mismatch, GPU
+            # memory, driver issue), so existing reconnect logic still
+            # works. Set USE_NVDEC=0 in env to force CPU decode.
+            from hw_capture import open_capture as _hw_open
+            cap = _hw_open(source)
             if not cap.isOpened():
                 try:
                     cap.release()
@@ -2166,7 +2326,13 @@ class FaceEngine:
             )
 
     def _grid_detect_loop(self, worker):
-        UNKNOWN_TO_FORGET = 3
+        # How many consecutive "unknown" detections before a previously
+        # named track (unknown_N) is demoted back to "unknown". A single-
+        # image template is noisy — same-person frames can momentarily
+        # cosine-distance > threshold due to blur/angle/lighting. Forget
+        # too eagerly and we re-enrol the same person as a new folder.
+        # 12 frames × 0.3 s detect_every ≈ 3.6 s of patience.
+        UNKNOWN_TO_FORGET = 12
         detect_period = max(0.25, float(self.detect_every))
         while not self.stop_evt.is_set() and not self._grid_stop_evt.is_set() and not worker["stop_evt"].is_set():
             try:
@@ -2353,7 +2519,12 @@ class FaceEngine:
                     try:
                         tr = create_tracker(self.tracker_type)
                         tr.init(frame, det_bbox)
-                    except Exception:
+                    except Exception as _trk_err:
+                        import logging as _logging
+                        _logging.getLogger(__name__).warning(
+                            "tracker init failed for det_bbox=%s frame_shape=%s: %s",
+                            det_bbox, frame.shape, _trk_err,
+                        )
                         continue
                     tracks.append(
                         {
@@ -2501,10 +2672,11 @@ class FaceEngine:
             if src not in analysis_sources:
                 analysis_sources.append(src)
 
-        # Reconfirm windows scale with the number of cameras: detection is
-        # serialized through _inference_lock, so per-camera detect cadence
-        # is roughly num_workers * detect_every. Tracks must outlive that
-        # window or every track gets killed before reconfirmation.
+        # Reconfirm windows scale with the number of cameras: even with
+        # concurrent inference (lock removed), per-camera detect cadence
+        # can stretch to ~num_workers * detect_every under GPU contention.
+        # Tracks must outlive that window or every track gets killed before
+        # reconfirmation.
         n_workers = max(1, len([s for s in analysis_sources if s is not None]))
         unknown_reconfirm_secs = max(3.0, self.detect_every * 5.0 * n_workers)
         known_reconfirm_secs = max(5.0, self.detect_every * 7.0 * n_workers)
@@ -2647,13 +2819,17 @@ class FaceEngine:
                         continue
 
                     is_unknown = name == "unknown"
-                    color = (0, 0, 255) if is_unknown else (0, 255, 0)
-                    cv2.rectangle(tile, (x, y), (x + w, y + h), color, 2)
-                    label = "unknown" if is_unknown else name
                     act_label, act_conf = self.get_activity(name) if not is_unknown else (None, 0.0)
-                    if act_label:
-                        label = f"{name} | {act_label}"
-                    cv2.putText(tile, label, (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+                    # Browser stream tiles intentionally have no per-person
+                    # bounding boxes or labels — when a camera contains many
+                    # people the boxes overlap each other into illegible mess.
+                    # Boxes/names ARE drawn into ``annotated_raw`` further
+                    # below, which feeds the footage writer, the visit
+                    # screenshot, and any single-view stream — i.e. all the
+                    # places where the user is looking at a single person /
+                    # reviewing history. The track data is also published in
+                    # ``aggregated_tracks`` so a future client-side overlay
+                    # could draw selectively.
 
                     aggregated_tracks.append(
                         {
@@ -2742,8 +2918,11 @@ class FaceEngine:
                     if ok_snap:
                         snap_bytes = snap_buf.tobytes()
                         with self._snapshot_lock:
+                            t_now = time.monotonic()
                             for pname in known_on_tile:
-                                self._snapshot_buf[(pname, str(source))] = snap_bytes
+                                key = (pname, str(source))
+                                self._snapshot_buf[key] = snap_bytes
+                                self._snapshot_buf_t[key] = t_now
                     last_snap_t = now
 
                 # Push to rolling frame ring buffer + active writers at native resolution
@@ -2751,13 +2930,40 @@ class FaceEngine:
                 if has_active_writer:
                     self._feed_active_writers(source, footage_frame, visible)
 
-                # Encode the annotated full-res frame for single-view display.
+                # Encode the annotated frame for single-view display.
                 # Throttled to out_fps to keep CPU encode work bounded.
-                if (is_viewer_single and need_annotated_raw and
+                # IMPORTANT: cap the encoded resolution so the MJPEG
+                # bitrate stays sane. Encoding 4K JPEGs at 15 fps produces
+                # ~15 MB/s which overwhelms the browser's <img>
+                # MJPEG renderer and causes the stream to stall for
+                # minutes after a camera switch.
+                #
+                # Source frame for the stream is ``raw_frame`` (CLEAN —
+                # no boxes/labels). Annotations remain on
+                # ``annotated_raw``/``footage_frame`` for footage and
+                # screenshots. Rationale: with many people in a frame the
+                # bounding-box rendering gets visually messy in a live
+                # view; recordings and per-visit screenshots still want
+                # the annotation overlay for after-the-fact review.
+                stream_src = raw_frame if raw_frame is not None else footage_frame
+                if (is_viewer_single and stream_src is not None and
                         (now - last_single_encode_t) >= (1.0 / max(1, self.out_fps))):
                     last_single_encode_t = now
+                    src_h, src_w = stream_src.shape[:2]
+                    max_w = int(self.width)
+                    max_h = int(self.height)
+                    if src_w > max_w or src_h > max_h:
+                        scale = min(max_w / src_w, max_h / src_h)
+                        new_w = max(1, int(round(src_w * scale)))
+                        new_h = max(1, int(round(src_h * scale)))
+                        encode_src = cv2.resize(
+                            stream_src, (new_w, new_h),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    else:
+                        encode_src = stream_src
                     ok_s, buf_s = cv2.imencode(
-                        ".jpg", footage_frame,
+                        ".jpg", encode_src,
                         [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)],
                     )
                     if ok_s:
@@ -2886,7 +3092,7 @@ class FaceEngine:
                 else:
                     det_t, results = now, det_out
 
-                UNKNOWN_TO_FORGET = 3  # how many consecutive "unknown" hits before we downgrade a known track
+                UNKNOWN_TO_FORGET = 12  # how many consecutive "unknown" hits before we downgrade a known track
                 unknown_stale_secs = max(1.2, self.detect_every * 1.2)  # must be >= detect_every to avoid flicker
                 # Ignore stale detector results only when we already have active tracks.
                 # This avoids losing bootstrap detections on slower hardware.
@@ -3052,6 +3258,12 @@ class FaceEngine:
                 pass
 
             # 4) draw
+            # Keep an unannotated copy for the browser MJPEG stream — when
+            # multiple people are in frame the bounding boxes overlap into
+            # an illegible mess. Annotations still go on ``frame`` itself,
+            # which is what feeds the footage writer and per-visit
+            # screenshots; only the live preview is clean.
+            clean_frame = frame.copy()
             for t in self.tracks:
                 x, y, w, h = map(int, t["bbox"])
 
@@ -3081,8 +3293,11 @@ class FaceEngine:
                     snap_bytes = snap_buf.tobytes()
                     cam_src = str(self.cam_index)
                     with self._snapshot_lock:
+                        t_now = time.monotonic()
                         for pname in known_on_frame:
-                            self._snapshot_buf[(pname, cam_src)] = snap_bytes
+                            key = (pname, cam_src)
+                            self._snapshot_buf[key] = snap_bytes
+                            self._snapshot_buf_t[key] = t_now
                 last_snap_t = now
 
             # 4c) push frame to rolling ring buffer + active writers (single-camera)
@@ -3097,7 +3312,7 @@ class FaceEngine:
             if now - last_encode_t >= (1.0 / max(1, self.out_fps)):
                 last_encode_t = now
                 ok, buf = cv2.imencode(
-                    ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)]
+                    ".jpg", clean_frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)]
                 )
                 if ok:
                     # Build track list outside lock to avoid nested lock acquisition

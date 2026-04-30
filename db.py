@@ -231,6 +231,9 @@ def _sqlite_get_conn():
         conn = sqlite3.connect(_sqlite_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
+        # Auto-checkpoint every ~1000 pages (~4 MB) so the WAL file doesn't
+        # balloon during long uptime and stall reads on flush.
+        conn.execute("PRAGMA wal_autocheckpoint=1000")
         conn.execute("PRAGMA foreign_keys=ON")
         _local.conn = conn
     return conn

@@ -273,8 +273,8 @@ os.makedirs(FOOTAGE_DIR, exist_ok=True)
 _ENGINE_KWARGS = dict(
     known_dir=FACES_DIR,
     detector="retinaface",
-    model="Facenet512",
-    threshold=0.4,
+    model="buffalo_l",
+    threshold=0.5,
     detect_every=0.3,
     detect_scale=1.0,
     tracker_type="CSRT",
@@ -398,6 +398,69 @@ def _bootstrap_post_engine():
 # In-memory visit tracking state: person_name -> {location_id, visit_id, camera_source}
 _active_visits = {}
 _last_stale_check = time.monotonic()
+
+# --- Background DB writer ---------------------------------------------------
+# Per-frame DB writes (update_visit_seen, update_visit_activity) used to run
+# inline on the attendance update path, blocking frame encoding when the WAL
+# flushed or the disk was busy. Instead we throttle them to once every
+# DB_SEEN_THROTTLE_SECS per visit and drain them off-thread.
+DB_SEEN_THROTTLE_SECS = 2.0
+_db_writer_q: "Queue[tuple]" = Queue(maxsize=10000)
+_last_seen_write: dict = {}      # visit_id -> last update_visit_seen monotonic
+_last_activity_write: dict = {}  # visit_id -> last update_visit_activity monotonic
+
+
+def _db_writer_loop():
+    while True:
+        try:
+            op = _db_writer_q.get()
+        except Exception:
+            continue
+        if op is None:
+            return
+        try:
+            kind = op[0]
+            if kind == "seen":
+                _, vid, conf = op
+                db.update_visit_seen(vid, confidence=conf)
+            elif kind == "activity":
+                _, vid, label = op
+                db.update_visit_activity(vid, label)
+        except Exception as e:
+            log.debug("DB writer op failed: %s", e)
+
+
+threading.Thread(target=_db_writer_loop, daemon=True, name="db-writer").start()
+
+
+def _enqueue_visit_seen(visit_id, confidence=None):
+    """Throttled, non-blocking update_visit_seen."""
+    if visit_id is None:
+        return
+    now = time.monotonic()
+    last = _last_seen_write.get(visit_id, 0.0)
+    if (now - last) < DB_SEEN_THROTTLE_SECS:
+        return
+    _last_seen_write[visit_id] = now
+    try:
+        _db_writer_q.put_nowait(("seen", visit_id, confidence))
+    except Full:
+        pass
+
+
+def _enqueue_visit_activity(visit_id, label):
+    """Throttled, non-blocking update_visit_activity."""
+    if visit_id is None or not label:
+        return
+    now = time.monotonic()
+    last = _last_activity_write.get(visit_id, 0.0)
+    if (now - last) < DB_SEEN_THROTTLE_SECS:
+        return
+    _last_activity_write[visit_id] = now
+    try:
+        _db_writer_q.put_nowait(("activity", visit_id, label))
+    except Full:
+        pass
 
 
 def _shutdown_db():
@@ -607,7 +670,7 @@ def _update_attendance_from_tracks(tracks):
                 # Keep DB column up-to-date (not just on visit close)
                 top = engine.get_visit_top_activity(vid)
                 if top and db.is_available():
-                    db.update_visit_activity(vid, top)
+                    _enqueue_visit_activity(vid, top)
 
     # Mark disappeared after a grace period (avoid flicker)
     for name, s in list(attendance_state.items()):
@@ -732,8 +795,8 @@ def _update_visit_for_person(name, camera_source, confidence=None, last_detect_t
         _save_visit_screenshot(vid, name, camera_source)
         _start_visit_footage(vid, name, camera_source)
     elif active["location_id"] == loc_id:
-        # Same location — update last_seen in DB
-        db.update_visit_seen(active["visit_id"], confidence=confidence)
+        # Same location — update last_seen in DB (throttled, off-thread)
+        _enqueue_visit_seen(active["visit_id"], confidence=confidence)
         # Only refresh the monotonic clock if the face detector recently
         # confirmed this track.  Tracker-only ghost boxes must NOT keep
         # the timer alive, or they block visit transitions to other cameras.
@@ -745,7 +808,7 @@ def _update_visit_for_person(name, camera_source, confidence=None, last_detect_t
         if elapsed < VISIT_TRANSITION_SECS:
             # Still recently seen on original camera (overlap zone) — do NOT
             # transition; just keep the existing visit alive.
-            db.update_visit_seen(active["visit_id"], confidence=confidence)
+            _enqueue_visit_seen(active["visit_id"], confidence=confidence)
             log.debug("Visit overlap: %s seen on cam %s but active on loc %s (%.1fs ago, need %.1fs)",
                        name, camera_source, active["location_id"], elapsed, VISIT_TRANSITION_SECS)
         else:
