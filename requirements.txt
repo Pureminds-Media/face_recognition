@@ -1,7 +1,21 @@
-absl-py==2.4.0
+# This is a `pip freeze` snapshot — it pins every direct AND transitive
+# dependency in the venv at the time it was generated. It is intentionally
+# verbose so that fresh installs reproduce the exact tested combination.
+#
+# After the migration off DeepFace → InsightFace, the following packages
+# are no longer used at runtime and have been removed:
+#   deepface, retina-face, mtcnn, tf_keras, tensorflow, keras,
+#   tensorboard, tensorboard-data-server, gast, libclang, ml_dtypes,
+#   namex, optree, astunparse, google-pasta, opt_einsum, termcolor,
+#   wrapt, h5py, lightdsa, lightecc, lightphe, mediapipe, gdown, fire,
+#   sounddevice, absl-py, flatbuffers
+# Removing them in one place — leave them out of pip-freeze regenerations.
+# The legacy `face_recognition_testing.py` and `test_same_image.py` scripts
+# still import deepface; those are dev-only and break unless deepface
+# is reinstalled by hand.
+
 annotated-doc==0.0.4
 anyio==4.12.1
-astunparse==1.6.3
 beautifulsoup4==4.14.3
 blinker==1.9.0
 certifi==2026.1.4
@@ -13,23 +27,14 @@ contourpy==1.3.3
 cuda-bindings==12.9.4
 cuda-pathfinder==1.2.2
 cycler==0.12.1
-# deepface — replaced by insightface for face detection + recognition.
-# Kept commented for reference; only legacy test scripts still reference it.
-# deepface==0.0.98
 filelock==3.20.3
-fire==0.7.1
 Flask==3.1.2
-flatbuffers==25.12.19
 fonttools==4.61.1
 fsspec==2026.2.0
-gast==0.7.0
-gdown==5.2.1
-google-pasta==0.2.0
 grpcio==1.76.0
 gunicorn==25.0.1
 waitress==3.0.2
 h11==0.16.0
-h5py==3.15.1
 hf-xet==1.3.2
 httpcore==1.0.9
 httpx==0.28.1
@@ -40,23 +45,14 @@ idna==3.11
 itsdangerous==2.2.0
 Jinja2==3.1.6
 joblib==1.5.3
-keras==3.13.2
 kiwisolver==1.4.9
-libclang==18.1.1
-lightdsa==0.0.3
-lightecc==0.0.4
-lightphe==0.0.20
 lz4==4.4.5
 Markdown==3.10.1
 markdown-it-py==4.0.0
 MarkupSafe==3.0.3
 matplotlib==3.10.8
 mdurl==0.1.2
-mediapipe==0.10.32
-ml_dtypes==0.5.4
 mpmath==1.3.0
-mtcnn==1.0.0
-namex==0.1.0
 networkx==3.6.1
 numpy==2.4.3
 nvidia-cublas-cu12==12.8.4.1
@@ -83,10 +79,8 @@ opencv-contrib-python==4.13.0.92
 # opencv-contrib-python and remove the CSRT/KCF trackers we depend on.
 # `pip install insightface` pulls in opencv-python-headless transitively;
 # uninstall it after install if it sneaks in.
-opt_einsum==3.4.0
 optimum==2.1.0
 optimum-onnx==0.1.0
-optree==0.18.0
 packaging==26.0
 pandas==3.0.0
 pillow==12.1.0
@@ -104,20 +98,13 @@ python-dotenv==1.2.1
 PyYAML==6.0.3
 regex==2026.2.28
 requests==2.32.5
-retina-face==0.0.17
 rich==14.3.2
 safetensors==0.7.0
 scipy==1.17.1
 shellingham==1.5.4
 six==1.17.0
-sounddevice==0.5.5
 soupsieve==2.8.3
 sympy==1.14.0
-tensorboard==2.20.0
-tensorboard-data-server==0.7.2
-tensorflow==2.20.0
-termcolor==3.3.0
-tf_keras==2.20.1
 tokenizers==0.22.2
 torch==2.10.0
 torchvision==0.25.0
