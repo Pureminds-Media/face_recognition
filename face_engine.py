@@ -188,6 +188,7 @@ class FaceEngine:
         height=1080,
         out_fps=15,
         jpeg_quality=80,
+        live_annotations=True,
     ):
         self.known_dir = known_dir
         self.detector = detector
@@ -201,6 +202,9 @@ class FaceEngine:
         self.height = height
         self.out_fps = out_fps
         self.jpeg_quality = jpeg_quality
+        # Whether to render bounding boxes + name labels onto the live
+        # MJPEG stream. Footage and screenshots are always annotated.
+        self.live_annotations = bool(live_annotations)
         self.allowed_exts = (".jpg", ".png", ".jpeg", ".webp")
 
         # InsightFace shared FaceAnalysis instance (loaded eagerly in start()
@@ -365,7 +369,7 @@ class FaceEngine:
             # det_thresh: 0.3 is more permissive than the 0.5 default;
             #   the recognition step will reject false positives anyway,
             #   so it's safe to widen here.
-            app.prepare(ctx_id=0, det_size=(960, 960), det_thresh=0.3)
+            app.prepare(ctx_id=0, det_size=(960, 960), det_thresh=0.5)
             self._face_app = app
             elapsed = (time.monotonic() - t0) * 1000
             _log.info("preloaded InsightFace (%s) in %.0f ms", self.model, elapsed)
@@ -2820,16 +2824,19 @@ class FaceEngine:
 
                     is_unknown = name == "unknown"
                     act_label, act_conf = self.get_activity(name) if not is_unknown else (None, 0.0)
-                    # Browser stream tiles intentionally have no per-person
-                    # bounding boxes or labels — when a camera contains many
-                    # people the boxes overlap each other into illegible mess.
-                    # Boxes/names ARE drawn into ``annotated_raw`` further
-                    # below, which feeds the footage writer, the visit
-                    # screenshot, and any single-view stream — i.e. all the
-                    # places where the user is looking at a single person /
-                    # reviewing history. The track data is also published in
-                    # ``aggregated_tracks`` so a future client-side overlay
-                    # could draw selectively.
+                    # Live-feed annotations: gated by ``self.live_annotations``.
+                    # When disabled the tile is encoded clean — useful for
+                    # busy scenes where overlapping boxes turn into mess.
+                    # Boxes/names are still drawn into ``annotated_raw``
+                    # further below for the footage writer + screenshots.
+                    if self.live_annotations:
+                        color = (0, 0, 255) if is_unknown else (0, 255, 0)
+                        cv2.rectangle(tile, (x, y), (x + w, y + h), color, 2)
+                        label = "unknown" if is_unknown else name
+                        if act_label:
+                            label = f"{name} | {act_label}"
+                        cv2.putText(tile, label, (x, max(0, y - 8)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
                     aggregated_tracks.append(
                         {
@@ -2938,14 +2945,16 @@ class FaceEngine:
                 # MJPEG renderer and causes the stream to stall for
                 # minutes after a camera switch.
                 #
-                # Source frame for the stream is ``raw_frame`` (CLEAN —
-                # no boxes/labels). Annotations remain on
-                # ``annotated_raw``/``footage_frame`` for footage and
-                # screenshots. Rationale: with many people in a frame the
-                # bounding-box rendering gets visually messy in a live
-                # view; recordings and per-visit screenshots still want
-                # the annotation overlay for after-the-fact review.
-                stream_src = raw_frame if raw_frame is not None else footage_frame
+                # Source frame for the stream:
+                # - if ``live_annotations`` is on, use ``footage_frame``
+                #   (annotated_raw) so the user sees boxes/labels;
+                # - otherwise encode from clean ``raw_frame``.
+                # Either way, footage_frame keeps its annotations for the
+                # footage writer + screenshots.
+                if self.live_annotations:
+                    stream_src = footage_frame if footage_frame is not None else raw_frame
+                else:
+                    stream_src = raw_frame if raw_frame is not None else footage_frame
                 if (is_viewer_single and stream_src is not None and
                         (now - last_single_encode_t) >= (1.0 / max(1, self.out_fps))):
                     last_single_encode_t = now
@@ -3311,8 +3320,11 @@ class FaceEngine:
             # 5) encode at limited FPS
             if now - last_encode_t >= (1.0 / max(1, self.out_fps)):
                 last_encode_t = now
+                # Pick annotated ``frame`` or pre-draw ``clean_frame`` for
+                # the stream depending on the live-annotations toggle.
+                stream_frame = frame if self.live_annotations else clean_frame
                 ok, buf = cv2.imencode(
-                    ".jpg", clean_frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)]
+                    ".jpg", stream_frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)]
                 )
                 if ok:
                     # Build track list outside lock to avoid nested lock acquisition

@@ -270,6 +270,13 @@ os.makedirs(FOOTAGE_DIR, exist_ok=True)
 # because Python's `spawn` start method re-imports app.py in the child;
 # any unguarded mp.Process() / Manager() at module level recurses.
 # Instead, expose a bootstrap function that the __main__ block calls.
+def _env_bool(name, default):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
 _ENGINE_KWARGS = dict(
     known_dir=FACES_DIR,
     detector="retinaface",
@@ -282,6 +289,12 @@ _ENGINE_KWARGS = dict(
     height=720,
     out_fps=15,
     jpeg_quality=80,
+    # Draw bounding boxes + name labels on the live MJPEG feed.
+    # Default on. Set LIVE_ANNOTATIONS_ENABLED=0 in .env to get a clean
+    # stream — useful when many people are in frame and box overlays
+    # become illegible. Footage recordings and per-visit screenshots
+    # are always annotated regardless of this flag.
+    live_annotations=_env_bool("LIVE_ANNOTATIONS_ENABLED", True),
 )
 
 # Module-level placeholder so route handlers (which only resolve `engine`

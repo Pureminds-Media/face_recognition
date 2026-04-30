@@ -250,13 +250,15 @@ Append `?api_key=<key>`. Drop the URL into an `<img>` tag. The viewer
 follows whatever camera/grid is currently active — switch via
 `POST /api/camera`.
 
-The MJPEG stream is intentionally **clean** — no per-person bounding
-boxes or name labels are drawn on the live feed (they cluttered the
-view when many people were present). Boxes/labels remain on the saved
-footage clips and per-visit screenshots for after-the-fact review. If
-your client UI wants to overlay boxes, poll `GET /api/tracks` (or read
-the bbox field on `/api/attendance/stream`'s state events) and render
-them as a transparent layer over the `<img>`.
+By default the MJPEG stream is **annotated** — bounding boxes and name
+labels are drawn on the live feed. To turn this off (e.g. for crowded
+scenes where overlapping boxes become illegible), set the server-side
+env var `LIVE_ANNOTATIONS_ENABLED=0` and restart the server. Saved
+footage clips and per-visit screenshots remain annotated regardless of
+this flag. Clients that want to render their own overlay (e.g. a
+selective highlight only on tapped people) can poll `GET /api/tracks`
+or read the bbox field on `/api/attendance/stream`'s state events and
+draw a transparent layer over the `<img>`.
 
 In single-camera viewer mode the source-frame is downscaled to the
 engine's `width × height` (defaults `1280 × 720`) before JPEG encoding,

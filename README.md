@@ -15,7 +15,7 @@ Uses InsightFace (RetinaFace + ArcFace, ONNX Runtime GPU) for face detection and
 ## Features
 
 - **Multi-camera analysis** — every configured camera runs concurrently in a shared analysis pool: face detection, recognition, tracking, visit bookkeeping, and footage capture all happen for every camera at once regardless of which one is on screen. RTSP streams decode on the GPU's NVDEC engine when available (PyAV + CUDA hwaccel), keeping CPU free for the rest of the pipeline. Per-camera fallback to software decode if hardware decode init fails.
-- **UI is single-camera-only** — the live preview cycles between cameras one at a time (carousel arrows / swipe). Boxes and name labels are intentionally **not drawn** on the live feed — with many people in frame the overlays become illegible. Annotations are still rendered into the recorded footage and per-visit screenshots for after-the-fact review.
+- **UI is single-camera-only** — the live preview cycles between cameras one at a time (carousel arrows / swipe). Bounding boxes and name labels are drawn on the live feed by default; toggle off via `LIVE_ANNOTATIONS_ENABLED=0` when crowded scenes turn the overlays into illegible mess. Footage recordings and per-visit screenshots are always annotated regardless of this flag.
 - **Face recognition** — InsightFace `buffalo_l` model pack (RetinaFace detector + ArcFace embeddings, ONNX Runtime on GPU) with CSRT tracking. Thread-safe so multiple cameras detect concurrently in a single shared FaceAnalysis instance.
 - **Head detection** — YOLOv8n (ONNX Runtime GPU) supplements face detection to sustain tracking when face is not visible (e.g. turned sideways). Always on when model file exists, graceful fallback if missing.
 - **Visit tracking** — Per-location visits with flip-flop prevention, automatic timeout, and transition detection
@@ -107,6 +107,7 @@ Key settings in `.env`:
 | `ACTION_DETECTION_ENABLED` | `false` | Enable/disable CLIP action detection |
 | `AUTO_CAPTURE_ENABLED` | `false` | Enable/disable auto-capture of unknown persons (best for small crowds) |
 | `USE_NVDEC` | `1` | Use GPU-side video decode (NVDEC) for RTSP streams. Set to `0` to force CPU decode (debugging / non-NVIDIA hosts). |
+| `LIVE_ANNOTATIONS_ENABLED` | `1` | Draw bounding boxes + name labels on the live MJPEG feed. Set to `0` for a clean live stream when scenes get crowded — boxes still appear on saved footage and per-visit screenshots regardless. |
 
 ### 5) Add face images
 
