@@ -15,16 +15,16 @@ Uses InsightFace (RetinaFace + ArcFace, ONNX Runtime GPU) for face detection and
 ## Features
 
 - **Multi-camera analysis** — every configured camera runs concurrently in a shared analysis pool: face detection, recognition, tracking, visit bookkeeping, and footage capture all happen for every camera at once regardless of which one is on screen. RTSP streams decode on the GPU's NVDEC engine when available (PyAV + CUDA hwaccel), keeping CPU free for the rest of the pipeline. Per-camera fallback to software decode if hardware decode init fails.
-- **UI is single-camera-only** — the live preview cycles between cameras one at a time (carousel arrows / swipe). Bounding boxes and name labels are drawn on the live feed by default; toggle off via `LIVE_ANNOTATIONS_ENABLED=0` when crowded scenes turn the overlays into illegible mess. Footage recordings and per-visit screenshots are always annotated regardless of this flag.
+- **UI is single-camera-only** — the live preview cycles between cameras one at a time (carousel arrows / swipe). Bounding boxes and name labels are drawn on the live feed by default; toggle off via `LIVE_ANNOTATIONS_ENABLED=0` when crowded scenes turn the overlays into illegible mess. Footage recordings are always annotated regardless of this flag.
 - **Face recognition** — InsightFace `buffalo_l` model pack (RetinaFace detector + ArcFace embeddings, ONNX Runtime on GPU) with CSRT tracking. Thread-safe so multiple cameras detect concurrently in a single shared FaceAnalysis instance.
 - **Head detection** — YOLOv8n (ONNX Runtime GPU) supplements face detection to sustain tracking when face is not visible (e.g. turned sideways). Always on when model file exists, graceful fallback if missing.
 - **Visit tracking** — Per-location visits with flip-flop prevention, automatic timeout, and transition detection
 - **Footage recording** — Continuous VP8/WebM recording from visit start to end at native camera resolution
 - **Action detection** — CLIP ViT-B/32 zero-shot classification (e.g., "Using phone", "Typing", "Idle"). Only runs when face detector confirms the person (not on head-only or tracker-only boxes). Optional, toggled via `ACTION_DETECTION_ENABLED` env var.
 - **Auto-capture unknowns** — Automatically saves face crops of unrecognised people as `unknown_1`, `unknown_2`, etc. Re-identifies them on reappearance. Best for small crowds. Optional, toggled via `AUTO_CAPTURE_ENABLED` env var.
+- **AI kill switch** — Set `FACE_DETECTION_ENABLED=false` to disable all inference (detection, recognition, tracking, attendance) and run as a pure camera stream viewer. Useful for diagnosing lag or running on non-GPU hardware.
 - **People management** — Dedicated `/people` page to view all enrolled persons, rename anyone (especially auto-captured unknowns), delete persons, view face images, transfer images between persons, and delete individual images.
 - **History dashboard** — Daily summary, per-person, and per-location visit history with footage playback
-- **Screenshot capture** — Automatic per-visit screenshot on first detection
 - **SSE attendance stream** — Real-time attendance events via Server-Sent Events
 
 ## Requirements
@@ -104,10 +104,12 @@ Key settings in `.env`:
 | `DATABASE_URL` | *(none)* | PostgreSQL connection string (overrides SQLite) |
 | `VISIT_TIMEOUT_MINUTES` | `10` | Close a visit after this many minutes unseen |
 | `VISIT_TRANSITION_SECS` | `2.0` | Grace period before transitioning to a new camera |
+| `FACE_DETECTION_ENABLED` | `true` | Master AI switch. Set to `false` to disable all face detection, recognition, tracking, and attendance — the system becomes a plain camera stream viewer with no GPU inference load. |
 | `ACTION_DETECTION_ENABLED` | `false` | Enable/disable CLIP action detection |
 | `AUTO_CAPTURE_ENABLED` | `false` | Enable/disable auto-capture of unknown persons (best for small crowds) |
-| `USE_NVDEC` | `1` | Use GPU-side video decode (NVDEC) for RTSP streams. Set to `0` to force CPU decode (debugging / non-NVIDIA hosts). |
-| `LIVE_ANNOTATIONS_ENABLED` | `1` | Draw bounding boxes + name labels on the live MJPEG feed. Set to `0` for a clean live stream when scenes get crowded — boxes still appear on saved footage and per-visit screenshots regardless. |
+| `USE_NVDEC` | `true` | Use GPU-side video decode (NVDEC) for RTSP streams. Set to `false` to force CPU decode (debugging / non-NVIDIA hosts). |
+| `LIVE_ANNOTATIONS_ENABLED` | `true` | Draw bounding boxes + name labels on the live MJPEG feed. Set to `false` for a clean live stream when scenes get crowded — boxes still appear on saved footage regardless. |
+| `FOOTAGE_DIR` | *(required)* | Directory where footage WebM files are written. Set to a network mount path (e.g. `/mnt/camera_system/footage`) to offload storage to a NAS. |
 
 ### 5) Add face images
 
@@ -150,8 +152,7 @@ templates/
   history.html          # Visit history dashboard
   people.html           # People management (view, rename, delete, transfer)
 faces/                  # Enrolled face images (per-person subdirectories)
-footage/                # Recorded visit footage (WebM)
-screenshots/            # Visit screenshots (JPEG)
+footage/                # Recorded visit footage (WebM) — or a NAS mount path via FOOTAGE_DIR
 models/
   head-yolov8n-onnx/    # YOLOv8n head detector ONNX model (~12MB)
   clip-vit-base-patch32-onnx/  # CLIP ViT-B/32 ONNX model (~600MB)

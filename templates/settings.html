@@ -219,13 +219,22 @@
                   <div class="font-medium">IP Cameras</div>
                   <div class="text-xs text-slate-400">Group cameras under a shared RTSP base (e.g. an NVR). Add channels by number, or use the "Standalone" group for one-off URLs. All edits auto-save.</div>
                 </div>
-                <button
-                  id="addGroupBtn"
-                  type="button"
-                  class="shrink-0 rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium"
-                >
-                  + Add Group
-                </button>
+                <div class="flex gap-2 shrink-0">
+                  <button
+                    id="addCameraBtn"
+                    type="button"
+                    class="rounded-lg bg-slate-700 hover:bg-slate-600 px-3 py-2 text-sm font-medium"
+                  >
+                    + Add Camera
+                  </button>
+                  <button
+                    id="addGroupBtn"
+                    type="button"
+                    class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium"
+                  >
+                    + Add Group
+                  </button>
+                </div>
               </div>
               <div class="p-4 space-y-4">
                 <div id="ipCamMsg" class="text-xs"></div>
@@ -368,6 +377,33 @@
           >
             Transfer
           </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Add Solo Camera Modal -->
+    <div id="addCameraModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+      <div class="bg-slate-900 border border-slate-700 rounded-xl p-6 w-full max-w-md mx-4">
+        <h3 class="text-lg font-semibold mb-1">Add Camera</h3>
+        <p class="text-slate-400 text-xs mb-4">Enter a full RTSP URL — e.g. <span class="font-mono">rtsp://admin:pass@192.168.1.81:554/h264_stream</span></p>
+        <div class="space-y-3 mb-4">
+          <div>
+            <label class="block text-sm text-slate-400 mb-1">Name</label>
+            <input id="addCamName" type="text" maxlength="64" placeholder="e.g. Lobby"
+              class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white focus:outline-none focus:border-emerald-500 text-sm" />
+          </div>
+          <div>
+            <label class="block text-sm text-slate-400 mb-1">RTSP URL</label>
+            <input id="addCamUrl" type="text" placeholder="rtsp://..."
+              class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white focus:outline-none focus:border-emerald-500 text-sm font-mono" />
+          </div>
+          <div id="addCamError" class="text-red-400 text-sm hidden"></div>
+        </div>
+        <div class="flex gap-3 justify-end">
+          <button onclick="closeAddCameraModal()"
+            class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm">Cancel</button>
+          <button id="addCamSubmitBtn" onclick="submitAddCamera()"
+            class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium">Add Camera</button>
         </div>
       </div>
     </div>
@@ -1635,6 +1671,85 @@
           }
         });
       }
+
+      /* ===================== Add Solo Camera ===================== */
+      const addCameraBtn = document.getElementById("addCameraBtn");
+
+      function openAddCameraModal() {
+        document.getElementById("addCamName").value = "";
+        document.getElementById("addCamUrl").value = "";
+        document.getElementById("addCamError").classList.add("hidden");
+        document.getElementById("addCameraModal").classList.remove("hidden");
+        setTimeout(() => document.getElementById("addCamName").focus(), 100);
+      }
+
+      function closeAddCameraModal() {
+        document.getElementById("addCameraModal").classList.add("hidden");
+      }
+
+      async function submitAddCamera() {
+        const name = document.getElementById("addCamName").value.trim();
+        const url = document.getElementById("addCamUrl").value.trim();
+        const errEl = document.getElementById("addCamError");
+        const btn = document.getElementById("addCamSubmitBtn");
+
+        if (!name) { errEl.textContent = "Name is required"; errEl.classList.remove("hidden"); return; }
+        if (!url) { errEl.textContent = "URL is required"; errEl.classList.remove("hidden"); return; }
+        if (!url.startsWith("rtsp://") && !url.startsWith("rtmp://") && !url.startsWith("http")) {
+          errEl.textContent = "URL should start with rtsp://, rtmp://, or http"; errEl.classList.remove("hidden"); return;
+        }
+
+        btn.disabled = true;
+        btn.textContent = "Adding...";
+        errEl.classList.add("hidden");
+
+        try {
+          // Find or create the Standalone group (base_url = "").
+          const listR = await fetch("/api/ip_cameras");
+          const listJ = await listR.json();
+          let standaloneGroup = (listJ.groups || []).find(g => !g.base_url);
+
+          if (!standaloneGroup) {
+            const cR = await fetch("/api/ip_cameras/groups", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ name: "Standalone", base_url: "" }),
+            });
+            const cJ = await cR.json();
+            if (!cJ.ok) { errEl.textContent = cJ.error || "Could not create group"; errEl.classList.remove("hidden"); return; }
+            standaloneGroup = cJ.group;
+          }
+
+          const addR = await fetch(`/api/ip_cameras/groups/${encodeURIComponent(standaloneGroup.id)}/cameras`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name, url }),
+          });
+          const addJ = await addR.json();
+          if (!addJ.ok) { errEl.textContent = addJ.error || "Add failed"; errEl.classList.remove("hidden"); return; }
+
+          closeAddCameraModal();
+          _ipCamMsg(`Added "${addJ.camera.name}"`, "success");
+          await loadIpCameras();
+        } catch (_) {
+          errEl.textContent = "Network error";
+          errEl.classList.remove("hidden");
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "Add Camera";
+        }
+      }
+
+      if (addCameraBtn) {
+        addCameraBtn.addEventListener("click", openAddCameraModal);
+      }
+
+      document.addEventListener("keydown", (e) => {
+        const modal = document.getElementById("addCameraModal");
+        if (!modal || modal.classList.contains("hidden")) return;
+        if (e.key === "Escape") { closeAddCameraModal(); }
+        if (e.key === "Enter") { submitAddCamera(); }
+      });
 
       if (addGroupBtn) {
         addGroupBtn.addEventListener("click", async () => {

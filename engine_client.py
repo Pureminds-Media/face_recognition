@@ -36,9 +36,12 @@ class EngineClient:
     # ---------- low-level ----------
     def _call(self, op, *args, **kwargs):
         """Send a command and block until the engine acknowledges."""
-        with self._lock:
-            self._conn.send((op, args, kwargs))
-            ok, val = self._conn.recv()
+        try:
+            with self._lock:
+                self._conn.send((op, args, kwargs))
+                ok, val = self._conn.recv()
+        except (BrokenPipeError, EOFError, OSError) as exc:
+            raise RuntimeError("Engine process is not running") from exc
         if not ok:
             raise val
         return val

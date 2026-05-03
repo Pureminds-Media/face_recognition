@@ -419,6 +419,9 @@
 
       let attendanceES = null;
       let cameraRunning = false;
+      // Set after a switch so loadCameraOptions doesn't overwrite the label
+      // with a stale viewer_source before the mirror loop catches up.
+      let _confirmedViewerSrc = null;
 
       // --- stream control ---
       function startStream() {
@@ -473,8 +476,12 @@
           switchCamera(String(singleCamDevices[0].value)).catch(() => {});
         }
 
-        // Sync the single-mode carousel index with the viewer's source
-        const viewerSrc = String(j.viewer_source || "");
+        // Sync the single-mode carousel index with the viewer's source.
+        // Prefer _confirmedViewerSrc (set on switch) over the status API value
+        // which may still be stale if the mirror loop hasn't ticked yet.
+        const apiSrc = String(j.viewer_source || "");
+        if (_confirmedViewerSrc && apiSrc === _confirmedViewerSrc) _confirmedViewerSrc = null;
+        const viewerSrc = _confirmedViewerSrc || apiSrc;
         if (viewerSrc) {
           const idx = singleCamDevices.findIndex(d => String(d.value || "") === viewerSrc);
           if (idx >= 0) singleCamIndex = idx;
@@ -597,14 +604,17 @@
           if (typeof j.viewer_grid_offset === "number") gridOffset = j.viewer_grid_offset;
           if (typeof j.grid_page_size === "number") gridPageSize = j.grid_page_size;
           if (typeof j.grid_page_count === "number") gridPageCount = j.grid_page_count;
-          updateCamModeButtons();
-          updateCarouselUI();
-          // Refresh the dropdown's "active" indicator (and other stale UI)
-          // by re-fetching the full state. Cheap; happens once per switch.
-          loadCameraOptions().catch(() => {});
+          // Pin the confirmed source so loadCameraOptions won't overwrite the
+          // label with a stale mirror-loop value before the engine catches up.
+          if (j.viewer_source) _confirmedViewerSrc = j.viewer_source;
           if (cameraMsg) cameraMsg.textContent = j.viewer_mode === "single"
             ? `Viewing ${camLabelFor(j.viewer_source)}`
             : `Viewing grid`;
+          updateCamModeButtons();
+          updateCarouselUI();
+          // Refresh the dropdown's active indicator from the switch response
+          // devices list — avoids a second round-trip and the stale-label race.
+          loadCameraOptions().catch(() => {});
           if (j.running && videoFeed) startStream();
           return true;
         } catch (e) {

@@ -153,6 +153,7 @@ def run(conn, state, engine_kwargs, log_level=logging.INFO):
             try:
                 msg = conn.recv()
             except EOFError:
+                log.info("engine_runner: parent closed connection, exiting")
                 break
             if msg == "shutdown":
                 break
@@ -161,8 +162,17 @@ def run(conn, state, engine_kwargs, log_level=logging.INFO):
                 result = _dispatch(op, args, kwargs)
                 conn.send((True, result))
             except Exception as e:
-                log.exception("command failed: %s", msg)
-                conn.send((False, e))
+                log.exception("command failed: op=%s", op if 'op' in dir() else '?')
+                try:
+                    conn.send((False, e))
+                except Exception:
+                    try:
+                        conn.send((False, RuntimeError(str(e))))
+                    except Exception:
+                        log.error("conn.send failed — pipe broken, exiting")
+                        break
+    except Exception:
+        log.exception("engine_runner: unhandled exception in command loop — subprocess exiting")
     finally:
         stop_evt.set()
         try: engine.stop()

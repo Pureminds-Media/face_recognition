@@ -1,0 +1,23 @@
+[Unit]
+Description=Face Recognition Attendance System
+After=network.target
+
+[Service]
+Type=simple
+User=main
+WorkingDirectory=/home/main/Repos/face_recognition
+ExecStart=/home/main/Repos/face_recognition/.venv/bin/python app.py
+Restart=on-failure
+RestartSec=3
+
+# Kill the entire process group (app + engine subprocess) on stop/restart.
+# This is what prevents the "address already in use" problem — systemd
+# guarantees all child processes are dead before the next start.
+KillMode=control-group
+TimeoutStopSec=10
+
+# Load the .env file so NAS credentials and API keys are available
+EnvironmentFile=/home/main/Repos/face_recognition/.env
+
+[Install]
+WantedBy=multi-user.target

@@ -63,6 +63,14 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+
+@app.errorhandler(RuntimeError)
+def _handle_engine_offline(e):
+    if "Engine process is not running" in str(e):
+        return jsonify({"ok": False, "error": "Engine process is not running"}), 503
+    raise e
+
+
 # --- Public API auth ---------------------------------------------------------
 # When API_KEY is set, every /api/* and stream route requires the same key
 # in either an X-API-Key header or an api_key query string. Page routes
@@ -71,7 +79,7 @@ app = Flask(__name__)
 # the templates via render_template); external clients must send it themselves.
 API_KEY = os.getenv("API_KEY", "").strip()
 
-_PROTECTED_PREFIXES = ("/api/", "/video", "/screenshots/", "/footage/", "/faces/")
+_PROTECTED_PREFIXES = ("/api/", "/video", "/footage/", "/faces/")
 
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "[::1]", "::1"}
@@ -117,8 +125,7 @@ ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 FACES_DIR = "faces"
 TEST_UPLOAD_DIR = os.path.join("test_runs", "uploads")
 TEST_OUTPUT_DIR = os.path.join("test_runs", "outputs")
-SCREENSHOTS_DIR = "screenshots"
-FOOTAGE_DIR = "footage"
+FOOTAGE_DIR = os.environ["FOOTAGE_DIR"]
 IP_CAMERAS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ip_cameras.json")
 _ip_cameras_lock = threading.Lock()
 
@@ -263,7 +270,6 @@ def _serialize_state(state):
     return out
 ALLOWED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
-os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 os.makedirs(FOOTAGE_DIR, exist_ok=True)
 
 # The engine runs in a subprocess. We can't spawn it at module-import time
@@ -306,6 +312,19 @@ _engine_proc = None
 _engine_parent_conn = None
 
 
+def _spawn_engine_proc():
+    """Create and start a fresh engine subprocess. Returns (proc, parent_conn)."""
+    parent_conn, child_conn = _mp.Pipe()
+    proc = _mp.Process(
+        target=_engine_runner.run,
+        args=(child_conn, _engine_state, _ENGINE_KWARGS),
+        daemon=False,
+        name="face-engine",
+    )
+    proc.start()
+    return proc, parent_conn
+
+
 def _bootstrap_engine():
     """Spawn the engine subprocess and bind the EngineClient.
 
@@ -324,26 +343,23 @@ def _bootstrap_engine():
 
     _engine_manager = _mp.Manager()
     _engine_state = _engine_manager.dict()
-    parent_conn, child_conn = _mp.Pipe()
-    _engine_proc = _mp.Process(
-        target=_engine_runner.run,
-        args=(child_conn, _engine_state, _ENGINE_KWARGS),
-        daemon=False,
-        name="face-engine",
-    )
-    _engine_proc.start()
+
+    _engine_proc, parent_conn = _spawn_engine_proc()
     _engine_parent_conn = parent_conn
     engine = EngineClient(parent_conn, _engine_state, threading.Lock())
 
     import atexit as _atexit
     def _shutdown_engine():
-        try: parent_conn.send("shutdown")
+        try: _engine_parent_conn.send("shutdown")
         except Exception: pass
         try: _engine_proc.join(timeout=5)
         except Exception: pass
         if _engine_proc.is_alive():
             _engine_proc.terminate()
     _atexit.register(_shutdown_engine)
+    # Note: _shutdown_engine reads the globals _engine_parent_conn and
+    # _engine_proc at call time, so it always targets the current process
+    # even if the watchdog has restarted it.
 
     log.info("waiting for engine subprocess to publish state...")
     t0 = time.time()
@@ -355,6 +371,39 @@ def _bootstrap_engine():
     else:
         log.info("engine ready, cam_index=%s, identities=%s",
                  _engine_state.get("cam_index"), _engine_state.get("identities"))
+
+    threading.Thread(target=_engine_watchdog, daemon=True, name="engine-watchdog").start()
+
+
+def _engine_watchdog():
+    """Restart the engine subprocess if it dies unexpectedly."""
+    global _engine_proc, _engine_parent_conn
+    while True:
+        time.sleep(5)
+        try:
+            if _engine_proc is not None and not _engine_proc.is_alive():
+                exit_code = _engine_proc.exitcode
+                log.warning("engine subprocess died (exit code %s) — restarting", exit_code)
+                try: _engine_proc.join(timeout=2)
+                except Exception: pass
+
+                new_proc, new_conn = _spawn_engine_proc()
+                _engine_proc = new_proc
+                _engine_parent_conn = new_conn
+
+                # Swap the connection on the existing EngineClient so all
+                # existing route handlers pick it up without a restart.
+                object.__setattr__(engine, "_conn", new_conn)
+                object.__setattr__(engine, "_lock", threading.Lock())
+
+                # Wait for the new process to publish its state
+                t0 = time.time()
+                while "cam_index" not in _engine_state and (time.time() - t0) < 30:
+                    time.sleep(0.1)
+                log.info("engine subprocess restarted (cam_index=%s)",
+                         _engine_state.get("cam_index"))
+        except Exception:
+            log.exception("engine watchdog error")
 
 # Engine stays stopped until user clicks Start in the UI
 # engine.start()
@@ -708,20 +757,6 @@ def _update_attendance_from_tracks(tracks):
     return events
 
 
-def _save_visit_screenshot(visit_id, person_name, camera_source):
-    """Grab the buffered snapshot from the engine and save it for a visit."""
-    try:
-        snap = engine.get_snapshot(person_name, camera_source)
-        if snap is None:
-            return
-        fname = f"visit_{visit_id}.jpg"
-        fpath = os.path.join(SCREENSHOTS_DIR, fname)
-        with open(fpath, "wb") as f:
-            f.write(snap)
-        db.update_visit_screenshot(visit_id, fname)
-    except Exception as e:
-        log.debug("Failed to save visit screenshot: %s", e)
-
 
 def _start_visit_footage(visit_id, person_name, camera_source):
     """Open a streaming VideoWriter for a visit.
@@ -805,7 +840,6 @@ def _update_visit_for_person(name, camera_source, confidence=None, last_detect_t
             "camera_source": camera_source,
             "last_seen_mono": now_mono,
         }
-        _save_visit_screenshot(vid, name, camera_source)
         _start_visit_footage(vid, name, camera_source)
     elif active["location_id"] == loc_id:
         # Same location — update last_seen in DB (throttled, off-thread)
@@ -838,7 +872,6 @@ def _update_visit_for_person(name, camera_source, confidence=None, last_detect_t
                 "camera_source": camera_source,
                 "last_seen_mono": now_mono,
             }
-            _save_visit_screenshot(vid, name, camera_source)
             _start_visit_footage(vid, name, camera_source)
 
 def _mark_all_absent():
@@ -1757,13 +1790,6 @@ def faces_file(person, filename):
     resp.headers["Cache-Control"] = _STATIC_CACHE_HEADER
     return resp
 
-@app.route("/screenshots/<path:filename>")
-def screenshot_file(filename):
-    """Serve visit screenshot images."""
-    resp = send_from_directory(SCREENSHOTS_DIR, filename, conditional=True)
-    resp.headers["Cache-Control"] = _STATIC_CACHE_HEADER
-    return resp
-
 @app.route("/footage/<path:filename>")
 def footage_file(filename):
     """Serve visit footage video clips (supports Range requests for streaming)."""
@@ -1906,11 +1932,16 @@ def api_camera_set():
     _refresh_source_name_map()
 
     rows_o, cols_o = engine._grid_layout
+    # Read viewer_source directly from source_text rather than the shared
+    # state dict — the mirror loop (50 ms tick) may not have synced yet,
+    # which would return the previous camera and make the label lag one click.
+    resolved_source = source_text if not grid_match else ""
+    resolved_mode = "grid" if grid_match else "single"
     return jsonify({
         "ok": True,
         "running": engine.is_running(),
-        "viewer_mode": engine.viewer_mode,
-        "viewer_source": engine.viewer_source,
+        "viewer_mode": resolved_mode,
+        "viewer_source": resolved_source,
         "viewer_grid_offset": engine.viewer_grid_offset,
         "grid_layout": [rows_o, cols_o],
         "grid_page_size": engine.grid_page_size(),
@@ -2342,7 +2373,6 @@ def _serialize_visit(v):
         "duration_fmt": _fmt_duration(duration_secs),
         "ended": bool(v.get("ended", False)),
         "confidence": round(float(v["confidence"]), 3) if v.get("confidence") else None,
-        "screenshot_url": f"/screenshots/{v['screenshot']}" if v.get("screenshot") else None,
         "footage_url": f"/footage/{v['footage']}" if v.get("footage") else None,
         "activity": v.get("activity"),
     }
@@ -2493,12 +2523,6 @@ def api_history_clear():
     visit_count = db.clear_all_data()
     _active_visits.clear()
     attendance_state.clear()
-    # Clear screenshot files
-    for f in os.listdir(SCREENSHOTS_DIR):
-        try:
-            os.remove(os.path.join(SCREENSHOTS_DIR, f))
-        except Exception:
-            pass
     # Clear footage files
     for f in os.listdir(FOOTAGE_DIR):
         try:

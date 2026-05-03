@@ -198,9 +198,9 @@ development only.
 | GET    | `/api/history/locations`                   | All locations (with `display_name`).                        |
 | GET    | `/api/history/persons`                     | Distinct person names with at least one visit.              |
 | GET    | `/api/history/sessions`                    | Server run sessions.                                        |
-| POST   | `/api/history/clear`                       | Wipe visits, sessions, screenshots, footage. Destructive.   |
+| POST   | `/api/history/clear`                       | Wipe visits, sessions, and footage files. Destructive.      |
 
-Visit objects include: `id, person_name, location_name, location_display, camera_source, first_seen, last_seen, duration_secs, duration_fmt, ended, confidence, screenshot_url, footage_url, activity`.
+Visit objects include: `id, person_name, location_name, location_display, camera_source, first_seen, last_seen, duration_secs, duration_fmt, ended, confidence, footage_url, activity`.
 
 `duration_secs` = `last_seen − first_seen` (wall-clock duration of the visit). It is **not** the on-camera/visible time. A visit with `duration_secs = 0` typically means a single-frame detection that closed before any subsequent frame refreshed `last_seen`. The `visible_duration` column tracked by the footage writer (real on-camera seconds) is currently not exposed in the visit serializer.
 
@@ -225,7 +225,6 @@ Visit objects include: `id, person_name, location_name, location_display, camera
 | Path                       | What                                              |
 | -------------------------- | ------------------------------------------------- |
 | `/video`                   | MJPEG stream of the live viewer feed.             |
-| `/screenshots/<filename>`  | A saved visit screenshot.                         |
 | `/footage/<filename>`      | A saved visit footage clip.                       |
 | `/faces/<person>/<file>`   | A face image from a person folder.                |
 
@@ -254,8 +253,7 @@ By default the MJPEG stream is **annotated** — bounding boxes and name
 labels are drawn on the live feed. To turn this off (e.g. for crowded
 scenes where overlapping boxes become illegible), set the server-side
 env var `LIVE_ANNOTATIONS_ENABLED=0` and restart the server. Saved
-footage clips and per-visit screenshots remain annotated regardless of
-this flag. Clients that want to render their own overlay (e.g. a
+footage clips remain annotated regardless of this flag. Clients that want to render their own overlay (e.g. a
 selective highlight only on tapped people) can poll `GET /api/tracks`
 or read the bbox field on `/api/attendance/stream`'s state events and
 draw a transparent layer over the `<img>`.
@@ -263,8 +261,7 @@ draw a transparent layer over the `<img>`.
 In single-camera viewer mode the source-frame is downscaled to the
 engine's `width × height` (defaults `1280 × 720`) before JPEG encoding,
 so the bitrate stays reasonable even when the camera itself is 4K.
-Recordings, screenshots and face crops still use the camera's native
-resolution.
+Recordings and face crops still use the camera's native resolution.
 
 ---
 

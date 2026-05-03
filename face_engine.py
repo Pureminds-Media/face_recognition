@@ -205,6 +205,10 @@ class FaceEngine:
         # Whether to render bounding boxes + name labels onto the live
         # MJPEG stream. Footage and screenshots are always annotated.
         self.live_annotations = bool(live_annotations)
+        self.face_detection_enabled = bool(
+            os.environ.get("FACE_DETECTION_ENABLED", "true").strip().lower()
+            not in ("0", "false", "no")
+        )
         self.allowed_exts = (".jpg", ".png", ".jpeg", ".webp")
 
         # InsightFace shared FaceAnalysis instance (loaded eagerly in start()
@@ -261,10 +265,7 @@ class FaceEngine:
         # Snapshot buffer: (person_name, camera_source) -> JPEG bytes
         # Holds the latest annotated tile/frame for each person/camera pair.
         # Consumed by app.py when opening a new visit.
-        self._snapshot_buf = {}
-        self._snapshot_lock = threading.Lock()
-
-        # Rolling frame ring buffer per camera source (used for snapshots).
+        # Rolling frame ring buffer per camera source.
         # Key: str(camera_source)  Value: deque of numpy_frame
         self.FOOTAGE_RING_SECS = 5.0  # keep a few seconds for snapshot quality
         self._frame_ring = {}  # camera_source -> deque
@@ -331,10 +332,6 @@ class FaceEngine:
         self._reload_faces_running = False
         self._reload_faces_lock = threading.Lock()
 
-        # Per-snapshot timestamps so the janitor can TTL-prune entries that
-        # were never claimed via get_snapshot() (e.g., visit closed before
-        # the screenshot saver got to it).
-        self._snapshot_buf_t = {}  # key -> monotonic insertion time
         # Per-writer last-fed timestamp for orphan detection.
         self._writer_last_fed = {}  # visit_id -> monotonic last write
         # Janitor thread handle.
@@ -382,8 +379,9 @@ class FaceEngine:
             return
 
         self.stop_evt.clear()
-        self._preload_inference_models()
-        self.reload_faces()
+        if self.face_detection_enabled:
+            self._preload_inference_models()
+            self.reload_faces()
 
         if self._is_grid_mode():
             self._start_grid_mode()
@@ -404,25 +402,26 @@ class FaceEngine:
                 cap.grab()
             self._cap = cap
 
-            self._worker_t = threading.Thread(target=self._detector_worker, daemon=True)
-            self._worker_t.start()
+            if self.face_detection_enabled:
+                self._worker_t = threading.Thread(target=self._detector_worker, daemon=True)
+                self._worker_t.start()
 
             self._main_t = threading.Thread(target=self._main_loop, daemon=True)
             self._main_t.start()
 
-        # Start head detection (always on — supplements face detector)
-        try:
-            self._head_detector = HeadDetector()
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning("HeadDetector not available: %s", e)
-            self._head_detector = None
+        # Start head detection and action detection only when AI is enabled
+        if self.face_detection_enabled:
+            try:
+                self._head_detector = HeadDetector()
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning("HeadDetector not available: %s", e)
+                self._head_detector = None
 
-        # Start action detection thread (shared by grid and single-cam modes)
-        if self.activity_enabled:
-            self._action_detector = ActionDetector()
-            self._activity_t = threading.Thread(target=self._activity_loop, daemon=True)
-            self._activity_t.start()
+            if self.activity_enabled:
+                self._action_detector = ActionDetector()
+                self._activity_t = threading.Thread(target=self._activity_loop, daemon=True)
+                self._activity_t.start()
 
         # Janitor thread: prunes stale state to keep memory flat over long runs.
         self._janitor_stop.clear()
@@ -434,21 +433,13 @@ class FaceEngine:
     def _janitor_loop(self):
         """Periodically prune unbounded in-memory state."""
         # Tunables — keep generous so we never drop something still in use.
-        SNAPSHOT_TTL = 120.0       # JPEGs not claimed in 2 min: drop
         ACTIVITY_RESULT_TTL = 60.0 # stale activity results
         ORPHAN_WRITER_TTL = 900.0  # writer not fed for 15 min: orphan
         TICK = 30.0
         while not self._janitor_stop.wait(TICK):
             now = time.monotonic()
             try:
-                # 1) snapshot_buf TTL prune
-                with self._snapshot_lock:
-                    stale = [k for k, t in self._snapshot_buf_t.items()
-                             if (now - t) > SNAPSHOT_TTL]
-                    for k in stale:
-                        self._snapshot_buf.pop(k, None)
-                        self._snapshot_buf_t.pop(k, None)
-                # 2) activity_results stale prune (entries already expire on
+                # 1) activity_results stale prune (entries already expire on
                 #    read, but the dict slot stays; reclaim it)
                 with self._activity_results_lock:
                     cutoff = now - ACTIVITY_RESULT_TTL
@@ -461,12 +452,19 @@ class FaceEngine:
                     orphans = [vid for vid, last in self._writer_last_fed.items()
                                if (now - last) > ORPHAN_WRITER_TTL
                                and vid in self._active_writers]
+                    orphan_recs = []
                     for vid in orphans:
                         rec = self._active_writers.pop(vid, None)
                         self._writer_last_fed.pop(vid, None)
                         if rec is not None:
-                            try: rec["writer"].release()
-                            except Exception: pass
+                            orphan_recs.append(rec)
+                for rec in orphan_recs:
+                    rec["write_q"].put(None)
+                    rec["write_thread"].join(timeout=10.0)
+                    try:
+                        rec["writer"].release()
+                    except Exception:
+                        pass
                     # also drop last_fed entries for already-closed writers
                     for vid in list(self._writer_last_fed.keys()):
                         if vid not in self._active_writers:
@@ -569,10 +567,7 @@ class FaceEngine:
             self._frame_ring.clear()
             self._ring_frame_counts.clear()
 
-        # Clear snapshot buffer
-        with self._snapshot_lock:
-            self._snapshot_buf.clear()
-            self._snapshot_buf_t.clear()
+
 
         # Clear unknown pending accumulator
         self._unknown_pending.clear()
@@ -740,7 +735,7 @@ class FaceEngine:
         camera is offline. Sized to ``self.width × self.height`` so the
         MJPEG stream stays at a consistent resolution."""
         frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-        msg = f"No Signal [{source}]"
+        msg = f"No Signal"
         cv2.putText(
             frame, msg,
             (max(8, self.width // 2 - 200), self.height // 2),
@@ -758,16 +753,9 @@ class FaceEngine:
         with self._lock:
             return list(self._latest_tracks)
     
-    def get_snapshot(self, person_name, camera_source=None):
-        """Pop and return buffered JPEG bytes for a person/camera, or None.
-
-        In grid mode, camera_source is required to identify which tile.
-        In single-camera mode, camera_source can be None.
-        """
-        key = (person_name, str(camera_source) if camera_source is not None else None)
-        with self._snapshot_lock:
-            self._snapshot_buf_t.pop(key, None)
-            return self._snapshot_buf.pop(key, None)
+    def get_snapshot(self, person_name, camera_source=None):  # kept for API compatibility
+        """Always returns None — snapshot capture has been removed."""
+        return None
 
     def _push_frame_to_ring(self, camera_source, frame):
         """Push an annotated frame into the rolling ring buffer for a camera.
@@ -836,20 +824,47 @@ class FaceEngine:
             return False, fname
 
         now = time.monotonic()
+        # Each writer gets its own thread + queue so disk/NAS I/O never
+        # blocks the render loop.  The queue holds pre-resized frames;
+        # None is the sentinel that tells the thread to flush and exit.
+        write_q = Queue(maxsize=int(fps * 3))  # ~3 s of backlog before dropping
+
+        def _writer_thread(q, rec):
+            while True:
+                item = q.get()
+                if item is None:
+                    break
+                frames, count = item
+                try:
+                    for f in frames:
+                        rec["writer"].write(f)
+                    rec["frame_count"] += count
+                    rec["total_frames"] += count
+                    rec["_queued_ahead"] = max(0, rec.get("_queued_ahead", 0) - count)
+                except Exception:
+                    rec["_queued_ahead"] = max(0, rec.get("_queued_ahead", 0) - count)
+
+        rec = {
+            "cam": cam_key,
+            "person": person_name,
+            "writer": writer,
+            "path": fpath,
+            "fname": fname,
+            "w": w,
+            "h": h,
+            "fps": fps,
+            "start_time": now,
+            "frame_count": 0,
+            "total_frames": 0,
+            "write_q": write_q,
+        }
+        t = threading.Thread(target=_writer_thread, args=(write_q, rec), daemon=True,
+                             name=f"footage-{visit_id}")
+        t.start()
+        rec["write_thread"] = t
+
         with self._writers_lock:
-            self._active_writers[visit_id] = {
-                "cam": cam_key,
-                "person": person_name,
-                "writer": writer,
-                "path": fpath,
-                "fname": fname,
-                "w": w,
-                "h": h,
-                "fps": fps,
-                "start_time": now,
-                "frame_count": 0,      # frames written so far (throttle pacing)
-                "total_frames": 0,     # same as frame_count (no pause/resume)
-            }
+            self._active_writers[visit_id] = rec
             self._writer_last_fed[visit_id] = now
         return True, fname
 
@@ -870,30 +885,27 @@ class FaceEngine:
             for vid, rec in list(self._active_writers.items()):
                 if rec["cam"] != cam_key:
                     continue
-                # Frame-count throttle: write enough frames so that
-                # frame_count stays in sync with wall-clock time.
                 fps = rec["fps"]
                 elapsed = now - rec["start_time"]
-                target_frames = int(elapsed * fps) + 1  # where we should be
-                deficit = target_frames - rec["frame_count"]
+                # Use queued frame_count to stay in sync rather than the
+                # write-thread's counter, which lags behind by queue depth.
+                queued = rec["frame_count"] + rec.get("_queued_ahead", 0)
+                target_frames = int(elapsed * fps) + 1
+                deficit = target_frames - queued
                 if deficit <= 0:
                     continue
-                # Safety cap: never write more than 2× fps frames in one call
-                # to avoid runaway writes if start_time is stale.
-                deficit = min(deficit, fps * 2)
+                deficit = min(deficit, int(fps * 2))
                 try:
                     fh, fw = frame.shape[:2]
-                    if (fw, fh) != (rec["w"], rec["h"]):
-                        f = cv2.resize(frame, (rec["w"], rec["h"]))
-                    else:
-                        f = frame
-                    for _ in range(deficit):
-                        rec["writer"].write(f)
-                    rec["frame_count"] += deficit
-                    rec["total_frames"] += deficit
+                    f = cv2.resize(frame, (rec["w"], rec["h"])) if (fw, fh) != (rec["w"], rec["h"]) else frame
+                    frames = [f] * deficit
+                    rec["write_q"].put_nowait((frames, deficit))
+                    rec["_queued_ahead"] = rec.get("_queued_ahead", 0) + deficit
                     self._writer_last_fed[vid] = now
+                except Full:
+                    pass  # NAS too slow — drop rather than block the render loop
                 except Exception:
-                    pass  # writer may have been released
+                    pass
 
     def stop_footage(self, visit_id):
         """Close the VideoWriter for a visit.
@@ -907,6 +919,10 @@ class FaceEngine:
             self._writer_last_fed.pop(visit_id, None)
         if rec is None:
             return None, 0.0
+        # Drain the queue then release — ensures all enqueued frames are
+        # written before the file is closed.
+        rec["write_q"].put(None)
+        rec["write_thread"].join(timeout=10.0)
         try:
             rec["writer"].release()
         except Exception:
@@ -926,15 +942,21 @@ class FaceEngine:
         """Close all active VideoWriters. Returns {visit_id: (fname, visible_secs)}."""
         results = {}
         with self._writers_lock:
-            for vid, rec in list(self._active_writers.items()):
-                try:
-                    rec["writer"].release()
-                except Exception:
-                    pass
-                visible_secs = rec["total_frames"] / max(1, rec["fps"])
-                results[vid] = (rec["fname"], visible_secs)
+            recs = list(self._active_writers.items())
             self._active_writers.clear()
             self._writer_last_fed.clear()
+        # Signal all writer threads outside the lock so they can finish
+        # without deadlocking against _feed_active_writers.
+        for vid, rec in recs:
+            rec["write_q"].put(None)
+        for vid, rec in recs:
+            rec["write_thread"].join(timeout=10.0)
+            try:
+                rec["writer"].release()
+            except Exception:
+                pass
+            visible_secs = rec["total_frames"] / max(1, rec["fps"])
+            results[vid] = (rec["fname"], visible_secs)
         return results
 
     def get_qr(self):
@@ -1523,6 +1545,49 @@ class FaceEngine:
             print(f"[auto-capture] {next_name} candidate REJECTED — face too small ({qw}x{qh} < {MIN_ENROLL_FACE_PX}px).")
             pending.pop(tid, None)
             return None
+
+        # Dedup: compare candidate embedding against every existing unknown_N.
+        # If it matches an existing one closely enough, add to that folder
+        # instead of creating a new identity.  This prevents the same person
+        # being re-enrolled while the background reload is still in flight, or
+        # across multiple cameras that see the same person simultaneously.
+        DEDUP_THRESHOLD = 0.45  # cosine distance; lower = stricter match
+        candidate_emb = l2norm(qf.embedding) if qf.embedding is not None else None
+        matched_name = None
+        if candidate_emb is not None and os.path.isdir(self.known_dir):
+            import re as _re2
+            for d in os.listdir(self.known_dir):
+                if not _re2.match(r"^unknown_\d+$", d):
+                    continue
+                d_path = os.path.join(self.known_dir, d)
+                # Compare against every stored embedding in the folder
+                for img_file in os.listdir(d_path):
+                    if not img_file.lower().endswith((".jpg", ".jpeg", ".png")):
+                        continue
+                    img_path = os.path.join(d_path, img_file)
+                    ref_img = cv2.imread(img_path)
+                    if ref_img is None:
+                        continue
+                    try:
+                        ref_faces = self._face_app.get(ref_img)
+                    except Exception:
+                        continue
+                    ref_faces = [f for f in (ref_faces or []) if f.embedding is not None]
+                    if not ref_faces:
+                        continue
+                    ref_emb = l2norm(ref_faces[0].embedding)
+                    if cosine_distance(candidate_emb, ref_emb) < DEDUP_THRESHOLD:
+                        matched_name = d
+                        break
+                if matched_name:
+                    break
+
+        if matched_name:
+            print(f"[auto-capture] candidate matches existing {matched_name} — skipping new folder")
+            track["name"] = matched_name
+            track["unknown_hits"] = 0
+            pending.pop(tid, None)
+            return matched_name
 
         # Save to faces/unknown_N/1.jpg
         person_dir = os.path.join(self.known_dir, next_name)
@@ -2274,7 +2339,7 @@ class FaceEngine:
         cv2.rectangle(tile, (0, 0), (w - 1, h - 1), (40, 40, 120), 2)
         cv2.putText(
             tile,
-            f"No Signal [{source}]",
+            f"No Signal",
             (12, max(24, h // 2)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
@@ -2295,6 +2360,25 @@ class FaceEngine:
             2,
         )
 
+    @staticmethod
+    def _is_corrupt_frame(frame):
+        """Return True if frame looks like a corrupt NVDEC green-flash decode.
+
+        NVDEC partial decodes produce frames where the green channel
+        dominates massively over red and blue. Samples a 32x32 grid of
+        pixels spread across the whole frame so it's not fooled by cameras
+        pointed at a white wall or plain ceiling.
+        """
+        h, w = frame.shape[:2]
+        sample = frame[::max(1, h // 32), ::max(1, w // 32)]
+        if sample.size == 0:
+            return False
+        mean_b = float(sample[:, :, 0].mean())
+        mean_g = float(sample[:, :, 1].mean())
+        mean_r = float(sample[:, :, 2].mean())
+        # Green flash: green channel >> red and blue, and green is bright
+        return mean_g > 100 and mean_g > mean_r * 2.5 and mean_g > mean_b * 2.5
+
     def _grid_capture_loop(self, worker, tile_w, tile_h):
         cap = worker["cap"]
         while not self.stop_evt.is_set() and not self._grid_stop_evt.is_set() and not worker["stop_evt"].is_set():
@@ -2305,6 +2389,11 @@ class FaceEngine:
                     if (now - float(worker.get("last_good_frame_t", 0.0))) > 1.0:
                         worker["latest_frame"] = None
                 time.sleep(0.02)
+                continue
+
+            # Reject corrupt frames from NVDEC partial decodes (green-flash frames).
+            if self._is_corrupt_frame(frame):
+                time.sleep(0.01)
                 continue
 
             raw_frame = frame  # original camera resolution — used for footage
@@ -2665,7 +2754,6 @@ class FaceEngine:
         unknown_stale_secs = max(0.8, self.detect_every * 1.0)
 
         canvas = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)  # reused each frame
-        last_snap_t = 0.0  # throttle snapshot JPEG encoding
 
         # Build a list of every source we have a worker for. The visible
         # composite is only the first rows*cols of the *configured*
@@ -2863,12 +2951,6 @@ class FaceEngine:
                 )
                 cv2.rectangle(tile, (0, 0), (tile_w - 1, tile_h - 1), (80, 80, 80), 1)
 
-                snap_due = (now - last_snap_t) >= (1.0 / max(1, self.out_fps))
-                known_on_tile = [
-                    t.get("name") for t in updated_tracks
-                    if t.get("name") and t.get("name") != "unknown"
-                ]
-
                 # Build annotated raw frame for footage (native camera resolution)
                 # Only do the expensive copy + annotation when footage is actually recording.
                 visible = {t.get("name") for t in updated_tracks
@@ -2881,12 +2963,10 @@ class FaceEngine:
                             break
 
                 # Build annotated raw frame at native camera resolution.
-                # Needed when (a) footage is recording, OR (b) this is the
-                # source the user is currently viewing in single mode, OR
-                # (c) a visit snapshot is due for a known person on this tile.
+                # Needed when (a) footage is recording OR (b) this is the
+                # source the user is currently viewing in single mode.
                 is_viewer_single = str(source) == self.viewer_source
-                snap_needs_raw = bool(known_on_tile) and snap_due
-                need_annotated_raw = (has_active_writer or is_viewer_single or snap_needs_raw) and raw_frame is not None
+                need_annotated_raw = (has_active_writer or is_viewer_single) and raw_frame is not None
                 if need_annotated_raw:
                     raw_h, raw_w = raw_frame.shape[:2]
                     sx = raw_w / tile_w
@@ -2912,25 +2992,6 @@ class FaceEngine:
                     footage_frame = raw_frame  # no copy needed — just reference for ring buffer
                 else:
                     footage_frame = tile
-
-                # Buffer full-resolution snapshot for each known person on this camera.
-                # app.py consumes these when opening a new visit. Encoded from the
-                # annotated raw frame (native camera resolution) so saved visit
-                # screenshots match the camera's true resolution.
-                if known_on_tile and snap_due:
-                    snap_src = footage_frame if footage_frame is not None else tile
-                    ok_snap, snap_buf = cv2.imencode(
-                        ".jpg", snap_src, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
-                    )
-                    if ok_snap:
-                        snap_bytes = snap_buf.tobytes()
-                        with self._snapshot_lock:
-                            t_now = time.monotonic()
-                            for pname in known_on_tile:
-                                key = (pname, str(source))
-                                self._snapshot_buf[key] = snap_bytes
-                                self._snapshot_buf_t[key] = t_now
-                    last_snap_t = now
 
                 # Push to rolling frame ring buffer + active writers at native resolution
                 self._push_frame_to_ring(source, footage_frame)
@@ -3036,7 +3097,6 @@ class FaceEngine:
     def _main_loop(self):
         last_sent_t = 0.0
         last_encode_t = 0.0
-        last_snap_t = 0.0
         stale_secs = 2.0
         unknown_stale_secs = 0.7
         unknown_reconfirm_secs = max(1.5, self.detect_every * 1.5)
@@ -3287,29 +3347,7 @@ class FaceEngine:
                     label = f"{t['name']} | {act_label}"
                 cv2.putText(frame, label, (x, max(0, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2,)
 
-            # 4b) buffer snapshot for each known person (single-camera mode)
-            # Throttled to out_fps to avoid redundant JPEG encodes every frame.
-            snap_due = (now - last_snap_t) >= (1.0 / max(1, self.out_fps))
-            known_on_frame = [
-                t["name"] for t in self.tracks
-                if t.get("name") and t["name"] != "unknown"
-            ]
-            if known_on_frame and snap_due:
-                ok_snap, snap_buf = cv2.imencode(
-                    ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
-                )
-                if ok_snap:
-                    snap_bytes = snap_buf.tobytes()
-                    cam_src = str(self.cam_index)
-                    with self._snapshot_lock:
-                        t_now = time.monotonic()
-                        for pname in known_on_frame:
-                            key = (pname, cam_src)
-                            self._snapshot_buf[key] = snap_bytes
-                            self._snapshot_buf_t[key] = t_now
-                last_snap_t = now
-
-            # 4c) push frame to rolling ring buffer + active writers (single-camera)
+            # 4b) push frame to rolling ring buffer + active writers (single-camera)
             self._push_frame_to_ring(self.cam_index, frame)
             visible = {t["name"] for t in self.tracks
                        if t.get("name") and t["name"] != "unknown"}
