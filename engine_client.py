@@ -34,11 +34,13 @@ class EngineClient:
         object.__setattr__(self, "_lock", lock)
 
     # ---------- low-level ----------
-    def _call(self, op, *args, **kwargs):
+    def _call(self, op, *args, timeout=12, **kwargs):
         """Send a command and block until the engine acknowledges."""
         try:
             with self._lock:
                 self._conn.send((op, args, kwargs))
+                if not self._conn.poll(timeout):
+                    raise RuntimeError(f"Engine timed out on command {op!r}")
                 ok, val = self._conn.recv()
         except (BrokenPipeError, EOFError, OSError) as exc:
             raise RuntimeError("Engine process is not running") from exc

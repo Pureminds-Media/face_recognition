@@ -182,16 +182,22 @@ class ActionDetector:
                 processor.save_pretrained(self._model_path)
 
             self._model.use_io_binding = False
+            # Verify the model actually landed on GPU — don't silently run on CPU.
+            active = self._model.providers if hasattr(self._model, "providers") else []
+            if active and "CUDAExecutionProvider" not in active:
+                raise RuntimeError(
+                    f"CLIP loaded on wrong provider ({active}). "
+                    "Check onnxruntime-gpu installation."
+                )
             self._processor = CLIPProcessor.from_pretrained(
                 self._model_path, use_fast=False
             )
             elapsed = time.monotonic() - t0
-            log.info("CLIP action detector ready (%.1fs)", elapsed)
+            log.info("CLIP action detector ready on GPU (%.1fs)", elapsed)
             self._ready = True
         except Exception:
             log.exception(
-                "Failed to load CLIP action detector — disabling action "
-                "labels for this run."
+                "Failed to load CLIP action detector on GPU — action detection disabled."
             )
             self._ready = False
             self._load_failed = True

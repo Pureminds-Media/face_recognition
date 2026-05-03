@@ -79,7 +79,12 @@ def _handle_engine_offline(e):
 # the templates via render_template); external clients must send it themselves.
 API_KEY = os.getenv("API_KEY", "").strip()
 
-_PROTECTED_PREFIXES = ("/api/", "/video", "/footage/", "/faces/")
+_PROTECTED_PREFIXES = (
+    "/api/", 
+    "/video", 
+    "/footage/", 
+    # "/faces/"
+    )
 
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "[::1]", "::1"}
@@ -288,12 +293,12 @@ _ENGINE_KWARGS = dict(
     detector="retinaface",
     model="buffalo_l",
     threshold=0.5,
-    detect_every=0.3,
-    detect_scale=1.0,
+    detect_every=5,
+    detect_scale=1,
     tracker_type="CSRT",
     width=1280,
     height=720,
-    out_fps=15,
+    out_fps=10,
     jpeg_quality=80,
     # Draw bounding boxes + name labels on the live MJPEG feed.
     # Default on. Set LIVE_ANNOTATIONS_ENABLED=0 in .env to get a clean
@@ -402,6 +407,20 @@ def _engine_watchdog():
                     time.sleep(0.1)
                 log.info("engine subprocess restarted (cam_index=%s)",
                          _engine_state.get("cam_index"))
+
+                # Auto-resume the camera grid so the user doesn't have to
+                # manually restart after a crash.
+                try:
+                    with state_lock:
+                        if not engine.is_running():
+                            pool = _build_analysis_pool_source()
+                            if pool:
+                                engine.cam_index = pool
+                            _refresh_source_name_map()
+                            engine.start()
+                            log.info("engine watchdog: auto-resumed camera grid")
+                except Exception:
+                    log.exception("engine watchdog: auto-resume failed")
         except Exception:
             log.exception("engine watchdog error")
 
@@ -1471,18 +1490,31 @@ def api_rename_person():
         return jsonify({"ok": True, "person": new_name, "renamed_visits": 0})
 
     if os.path.exists(new_dir):
-        return jsonify({"ok": False, "error": f"Person '{new_name}' already exists"}), 409
+        # Merge: move all images from old_dir into new_dir, then delete old_dir.
+        import glob as _glob
+        moved = 0
+        for src_path in _glob.glob(os.path.join(old_dir, "*")):
+            fname = os.path.basename(src_path)
+            if fname.startswith("."):
+                continue  # skip cache files
+            dst_path = os.path.join(new_dir, fname)
+            # Avoid overwriting — append a suffix if name collides
+            if os.path.exists(dst_path):
+                base, ext = os.path.splitext(fname)
+                dst_path = os.path.join(new_dir, f"{base}_from_{old_name}{ext}")
+            shutil.move(src_path, dst_path)
+            moved += 1
+        shutil.rmtree(old_dir, ignore_errors=True)
+        rows = db.rename_person(old_name, new_name)
+        _reload_faces_async()
+        return jsonify({"ok": True, "person": new_name, "renamed_visits": rows,
+                        "merged": True, "images_moved": moved})
 
-    # Rename folder
+    # Simple rename
     os.rename(old_dir, new_dir)
-
-    # Update DB visits
     rows = db.rename_person(old_name, new_name)
-
-    # Reload face embeddings
     _reload_faces_async()
-
-    return jsonify({"ok": True, "person": new_name, "renamed_visits": rows})
+    return jsonify({"ok": True, "person": new_name, "renamed_visits": rows, "merged": False})
 
 @app.route("/api/person/<name>", methods=["DELETE"])
 def api_delete_person(name):
@@ -1818,6 +1850,8 @@ def api_camera_get():
         elif isinstance(engine.cam_index, int):
             active_cams = [engine.cam_index]
     rows, cols = engine._grid_layout
+    loading_opened = int(_engine_state.get("loading_opened", 0) if _engine_state else 0)
+    loading_total = int(_engine_state.get("loading_total", 0) if _engine_state else 0)
     return jsonify(
         {
             "running": engine.is_running(),
@@ -1830,6 +1864,8 @@ def api_camera_get():
             "grid_layout": [rows, cols],
             "grid_page_size": engine.grid_page_size(),
             "grid_page_count": engine.grid_page_count(),
+            "loading_opened": loading_opened,
+            "loading_total": loading_total,
         }
     )
 
@@ -2128,12 +2164,32 @@ def _probe_camera_url(url, timeout_s=8.0):
     result = {"ok": False, "msg": "timeout"}
 
     def _worker():
+        # Use PyAV for probing — cv2.VideoCapture can fail on H.265/HEVC
+        # streams even when the camera is perfectly reachable.
+        if is_url:
+            try:
+                import av as _av
+                c = _av.open(src, options={"rtsp_transport": "tcp", "timeout": "5000000"})
+                vs = next((s for s in c.streams if s.type == "video"), None)
+                if vs:
+                    w = vs.codec_context.width
+                    h = vs.codec_context.height
+                    codec = vs.codec_context.name
+                    result["ok"] = True
+                    result["msg"] = f"ok ({w}x{h} {codec})" if w and h else "ok"
+                else:
+                    result["ok"] = True
+                    result["msg"] = "ok (no video stream info)"
+                c.close()
+                return
+            except Exception as e:
+                result["msg"] = str(e)
+                return
         cap = None
         try:
-            cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG) if is_url else cv2.VideoCapture(src)
+            cap = cv2.VideoCapture(src)
             if not cap.isOpened():
-                result["msg"] = "cannot open (check URL, credentials, network or device)" \
-                    if is_url else "device unavailable"
+                result["msg"] = "device unavailable"
                 return
             ok, frame = cap.read()
             if not ok or frame is None:

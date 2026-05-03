@@ -165,6 +165,18 @@
                   id="carouselLabel"
                   class="hidden absolute bottom-2 left-1/2 -translate-x-1/2 z-10 px-3 py-1 rounded-full bg-black/55 text-white text-xs"
                 ></div>
+
+              </div>
+
+              <!-- Loading bar: shown while cameras open at startup.
+                   Lives outside videoStage so it's visible even when
+                   the video img has no src (zero height). -->
+              <div id="loadingOverlay" class="hidden mt-3 rounded-lg bg-slate-800/60 px-4 py-4 flex flex-col items-center gap-2">
+                <div class="text-slate-300 text-sm font-medium" id="loadingText">Loading cameras…</div>
+                <div class="w-full bg-slate-700 rounded-full h-2 overflow-hidden">
+                  <div id="loadingBar" class="h-full bg-emerald-500 rounded-full transition-all duration-300" style="width:0%"></div>
+                </div>
+                <div class="text-slate-400 text-xs" id="loadingCount">0 / 0 cams loaded</div>
               </div>
 
               <!-- QR prompt overlay -->
@@ -659,7 +671,14 @@
         });
 
         attendanceES.onerror = () => {
-          // Browser auto-reconnects. Optional: show “reconnecting…”
+          attendanceES.close();
+          attendanceES = null;
+          // Engine crashed — wait for watchdog to bring it back then reload
+          if (!_streamReconnectTimer) {
+            _streamReconnectTimer = setTimeout(() => {
+              window.location.reload();
+            }, 4000);
+          }
         };
 
       }
@@ -824,6 +843,31 @@
         const group = document.getElementById("camModeGroup");
         if (group && !group.contains(e.target)) closeAllDropdowns();
       });
+
+      // --- Loading overlay (startup camera open progress) ---
+      const loadingOverlay = document.getElementById("loadingOverlay");
+      const loadingBar = document.getElementById("loadingBar");
+      const loadingText = document.getElementById("loadingText");
+      const loadingCount = document.getElementById("loadingCount");
+
+      // Poll continuously so the bar reappears if the engine restarts.
+      setInterval(async () => {
+        if (!loadingOverlay) return;
+        try {
+          const r = await fetch("/api/camera");
+          if (!r.ok) { loadingOverlay.classList.add("hidden"); return; }
+          const j = await r.json();
+          const opened = j.loading_opened || 0;
+          const total = j.loading_total || 0;
+          const loading = total > 0 && opened < total;
+          loadingOverlay.classList.toggle("hidden", !loading);
+          if (loading) {
+            const pct = Math.round((opened / total) * 100);
+            loadingBar.style.width = pct + "%";
+            loadingCount.textContent = opened + " / " + total + " cams loaded";
+          }
+        } catch (_) { loadingOverlay.classList.add("hidden"); }
+      }, 600);
 
       // --- initial ---
       ensureStreaming().then(loadCameraOptions);
@@ -1352,6 +1396,18 @@
       if (videoFeed) videoFeed.addEventListener("load", () => {
         if (inlinePZ) inlinePZ._apply();
       });
+
+      // Auto-reload page when engine restarts after a crash
+      let _streamReconnectTimer = null;
+      if (videoFeed) {
+        videoFeed.addEventListener("error", () => {
+          if (!cameraRunning) return;
+          if (_streamReconnectTimer) return;
+          _streamReconnectTimer = setTimeout(() => {
+            window.location.reload();
+          }, 3000); // wait 3s for watchdog to bring engine back up, then reload
+        });
+      }
       if (fullscreenZoomImage) fullscreenZoomImage.addEventListener("load", () => {
         if (fsPZ) fsPZ._apply();
       });

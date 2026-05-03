@@ -98,18 +98,11 @@ class HeadDetector:
         # Tune CUDA EP for many concurrent callers (40+ camera grid):
         # - arena extend strategy keeps allocs cheap across calls
         # - cudnn heuristic search is faster than exhaustive for tiny batches
-        provider_options = [
-            {
-                "arena_extend_strategy": "kSameAsRequested",
-                "cudnn_conv_algo_search": "HEURISTIC",
-                "do_copy_in_default_stream": "1",
-            },
-            {},
-        ]
-        providers = [
-            ("CUDAExecutionProvider", provider_options[0]),
-            "CPUExecutionProvider",
-        ]
+        provider_options = {
+            "arena_extend_strategy": "kSameAsRequested",
+            "cudnn_conv_algo_search": "HEURISTIC",
+            "do_copy_in_default_stream": "1",
+        }
         opts = ort.SessionOptions()
         opts.log_severity_level = 3  # suppress Memcpy/provider warnings
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -117,16 +110,18 @@ class HeadDetector:
         opts.enable_mem_pattern = True
         t0 = time.monotonic()
         self._session = ort.InferenceSession(
-            self._model_path, sess_options=opts, providers=providers
+            self._model_path, sess_options=opts,
+            providers=[("CUDAExecutionProvider", provider_options)],
         )
         active = self._session.get_providers()
+        if "CUDAExecutionProvider" not in active:
+            raise RuntimeError(
+                f"HeadDetector: CUDAExecutionProvider not active (got {active}). "
+                "Check onnxruntime-gpu installation."
+            )
         self._input_name = self._session.get_inputs()[0].name
         elapsed = (time.monotonic() - t0) * 1000
-        log.info(
-            "HeadDetector loaded in %.0f ms  (providers: %s)",
-            elapsed,
-            active,
-        )
+        log.info("HeadDetector loaded in %.0f ms  (provider: CUDAExecutionProvider)", elapsed)
 
     # ------------------------------------------------------------------
     # Preprocessing

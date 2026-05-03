@@ -267,7 +267,7 @@ class FaceEngine:
         # Consumed by app.py when opening a new visit.
         # Rolling frame ring buffer per camera source.
         # Key: str(camera_source)  Value: deque of numpy_frame
-        self.FOOTAGE_RING_SECS = 5.0  # keep a few seconds for snapshot quality
+        self.FOOTAGE_RING_SECS = 1.0  # 1 second per camera — reduced for multi-camera RAM
         self._frame_ring = {}  # camera_source -> deque
         self._frame_ring_lock = threading.Lock()
         self._ring_frame_counts = {}  # camera_source -> (start_mono, frame_count)
@@ -355,24 +355,16 @@ class FaceEngine:
         try:
             app = FaceAnalysis(
                 name=self.model,
-                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-                # We only need detection + recognition for matching. Skip
-                # landmark/age/gender models — they cost VRAM and load time
-                # but we never use their outputs.
+                providers=["CUDAExecutionProvider"],
                 allowed_modules=["detection", "recognition"],
             )
-            # det_size: larger captures small/distant faces in 4K frames
-            #   (640 default is too small for wide cameras).
-            # det_thresh: 0.3 is more permissive than the 0.5 default;
-            #   the recognition step will reject false positives anyway,
-            #   so it's safe to widen here.
-            app.prepare(ctx_id=0, det_size=(960, 960), det_thresh=0.5)
+            app.prepare(ctx_id=0, det_size=(960, 960), det_thresh=0.65)
             self._face_app = app
             elapsed = (time.monotonic() - t0) * 1000
             _log.info("preloaded InsightFace (%s) in %.0f ms", self.model, elapsed)
         except Exception as e:
-            _log.error("InsightFace preload failed: %s", e)
-            self._face_app = None
+            _log.error("InsightFace preload failed (GPU required): %s", e)
+            raise
 
     def start(self):
         if self._running:
@@ -432,22 +424,44 @@ class FaceEngine:
 
     def _janitor_loop(self):
         """Periodically prune unbounded in-memory state."""
-        # Tunables — keep generous so we never drop something still in use.
-        ACTIVITY_RESULT_TTL = 60.0 # stale activity results
-        ORPHAN_WRITER_TTL = 900.0  # writer not fed for 15 min: orphan
+        ACTIVITY_RESULT_TTL = 30.0
+        ORPHAN_WRITER_TTL = 300.0
+        EXTRA_CAPTURE_TTL = 1800.0  # _last_extra_capture_at entries older than 30 min
+        UNKNOWN_PENDING_TTL = 120.0  # pending capture entries with no update for 2 min
         TICK = 30.0
         while not self._janitor_stop.wait(TICK):
             now = time.monotonic()
             try:
-                # 1) activity_results stale prune (entries already expire on
-                #    read, but the dict slot stays; reclaim it)
+                # 1) activity_results stale prune
                 with self._activity_results_lock:
                     cutoff = now - ACTIVITY_RESULT_TTL
                     stale = [pid for pid, r in self._activity_results.items()
                              if float(r.get("t", 0.0)) < cutoff]
                     for pid in stale:
                         self._activity_results.pop(pid, None)
-                # 3) orphan writer prune — close writers that haven't been fed
+
+                # 2) _last_extra_capture_at grows forever — expire old entries
+                with self._last_extra_capture_lock:
+                    stale = [k for k, t in self._last_extra_capture_at.items()
+                             if (now - t) > EXTRA_CAPTURE_TTL]
+                    for k in stale:
+                        self._last_extra_capture_at.pop(k, None)
+
+                # 3) _unknown_pending per-worker: entries for tracks that died
+                #    leave a stale id(track) key that never matches again.
+                for worker in list(getattr(self, "_grid_workers", {}).values()):
+                    try:
+                        pending = worker.get("unknown_pending")
+                        if not pending:
+                            continue
+                        stale = [tid for tid, e in list(pending.items())
+                                 if (now - float(e.get("first_t", now))) > UNKNOWN_PENDING_TTL]
+                        for tid in stale:
+                            pending.pop(tid, None)
+                    except Exception:
+                        pass
+
+                # 4) orphan writer prune — close writers that haven't been fed
                 with self._writers_lock:
                     orphans = [vid for vid, last in self._writer_last_fed.items()
                                if (now - last) > ORPHAN_WRITER_TTL
@@ -469,6 +483,40 @@ class FaceEngine:
                     for vid in list(self._writer_last_fed.keys()):
                         if vid not in self._active_writers:
                             self._writer_last_fed.pop(vid, None)
+
+                # 5) Dead-thread detection: respawn capture/detect threads
+                #    that haven't ticked their heartbeat in 30 seconds.
+                THREAD_STALE_SECS = 30.0
+                for src, worker in list(getattr(self, "_grid_workers", {}).items()):
+                    if worker.get("stop_evt") and worker["stop_evt"].is_set():
+                        continue
+                    try:
+                        ct = worker.get("capture_thread")
+                        if ct is not None and not ct.is_alive():
+                            import logging as _log2
+                            _log2.getLogger("face_engine").warning(
+                                "janitor: capture thread dead for %s — respawning", src)
+                            tw = threading.Thread(
+                                target=self._grid_capture_loop,
+                                args=(worker, worker.get("_tile_w", 320), worker.get("_tile_h", 240)),
+                                daemon=True,
+                            )
+                            worker["capture_thread"] = tw
+                            tw.start()
+                        dt = worker.get("detect_thread")
+                        if dt is not None and not dt.is_alive():
+                            import logging as _log2
+                            _log2.getLogger("face_engine").warning(
+                                "janitor: detect thread dead for %s — respawning", src)
+                            tw = threading.Thread(
+                                target=self._grid_detect_loop,
+                                args=(worker,),
+                                daemon=True,
+                            )
+                            worker["detect_thread"] = tw
+                            tw.start()
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -630,6 +678,8 @@ class FaceEngine:
             frame, bbox = latest_frame, latest_bbox
 
             try:
+                if frame is None or frame.ndim < 3 or frame.shape[0] < 16 or frame.shape[1] < 16:
+                    continue
                 label, conf = self._action_detector.detect(
                     frame, bbox, person_id=person_id
                 )
@@ -827,7 +877,7 @@ class FaceEngine:
         # Each writer gets its own thread + queue so disk/NAS I/O never
         # blocks the render loop.  The queue holds pre-resized frames;
         # None is the sentinel that tells the thread to flush and exit.
-        write_q = Queue(maxsize=int(fps * 3))  # ~3 s of backlog before dropping
+        write_q = Queue(maxsize=int(fps))  # ~1 s of backlog before dropping
 
         def _writer_thread(q, rec):
             while True:
@@ -1370,6 +1420,8 @@ class FaceEngine:
         """
         if self._head_detector is None:
             return []
+        if frame is None or frame.ndim < 3 or frame.shape[0] < 16 or frame.shape[1] < 16:
+            return []
         try:
             return self._head_detector.detect(frame)
         except Exception:
@@ -1454,7 +1506,9 @@ class FaceEngine:
         # Compute face area for quality selection
         bx, by, bw, bh = track.get("bbox", (0, 0, 0, 0))
         area = bw * bh
-        if area <= 0:
+        # Skip tiny detections — they produce near-zero crops that crash the
+        # ONNX CUDA runtime (SIGSEGV) when re-run through InsightFace.
+        if area < 400 or bw < 16 or bh < 16:
             return None
 
         entry = pending.get(tid)
@@ -1519,10 +1573,20 @@ class FaceEngine:
         if self._face_app is None:
             pending.pop(tid, None)
             return None
+        # Guard: InsightFace's ONNX CUDA kernel segfaults on tiny inputs.
+        if crop.shape[0] < 32 or crop.shape[1] < 32:
+            pending.pop(tid, None)
+            return None
+        # Must hold inference lock — concurrent _face_app.get() calls from
+        # multiple detect threads cause SIGSEGV in the ONNX CUDA runtime.
+        if not self._inference_lock.acquire(timeout=2.0):
+            return None  # detection busy, skip — will retry on next track
         try:
             qc_faces = self._face_app.get(crop)
         except Exception:
             qc_faces = []
+        finally:
+            self._inference_lock.release()
         # Keep only confident faces
         qc_faces = [
             f for f in (qc_faces or [])
@@ -1566,12 +1630,16 @@ class FaceEngine:
                         continue
                     img_path = os.path.join(d_path, img_file)
                     ref_img = cv2.imread(img_path)
-                    if ref_img is None:
+                    if ref_img is None or ref_img.shape[0] < 32 or ref_img.shape[1] < 32:
+                        continue
+                    if not self._inference_lock.acquire(timeout=2.0):
                         continue
                     try:
                         ref_faces = self._face_app.get(ref_img)
                     except Exception:
-                        continue
+                        ref_faces = []
+                    finally:
+                        self._inference_lock.release()
                     ref_faces = [f for f in (ref_faces or []) if f.embedding is not None]
                     if not ref_faces:
                         continue
@@ -1686,7 +1754,14 @@ class FaceEngine:
                 tight = crop_frame[by:by + bh, bx:bx + bw]
                 if tight.size == 0 or self._face_app is None:
                     return False
-                detected = self._face_app.get(tight)
+                if tight.shape[0] < 32 or tight.shape[1] < 32:
+                    return False
+                if not self._inference_lock.acquire(timeout=2.0):
+                    return False
+                try:
+                    detected = self._face_app.get(tight)
+                finally:
+                    self._inference_lock.release()
                 detected = [f for f in detected if float(getattr(f, "det_score", 0.0)) >= 0.50]
                 if not detected:
                     return False
@@ -1820,7 +1895,14 @@ class FaceEngine:
                     img = cv2.imread(path)
                     if img is None or self._face_app is None:
                         continue
-                    detected = self._face_app.get(img)
+                    if img.shape[0] < 32 or img.shape[1] < 32:
+                        continue
+                    if not self._inference_lock.acquire(timeout=2.0):
+                        continue
+                    try:
+                        detected = self._face_app.get(img)
+                    finally:
+                        self._inference_lock.release()
                     detected = [f for f in detected if float(getattr(f, "det_score", 0.0)) >= 0.50]
                     if not detected:
                         continue
@@ -1857,7 +1939,31 @@ class FaceEngine:
                 template = l2norm(np.mean(np.asarray(embs), axis=0))
                 known.append((person, template))
 
+        prev_names = {name for name, _ in self.known_embeddings}
+        new_names = {name for name, _ in known}
         self.known_embeddings = known
+
+        # Auto-wipe DB visits for persons whose folder is now empty/gone.
+        # This fires when the user moves the last image out of a folder —
+        # the identity no longer exists so its history is orphaned.
+        removed = prev_names - new_names
+        for name in removed:
+            person_dir = os.path.join(self.known_dir, name)
+            folder_gone = not os.path.isdir(person_dir)
+            folder_empty = os.path.isdir(person_dir) and not any(
+                f.lower().endswith(self.allowed_exts)
+                for f in os.listdir(person_dir)
+            )
+            if folder_gone or folder_empty:
+                try:
+                    import db as _db
+                    deleted = _db.delete_person_visits(name)
+                    _log.info("reload_faces: wiped %d visits for removed identity %r", deleted, name)
+                    if folder_empty:
+                        import shutil
+                        shutil.rmtree(person_dir, ignore_errors=True)
+                except Exception as _e:
+                    _log.warning("reload_faces: could not wipe visits for %r: %s", name, _e)
 
     def _detect_and_match_faces(self, frame_full, min_face_size=30, keep_unembedded_unknown=False):
         H, W = frame_full.shape[:2]
@@ -1873,13 +1979,17 @@ class FaceEngine:
             else:
                 small = frame_full
 
-            # Detection + embedding in one GPU pass per frame.
-            faces = self._face_app.get(small)
-
-            # Fallback: if a downscale missed the face, retry full-res once.
-            if not faces and used_scale != 1.0:
-                faces = self._face_app.get(frame_full)
-                used_scale = 1.0
+            # Serialise GPU inference — concurrent ONNX calls from 17 threads
+            # cause native segfaults (exit -11) under load.
+            if not self._inference_lock.acquire(timeout=2.0):
+                return results  # another thread is running inference; skip this frame
+            try:
+                faces = self._face_app.get(small)
+                if not faces and used_scale != 1.0:
+                    faces = self._face_app.get(frame_full)
+                    used_scale = 1.0
+            finally:
+                self._inference_lock.release()
 
             inv = 1.0 / used_scale
         except Exception as _ext_err:
@@ -2174,51 +2284,65 @@ class FaceEngine:
         self._grid_stop_evt.clear()
         self._grid_qr_rr_idx = 0
 
+        total_sources = len([s for s in sources if s is not None])
+        self._loading_total = total_sources
+        self._loading_opened = 0
+
+        from hw_capture import open_capture as _hw_open
+        import concurrent.futures as _cf
+
+        # Deduplicate sources while preserving slot order.
+        unique_sources = []
+        seen_srcs = set()
         for source in sources:
-            # None means an intentionally empty slot — no worker needed
+            if source is None:
+                unique_sources.append(None)
+                continue
+            src_key = str(source)
+            if src_key in seen_srcs:
+                unique_sources.append(None)
+            else:
+                seen_srcs.add(src_key)
+                unique_sources.append(source)
+
+        # Open all cameras in parallel so startup doesn't block the command
+        # loop for 30+ seconds (sequential opens at ~1.5s each with 23 cams).
+        real_sources = [(i, s) for i, s in enumerate(unique_sources) if s is not None]
+        cap_results = {}  # src_key -> cap or None
+
+        def _open_one(idx_src):
+            idx, src = idx_src
+            cap = _hw_open(src)
+            if not cap.isOpened():
+                try: cap.release()
+                except Exception: pass
+                return str(src), None
+            if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+                try: cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception: pass
+            return str(src), cap
+
+        with _cf.ThreadPoolExecutor(max_workers=min(len(real_sources), 16)) as _ex:
+            for src_key, cap in _ex.map(_open_one, real_sources):
+                cap_results[src_key] = cap
+                if cap is not None:
+                    self._loading_opened += 1
+
+        _detect_period = max(0.25, float(self.detect_every))
+        for source in unique_sources:
             if source is None:
                 ordered_sources.append(None)
                 continue
-
-            # Skip duplicate sources — a camera can only be opened once
             src_key = str(source)
-            if src_key in workers:
+            cap = cap_results.get(src_key)
+            if cap is None:
                 ordered_sources.append(None)
                 continue
 
-            # Use NVDEC for RTSP/HTTP sources when available; the opener
-            # transparently falls back to cv2.VideoCapture if hardware
-            # decode init fails for any reason (codec mismatch, GPU
-            # memory, driver issue), so existing reconnect logic still
-            # works. Set USE_NVDEC=0 in env to force CPU decode.
-            from hw_capture import open_capture as _hw_open
-            cap = _hw_open(source)
-            if not cap.isOpened():
-                try:
-                    cap.release()
-                except Exception:
-                    pass
-                ordered_sources.append(None)  # treat as empty if can't open
-                continue
-
-            # IMPORTANT: do NOT call cap.set(CAP_PROP_FRAME_WIDTH/HEIGHT).
-            # That would downscale the camera feed at the source on backends
-            # that honor it, starving the AI detectors with a tile-sized
-            # frame. We want the camera's native resolution for detection
-            # and only resize for the tile renderer (done in capture loop).
-            if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
-                try:
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                except Exception:
-                    pass
-
             # Phase-stagger per worker so N grid workers don't all hit
-            # the inference lock at the same moment. Spreads the load
-            # across detect_every and dramatically reduces lock contention
-            # on large grids (10+ cams).
+            # the inference lock at the same moment.
             _worker_idx = len(workers)
-            _detect_period = max(0.25, float(self.detect_every))
-            _phase_offset = (_detect_period * _worker_idx / max(1, len(sources))) - _detect_period
+            _phase_offset = (_detect_period * _worker_idx / max(1, len(real_sources))) - _detect_period
 
             worker = {
                 "source": source,
@@ -2226,6 +2350,10 @@ class FaceEngine:
                 "lock": threading.Lock(),
                 "stop_evt": threading.Event(),
                 "frame_q": Queue(maxsize=1),
+                "_tile_w": tile_w,
+                "_tile_h": tile_h,
+                "capture_heartbeat_t": time.monotonic(),
+                "detect_heartbeat_t": time.monotonic(),
                 "latest_frame": None,
                 "latest_raw_frame": None,
                 "latest_frame_t": 0.0,
@@ -2233,13 +2361,11 @@ class FaceEngine:
                 "tracks": [],
                 "latest_tracks": [],
                 "last_det_t": time.monotonic() + _phase_offset,
-                "track_max_misses": 6,
+                "track_max_misses": 3,
                 "bbox_smooth_alpha": 0.55,
                 "max_unknown_tracks": 3,
                 "capture_thread": None,
                 "detect_thread": None,
-                # Per-worker pending dict for auto-capture so workers don't
-                # wipe each other's state via the engine-level cleanup.
                 "unknown_pending": {},
             }
             worker["capture_thread"] = threading.Thread(
@@ -2380,16 +2506,52 @@ class FaceEngine:
         return mean_g > 100 and mean_g > mean_r * 2.5 and mean_g > mean_b * 2.5
 
     def _grid_capture_loop(self, worker, tile_w, tile_h):
+        from hw_capture import open_capture as _hw_open
         cap = worker["cap"]
+        _no_frame_since = None  # monotonic time of first consecutive failure
+        _RECONNECT_SECS = 8.0   # reopen after this many seconds with no frames
+
         while not self.stop_evt.is_set() and not self._grid_stop_evt.is_set() and not worker["stop_evt"].is_set():
+            # Pick up replacement cap if reconnect thread swapped it.
+            current_cap = worker.get("cap", cap)
+            if current_cap is not cap:
+                cap = current_cap
             ok, frame = cap.read()
             now = time.monotonic()
             if not ok or frame is None:
                 with worker["lock"]:
                     if (now - float(worker.get("last_good_frame_t", 0.0))) > 1.0:
                         worker["latest_frame"] = None
-                time.sleep(0.02)
+                if _no_frame_since is None:
+                    _no_frame_since = now
+                elif (now - _no_frame_since) >= _RECONNECT_SECS:
+                    # Stream dead — reconnect in a background thread so we
+                    # don't block the engine command loop (PyAV open has a
+                    # 10s timeout that would freeze all camera switches).
+                    source = worker.get("source")
+                    import logging as _log
+                    _log.getLogger("face_engine").warning(
+                        "capture: no frames for %.0fs on %s — reconnecting", now - _no_frame_since, source
+                    )
+                    _no_frame_since = None  # reset so we don't re-trigger immediately
+                    old_cap = cap
+
+                    def _reconnect(w, old, src):
+                        try: old.release()
+                        except Exception: pass
+                        try:
+                            new_cap = _hw_open(src)
+                            w["cap"] = new_cap
+                            _log.getLogger("face_engine").info("reconnected %s", src)
+                        except Exception as _e:
+                            _log.getLogger("face_engine").warning("reconnect failed for %s: %s", src, _e)
+
+                    threading.Thread(target=_reconnect, args=(worker, old_cap, source), daemon=True).start()
+                    # Keep reading from the old (dead) cap while reconnect runs;
+                    # it'll just return (False, None) until the thread swaps it.
+                time.sleep(0.05)
                 continue
+            _no_frame_since = None
 
             # Reject corrupt frames from NVDEC partial decodes (green-flash frames).
             if self._is_corrupt_frame(frame):
@@ -2405,17 +2567,17 @@ class FaceEngine:
 
             with worker["lock"]:
                 worker["latest_frame"] = frame
-                worker["latest_raw_frame"] = raw_frame
+                worker["latest_raw_frame"] = raw_frame  # overwritten each frame; only held until next frame
                 worker["latest_frame_t"] = now
                 worker["last_good_frame_t"] = now
+                worker["capture_heartbeat_t"] = now
 
-            # Push BOTH the raw camera frame AND the tile-sized resize.
-            # Detection runs on raw for accuracy on small/distant faces;
-            # the tracker is initialised in tile space so render-loop
-            # tracker.update(tile) calls remain cheap and consistent.
+            # Push tile frame only for detection — raw is read directly from
+            # worker["latest_raw_frame"] in the detect loop to avoid copying
+            # a full-resolution frame into the queue.
             self._push_latest(
                 worker["frame_q"],
-                (now, raw_frame.copy(), frame.copy()),
+                (now, frame),
             )
 
     def _grid_detect_loop(self, worker):
@@ -2429,17 +2591,24 @@ class FaceEngine:
         detect_period = max(0.25, float(self.detect_every))
         while not self.stop_evt.is_set() and not self._grid_stop_evt.is_set() and not worker["stop_evt"].is_set():
             try:
-                _frame_t, raw_frame, tile_frame = worker["frame_q"].get(timeout=0.1)
+                _frame_t, tile_frame = worker["frame_q"].get(timeout=0.1)
             except Empty:
                 continue
             except (TypeError, ValueError):
-                # Defensive: queue payload shape mismatch (e.g. legacy 2-tuple).
                 continue
 
             now = time.monotonic()
             with worker["lock"]:
                 last_det_t = float(worker.get("last_det_t", 0.0))
             if (now - last_det_t) < detect_period:
+                continue
+
+            # Grab the raw frame from the worker dict (avoids copying it into
+            # the queue — saves ~8MB per camera per detection tick).
+            with worker["lock"]:
+                raw_frame = worker.get("latest_raw_frame")
+                worker["detect_heartbeat_t"] = time.monotonic()
+            if raw_frame is None:
                 continue
 
             # Run face detection on the FULL-resolution camera frame so
@@ -2750,8 +2919,8 @@ class FaceEngine:
         grid_h = cell_h * rows
         last_encode_t = 0.0
         last_single_encode_t = 0.0
-        stale_secs = 1.6
-        unknown_stale_secs = max(0.8, self.detect_every * 1.0)
+        stale_secs = 1.0
+        unknown_stale_secs = max(0.5, self.detect_every * 0.6)
 
         canvas = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)  # reused each frame
 
@@ -2770,11 +2939,26 @@ class FaceEngine:
         # Tracks must outlive that window or every track gets killed before
         # reconfirmation.
         n_workers = max(1, len([s for s in analysis_sources if s is not None]))
-        unknown_reconfirm_secs = max(3.0, self.detect_every * 5.0 * n_workers)
-        known_reconfirm_secs = max(5.0, self.detect_every * 7.0 * n_workers)
+        # Cap reconfirm windows: detect_every * n_workers gives the expected
+        # worst-case gap between face detections on a single camera under full
+        # GPU load. A 2× safety margin is enough; uncapped values (e.g. 800s
+        # with 23 cams) cause ghost boxes to float for minutes after people leave.
+        _detection_cycle = self.detect_every * n_workers
+        unknown_reconfirm_secs = min(max(3.0, _detection_cycle * 2.0), 20.0)
+        known_reconfirm_secs = min(max(5.0, _detection_cycle * 2.5), 30.0)
 
+        frame_interval = 1.0 / max(1, self.out_fps)
         while not self.stop_evt.is_set() and not self._grid_stop_evt.is_set():
-            now = time.monotonic()
+            loop_start = time.monotonic()
+
+            # Skip the entire render iteration if we're not due for a new
+            # frame yet. This keeps the loop sleeping most of the time
+            # instead of doing 23-camera work at CPU speed.
+            if (loop_start - last_encode_t) < frame_interval:
+                time.sleep(max(0.001, frame_interval - (loop_start - last_encode_t)))
+                continue
+
+            now = loop_start
             canvas[:] = 0  # clear reused buffer instead of allocating
             aggregated_tracks = []
 
@@ -3082,23 +3266,23 @@ class FaceEngine:
                         except Exception:
                             pass
 
-            if now - last_encode_t >= (1.0 / max(1, self.out_fps)):
-                last_encode_t = now
-                ok, buf = cv2.imencode(
-                    ".jpg", canvas, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)]
-                )
-                if ok:
-                    with self._lock:
-                        self._latest_jpeg = buf.tobytes()
-                        self._latest_tracks = aggregated_tracks
+            last_encode_t = now
+            ok, buf = cv2.imencode(
+                ".jpg", canvas, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)]
+            )
+            if ok:
+                with self._lock:
+                    self._latest_jpeg = buf.tobytes()
+                    self._latest_tracks = aggregated_tracks
 
-            time.sleep(0.001)
+            elapsed = time.monotonic() - now
+            time.sleep(max(0.001, frame_interval - elapsed))
 
     def _main_loop(self):
         last_sent_t = 0.0
         last_encode_t = 0.0
-        stale_secs = 2.0
-        unknown_stale_secs = 0.7
+        stale_secs = 1.0
+        unknown_stale_secs = 0.5
         unknown_reconfirm_secs = max(1.5, self.detect_every * 1.5)
         known_reconfirm_secs = max(2.0, self.detect_every * 2.0)
         max_detection_lag = max(1.5, self.detect_every * 4.0)

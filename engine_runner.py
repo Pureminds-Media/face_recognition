@@ -61,6 +61,8 @@ def run(conn, state, engine_kwargs, log_level=logging.INFO):
                 state["grid_page_count"] = engine.grid_page_count()
                 state["activity_enabled"] = bool(getattr(engine, "activity_enabled", False))
                 state["source_name_map"] = dict(getattr(engine, "source_name_map", {}) or {})
+                state["loading_opened"] = int(getattr(engine, "_loading_opened", 0))
+                state["loading_total"] = int(getattr(engine, "_loading_total", 0))
 
                 # Hot-path data
                 state["tracks"] = list(engine.get_tracks() or [])
@@ -131,6 +133,18 @@ def run(conn, state, engine_kwargs, log_level=logging.INFO):
             # the periodic sync thread next ticks.
             try: state[name] = value
             except Exception: pass
+            return None
+        if op == "reload_faces":
+            # Run in background so the command loop isn't blocked for the
+            # duration of embedding computation (can take 10-30s with many faces).
+            def _do_reload():
+                try:
+                    engine.reload_faces()
+                    state["identities"] = len(engine.known_embeddings)
+                    state["identity_names"] = [name for name, _ in engine.known_embeddings]
+                except Exception as e:
+                    log.warning("reload_faces background error: %s", e)
+            threading.Thread(target=_do_reload, daemon=True).start()
             return None
         if op == "process_video_start":
             input_path, output_path = args

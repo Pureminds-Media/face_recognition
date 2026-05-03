@@ -251,15 +251,15 @@
 
     <!-- ============ PEOPLE MODALS ============ -->
 
-    <!-- Rename Modal -->
+    <!-- Rename / Merge Modal -->
     <div id="renameModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60">
       <div class="bg-slate-900 border border-slate-700 rounded-xl p-6 w-full max-w-md mx-4">
-        <h3 class="text-lg font-semibold mb-4">Rename Person</h3>
+        <h3 class="text-lg font-semibold mb-4">Rename / Merge Person</h3>
         <div class="mb-3">
           <label class="block text-sm text-slate-400 mb-1">Current name</label>
           <div id="renameOldName" class="text-white font-mono bg-slate-800 rounded px-3 py-2"></div>
         </div>
-        <div class="mb-4">
+        <div class="mb-1">
           <label class="block text-sm text-slate-400 mb-1">New name</label>
           <input
             id="renameNewName"
@@ -268,8 +268,9 @@
             placeholder="e.g. john_doe"
             maxlength="64"
           />
-          <div id="renameError" class="text-red-400 text-sm mt-1 hidden"></div>
         </div>
+        <div class="text-xs text-slate-500 mb-3">If the name already exists, the photos and visit history will be merged into that person.</div>
+        <div id="renameError" class="text-red-400 text-sm mb-3 hidden"></div>
         <div class="flex gap-3 justify-end">
           <button
             onclick="closeRenameModal()"
@@ -644,8 +645,14 @@
           return;
         }
 
+        const isMerge = _knownPeopleNames && _knownPeopleNames.includes(newName.toLowerCase()) && newName !== _renameTarget;
+        if (isMerge) {
+          const ok = confirm(`"${newName}" already exists. Merge "${_renameTarget}" into "${newName}"?\n\nAll photos and visit history will be combined. This cannot be undone.`);
+          if (!ok) return;
+        }
+
         btn.disabled = true;
-        btn.textContent = "Renaming...";
+        btn.textContent = isMerge ? "Merging..." : "Renaming...";
 
         try {
           const res = await fetch("/api/rename_person", {
