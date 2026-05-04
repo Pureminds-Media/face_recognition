@@ -33,6 +33,34 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
+# Serialise concurrent NVDEC context creation/destruction.  Creating or
+# tearing down multiple CUDA video-decode contexts simultaneously can
+# corrupt internal NVDEC state and cause SIGSEGV.
+_nvdec_lock = threading.Lock()
+
+# Limit concurrent GPU→CPU frame downloads (frame.to_ndarray on NVDEC frames).
+# 23 threads doing simultaneous CUDA memcpy + colour conversion on one NVDEC
+# engine corrupts CUDA state and causes SIGSEGV.  A semaphore of 6 allows
+# enough parallelism while keeping the hardware from being overwhelmed.
+# Raise MAX_NVDEC_TRANSFERS in env if you have a high-end GPU with multiple
+# NVDEC engines (e.g. RTX 5090).
+def _max_nvdec_transfers() -> int:
+    try:
+        return max(1, int(os.getenv("MAX_NVDEC_TRANSFERS", "6")))
+    except (ValueError, TypeError):
+        return 6
+
+_nvdec_transfer_sem: Optional[threading.Semaphore] = None
+_nvdec_transfer_sem_lock = threading.Lock()
+
+def _get_transfer_sem() -> threading.Semaphore:
+    global _nvdec_transfer_sem
+    if _nvdec_transfer_sem is None:
+        with _nvdec_transfer_sem_lock:
+            if _nvdec_transfer_sem is None:
+                _nvdec_transfer_sem = threading.Semaphore(_max_nvdec_transfers())
+    return _nvdec_transfer_sem
+
 # Map of base FFmpeg codec name → CUVID hardware decoder. PyAV/FFmpeg
 # auto-detects the codec from the RTSP stream so we just need to look
 # up which hardware decoder to substitute.
@@ -97,23 +125,24 @@ class HwRtspCapture:
         # software inside this same container instead of erroring out.
         hwaccel = HWAccel(device_type="cuda", allow_software_fallback=True)
 
-        self._container = av.open(
-            url, options=options, timeout=10.0, hwaccel=hwaccel,
-        )
-        try:
-            stream = self._container.streams.video[0]
-        except IndexError:
-            self._container.close()
-            raise RuntimeError(f"No video stream in {url}")
-
-        # Sanity-check that hwaccel actually attached. If not, bail so
-        # the caller falls back to cv2.VideoCapture.
-        if not getattr(stream.codec_context, "is_hwaccel", False):
-            base_codec = stream.codec_context.codec.name if stream.codec_context.codec else "?"
-            self._container.close()
-            raise RuntimeError(
-                f"hwaccel did not attach for codec {base_codec!r} on {url}"
+        with _nvdec_lock:
+            self._container = av.open(
+                url, options=options, timeout=10.0, hwaccel=hwaccel,
             )
+            try:
+                stream = self._container.streams.video[0]
+            except IndexError:
+                self._container.close()
+                raise RuntimeError(f"No video stream in {url}")
+
+            # Sanity-check that hwaccel actually attached. If not, bail so
+            # the caller falls back to cv2.VideoCapture.
+            if not getattr(stream.codec_context, "is_hwaccel", False):
+                base_codec = stream.codec_context.codec.name if stream.codec_context.codec else "?"
+                self._container.close()
+                raise RuntimeError(
+                    f"hwaccel did not attach for codec {base_codec!r} on {url}"
+                )
 
         self._stream = stream
         self._width = int(stream.codec_context.width or 0)
@@ -140,7 +169,8 @@ class HwRtspCapture:
                 # transparently downloads + reformats to BGR via
                 # libswscale. Cheaper than a CPU H.264/H.265 decode.
                 try:
-                    ndarr = frame.to_ndarray(format="bgr24")
+                    with _get_transfer_sem():
+                        ndarr = frame.to_ndarray(format="bgr24")
                 except Exception:
                     continue
                 with self._lock:
@@ -167,13 +197,17 @@ class HwRtspCapture:
 
     def release(self):
         self._stop.set()
+        # Close the container first — this unblocks the blocking decode()
+        # call in the reader thread so the join below doesn't time out and
+        # leave the thread accessing a half-closed container (SIGSEGV).
+        with _nvdec_lock:
+            try:
+                self._container.close()
+            except Exception:
+                pass
         if self._thread is not None:
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=3.0)
             self._thread = None
-        try:
-            self._container.close()
-        except Exception:
-            pass
         self._opened = False
 
     # cv2 callers occasionally probe these; keep the API surface

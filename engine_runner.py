@@ -134,6 +134,17 @@ def run(conn, state, engine_kwargs, log_level=logging.INFO):
             try: state[name] = value
             except Exception: pass
             return None
+        if op == "start":
+            # Run in background so the command loop isn't blocked while
+            # cameras open (23 cameras × ~1.2 s each = ~28 s with NVDEC
+            # serialisation).  The UI polls is_running via shared state.
+            def _do_start():
+                try:
+                    engine.start()
+                except Exception as e:
+                    log.warning("engine.start() background error: %s", e)
+            threading.Thread(target=_do_start, daemon=True).start()
+            return None
         if op == "reload_faces":
             # Run in background so the command loop isn't blocked for the
             # duration of embedding computation (can take 10-30s with many faces).

@@ -16,7 +16,7 @@ Uses InsightFace (RetinaFace + ArcFace, ONNX Runtime GPU) for face detection and
 
 - **Multi-camera analysis** — every configured camera runs concurrently in a shared analysis pool: face detection, recognition, tracking, visit bookkeeping, and footage capture all happen for every camera at once regardless of which one is on screen. RTSP streams decode on the GPU's NVDEC engine when available (PyAV + CUDA hwaccel), keeping CPU free for the rest of the pipeline. Per-camera fallback to software decode if hardware decode init fails.
 - **UI is single-camera-only** — the live preview cycles between cameras one at a time (carousel arrows / swipe). Bounding boxes and name labels are drawn on the live feed by default; toggle off via `LIVE_ANNOTATIONS_ENABLED=0` when crowded scenes turn the overlays into illegible mess. Footage recordings are always annotated regardless of this flag.
-- **Face recognition** — InsightFace `buffalo_l` model pack (RetinaFace detector + ArcFace embeddings, ONNX Runtime on GPU) with CSRT tracking. Thread-safe so multiple cameras detect concurrently in a single shared FaceAnalysis instance.
+- **Face recognition** — InsightFace `buffalo_l` model pack (RetinaFace detector + ArcFace embeddings, ONNX Runtime on GPU) with CSRT tracking. A pool of up to `INFERENCE_POOL_SIZE` independent FaceAnalysis instances (default 6) runs concurrently across cameras; each has its own CUDA stream so detection from different cameras truly overlaps on the GPU.
 - **Head detection** — YOLOv8n (ONNX Runtime GPU) supplements face detection to sustain tracking when face is not visible (e.g. turned sideways). Always on when model file exists, graceful fallback if missing.
 - **Visit tracking** — Per-location visits with flip-flop prevention, automatic timeout, and transition detection
 - **Footage recording** — Continuous VP8/WebM recording from visit start to end at native camera resolution
@@ -24,7 +24,8 @@ Uses InsightFace (RetinaFace + ArcFace, ONNX Runtime GPU) for face detection and
 - **Auto-capture unknowns** — Automatically saves face crops of unrecognised people as `unknown_1`, `unknown_2`, etc. Re-identifies them on reappearance. Best for small crowds. Optional, toggled via `AUTO_CAPTURE_ENABLED` env var.
 - **AI kill switch** — Set `FACE_DETECTION_ENABLED=false` to disable all inference (detection, recognition, tracking, attendance) and run as a pure camera stream viewer. Useful for diagnosing lag or running on non-GPU hardware.
 - **People management** — Dedicated `/people` page to view all enrolled persons, rename anyone (especially auto-captured unknowns), delete persons, view face images, transfer images between persons, and delete individual images.
-- **History dashboard** — Daily summary, per-person, and per-location visit history with footage playback
+- **History dashboard** — Visit history across four views: Attendance (first/last seen per person per day), Daily Summary, Per Person, and Per Location — all with footage playback. All date pickers display as dd-mm-yyyy.
+- **Analytics dashboard** — Top 10 Earliest Arrivals (by day), Top 10 Latest Arrivals (by day), and Top 10 Longest Working shown as an interactive horizontal bar chart (hover for duration tooltip), all filterable by period.
 - **SSE attendance stream** — Real-time attendance events via Server-Sent Events
 
 ## Requirements
@@ -103,7 +104,7 @@ Key settings in `.env`:
 | `DATABASE_PATH` | `face_recognition.db` | SQLite database file path |
 | `DATABASE_URL` | *(none)* | PostgreSQL connection string (overrides SQLite) |
 | `VISIT_TIMEOUT_MINUTES` | `10` | Close a visit after this many minutes unseen |
-| `VISIT_TRANSITION_SECS` | `2.0` | Grace period before transitioning to a new camera |
+| `VISIT_TRANSITION_SECS` | `30.0` | Seconds a person must be absent from their current camera before the visit transitions to a new location. Raise to reduce flip-flopping in camera overlap zones. |
 | `FACE_DETECTION_ENABLED` | `true` | Master AI switch. Set to `false` to disable all face detection, recognition, tracking, and attendance — the system becomes a plain camera stream viewer with no GPU inference load. |
 | `ACTION_DETECTION_ENABLED` | `false` | Enable/disable CLIP action detection |
 | `AUTO_CAPTURE_ENABLED` | `false` | Enable/disable auto-capture of unknown persons (best for small crowds) |
@@ -192,12 +193,13 @@ Key parameters in `app.py` engine initialization:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `detect_every` | `0.3` | Seconds between face detection runs |
+| `detect_every` | `5` | Seconds between face detection runs per camera |
 | `detect_scale` | `1.0` | Scale factor for detection (lower = faster, less accurate) |
 | `width` / `height` | `1280` / `720` | Camera resolution |
 | `out_fps` | `15` | Target FPS for MJPEG stream and footage |
 | `threshold` | `0.5` | Cosine distance threshold for ArcFace face matching. Below this distance → recognised as that person. Raise (toward 0.6) if same person is being mis-labeled "unknown"; lower (toward 0.4) if different people are being collapsed together. |
 | `tracker_type` | `CSRT` | OpenCV tracker (`CSRT` or `KCF`) |
+| `INFERENCE_POOL_SIZE` | `6` | Number of parallel InsightFace instances. Each costs ~300–400 MB VRAM. On an 8 GB GPU running 20+ cameras, keep at 6 or below — higher values cause VRAM exhaustion and SIGSEGV crashes. |
 
 ## Auto-Capture Unknowns
 
@@ -242,6 +244,10 @@ curl -X POST http://localhost:5000/api/history/clear
 **Action detection not loading** — Ensure `onnxruntime-gpu` is installed and `onnxruntime` (CPU) is not. Check CUDA drivers with `nvidia-smi`.
 
 **Footage won't play in browser** — Files are VP8/WebM. All modern browsers support this. The OpenCV "tag VP80 is not supported" warning is misleading — the files are valid.
+
+**Engine subprocess crashes (exit code -11 / SIGSEGV)** — Most common causes: (1) VRAM exhaustion — reduce `INFERENCE_POOL_SIZE` in `face_engine.py` (each instance uses ~400 MB VRAM; default 6 is safe on 8 GB; raising above 8–10 risks OOM with 20+ cameras); (2) concurrent NVDEC context creation/destruction — fixed in `hw_capture.py` by serialising `av.open()` / `container.close()` under a module-level lock; (3) visit flip-flopping creating rapid footage-writer churn — raise `VISIT_TRANSITION_SECS` (default 30 s).
+
+**Cameras flip-flopping between locations** — A person in a camera overlap zone can be detected on alternating cameras each cycle, creating rapid visit transitions and footage writer churn. Raise `VISIT_TRANSITION_SECS` (default 30 s) so a person must be absent from their current camera for at least that long before transitioning.
 
 **Camera lag on repeated start/stop** — Fixed in recent updates. The engine now fully cleans up GPU models, footage writers, frame buffers, and pending state on stop.
 

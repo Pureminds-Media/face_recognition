@@ -292,7 +292,7 @@ _ENGINE_KWARGS = dict(
     known_dir=FACES_DIR,
     detector="retinaface",
     model="buffalo_l",
-    threshold=0.5,
+    threshold=0.55,
     detect_every=5,
     detect_scale=1,
     tracker_type="CSRT",
@@ -439,7 +439,7 @@ UNKNOWN_PROMPT_SECS = 10.0
 UNKNOWN_RESET_GRACE_SECS = 1.5
 VISIT_TIMEOUT_MINUTES = int(os.getenv("VISIT_TIMEOUT_MINUTES", "10"))
 VISIT_STALE_CHECK_SECS = 30.0  # how often to check for stale visits
-VISIT_TRANSITION_SECS = float(os.getenv("VISIT_TRANSITION_SECS", "2.0"))  # seconds absent from current camera before transitioning to a new location
+VISIT_TRANSITION_SECS = float(os.getenv("VISIT_TRANSITION_SECS", "30.0"))  # seconds absent from current camera before transitioning to a new location
 qr_prompt_state = {
     "unknown_first_mono": None,
     "unknown_last_seen_mono": None,
@@ -2654,6 +2654,230 @@ def attendance_stream():
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.route("/api/analytics/earliest")
+def api_analytics_earliest():
+    """Top 10 employees with the earliest first arrival on a specific date.
+
+    Query params:
+      ?date=YYYY-MM-DD  (default: today)
+      ?order=latest     (reverse sort for latest arrivals)
+      ?shift=morning|night
+          morning = 04:00–16:00 on the given date
+          night   = 16:00 on the given date to 04:00 the following day
+          (omit for full day)
+    Returns rows sorted by first_seen, excluding unknown_N names.
+    """
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+
+    date_str = request.args.get("date", datetime.now().strftime("%Y-%m-%d"))
+    try:
+        # Build shift boundaries in local time, then convert to UTC for the SQL comparison
+        local_midnight = datetime.strptime(date_str, "%Y-%m-%d").astimezone()
+        day = local_midnight
+    except ValueError:
+        return jsonify({"ok": False, "error": "invalid date format"}), 400
+
+    shift = request.args.get("shift", "")  # "morning", "night", or ""
+    order = "DESC" if request.args.get("order") == "latest" else "ASC"
+    ph = "?" if db._backend == "sqlite" else "%s"
+
+    if shift == "morning":
+        start = (day + timedelta(hours=4)).astimezone(timezone.utc)
+        end   = (day + timedelta(hours=16)).astimezone(timezone.utc)
+    elif shift == "night":
+        start = (day + timedelta(hours=16)).astimezone(timezone.utc)
+        end   = (day + timedelta(hours=28)).astimezone(timezone.utc)  # 04:00 next day
+    else:
+        start = day.astimezone(timezone.utc)
+        end   = (day + timedelta(days=1)).astimezone(timezone.utc)
+
+    params = (start.isoformat() if db._backend == "sqlite" else start,
+              end.isoformat()   if db._backend == "sqlite" else end)
+
+    # For night shift: exclude anyone who already arrived during morning shift
+    # so each person appears in at most one shift row.
+    morning_exclusion = ""
+    morning_params = ()
+    if shift == "night":
+        morning_start = (day + timedelta(hours=4)).astimezone(timezone.utc)
+        morning_end   = (day + timedelta(hours=16)).astimezone(timezone.utc)
+        ms = morning_start.isoformat() if db._backend == "sqlite" else morning_start
+        me = morning_end.isoformat()   if db._backend == "sqlite" else morning_end
+        morning_exclusion = f"""
+          AND person_name NOT IN (
+            SELECT DISTINCT person_name FROM visits
+            WHERE first_seen >= {ph} AND first_seen < {ph}
+          )"""
+        morning_params = (ms, me)
+
+    sql = f"""
+        SELECT person_name, MIN(first_seen) as earliest
+        FROM visits
+        WHERE first_seen >= {ph} AND first_seen < {ph}
+          AND person_name NOT LIKE 'unknown_%'
+          {morning_exclusion}
+        GROUP BY person_name
+        ORDER BY earliest {order}
+        LIMIT 10
+    """
+    with db._cursor() as cur:
+        cur.execute(sql, params + morning_params)
+        rows = db._rows_to_dicts(cur.fetchall())
+
+    result = []
+    for row in rows:
+        dt = _to_dt(row["earliest"])
+        result.append({
+            "person_name": row["person_name"],
+            "arrival_time": dt.astimezone().strftime("%I:%M %p") if dt else "--",
+        })
+
+    return jsonify({"ok": True, "date": date_str, "shift": shift, "rows": result})
+
+
+@app.route("/api/analytics/longest")
+def api_analytics_longest():
+    """Top 10 employees with the longest total visible duration for a period.
+
+    Query param: ?period=day|week|month|year (default: day)
+    Sums visible_duration (seconds on camera) per person, falls back to
+    last_seen - first_seen for visits without visible_duration recorded.
+    """
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+
+    period = request.args.get("period", "day")
+    now = datetime.now(timezone.utc)
+
+    if period == "day":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "week":
+        # Calendar week: Sunday = day 0. weekday() returns Mon=0..Sun=6, so
+        # days_since_sunday = (weekday + 1) % 7
+        days_since_sunday = (now.weekday() + 1) % 7
+        start = (now - timedelta(days=days_since_sunday)).replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "month":
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    elif period == "year":
+        start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    else:
+        return jsonify({"ok": False, "error": "invalid period"}), 400
+
+    ph = "?" if db._backend == "sqlite" else "%s"
+    start_val = start.isoformat() if db._backend == "sqlite" else start
+
+    # Use visible_duration when available, otherwise derive from timestamps.
+    if db._backend == "sqlite":
+        duration_expr = "SUM(COALESCE(visible_duration, (julianday(last_seen) - julianday(first_seen)) * 86400))"
+    else:
+        duration_expr = "SUM(COALESCE(visible_duration, EXTRACT(EPOCH FROM (last_seen - first_seen))))"
+
+    sql = f"""
+        SELECT person_name, {duration_expr} as total_secs
+        FROM visits
+        WHERE first_seen >= {ph}
+          AND person_name NOT LIKE 'unknown_%'
+        GROUP BY person_name
+        ORDER BY total_secs DESC
+        LIMIT 10
+    """
+    with db._cursor() as cur:
+        cur.execute(sql, (start_val,))
+        rows = db._rows_to_dicts(cur.fetchall())
+
+    result = []
+    for row in rows:
+        secs = float(row["total_secs"] or 0)
+        result.append({
+            "person_name": row["person_name"],
+            "total_secs": round(secs, 1),
+            "duration_fmt": _fmt_duration(secs),
+        })
+
+    return jsonify({"ok": True, "period": period, "rows": result})
+
+
+@app.route("/api/analytics/headcount")
+def api_analytics_headcount():
+    """Distinct people present per day for a date range.
+
+    Query params: ?from=YYYY-MM-DD&to=YYYY-MM-DD (both default to current month).
+    Returns [{date, count}] ordered by date ascending.
+    """
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+
+    now = datetime.now(timezone.utc)
+    default_from = now.replace(day=1).strftime("%Y-%m-%d")
+    default_to = now.strftime("%Y-%m-%d")
+    from_date = request.args.get("from", default_from)
+    to_date = request.args.get("to", default_to)
+
+    ph = "?" if db._backend == "sqlite" else "%s"
+    if db._backend == "sqlite":
+        date_expr = "DATE(first_seen)"
+    else:
+        date_expr = "first_seen::date"
+
+    sql = f"""
+        SELECT {date_expr} as day, COUNT(DISTINCT person_name) as count
+        FROM visits
+        WHERE {date_expr} >= {ph} AND {date_expr} <= {ph}
+          AND person_name NOT LIKE 'unknown_%'
+        GROUP BY day
+        ORDER BY day ASC
+    """
+    with db._cursor() as cur:
+        cur.execute(sql, (from_date, to_date))
+        rows = db._rows_to_dicts(cur.fetchall())
+
+    return jsonify({"ok": True, "rows": [{"date": r["day"], "count": int(r["count"])} for r in rows]})
+
+
+@app.route("/api/analytics/heatmap")
+def api_analytics_heatmap():
+    """Presence heatmap: which employees were present on which days.
+
+    Query params: ?from=YYYY-MM-DD&to=YYYY-MM-DD (both default to current month).
+    Returns {dates, persons, present: {person: {date: true}}}.
+    """
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+
+    now = datetime.now(timezone.utc)
+    default_from = now.replace(day=1).strftime("%Y-%m-%d")
+    default_to = now.strftime("%Y-%m-%d")
+    from_date = request.args.get("from", default_from)
+    to_date = request.args.get("to", default_to)
+
+    ph = "?" if db._backend == "sqlite" else "%s"
+    if db._backend == "sqlite":
+        date_expr = "DATE(first_seen)"
+    else:
+        date_expr = "first_seen::date"
+
+    sql = f"""
+        SELECT {date_expr} as day, person_name
+        FROM visits
+        WHERE {date_expr} >= {ph} AND {date_expr} <= {ph}
+          AND person_name NOT LIKE 'unknown_%'
+        GROUP BY day, person_name
+        ORDER BY person_name ASC, day ASC
+    """
+    with db._cursor() as cur:
+        cur.execute(sql, (from_date, to_date))
+        rows = db._rows_to_dicts(cur.fetchall())
+
+    dates_set = sorted({r["day"] for r in rows})
+    persons_set = sorted({r["person_name"] for r in rows})
+    present = {p: {} for p in persons_set}
+    for r in rows:
+        present[r["person_name"]][r["day"]] = True
+
+    return jsonify({"ok": True, "dates": dates_set, "persons": persons_set, "present": present})
 
 
 if __name__ == "__main__":

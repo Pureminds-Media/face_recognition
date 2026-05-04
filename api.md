@@ -150,7 +150,7 @@ development only.
 | Method | Path           | Description                                           |
 | ------ | -------------- | ----------------------------------------------------- |
 | GET    | `/api/status`  | `{running, fps, cam_index, viewer_mode, …}`          |
-| POST   | `/api/start`   | Start the detection engine.                           |
+| POST   | `/api/start`   | Start the detection engine. Returns immediately; camera connections open in the background. Poll `GET /api/status` (`running: true`) to confirm. |
 | POST   | `/api/stop`    | Stop the engine.                                      |
 | GET    | `/api/tracks`  | Live track snapshot: list of `{name, bbox, activity}`. |
 
@@ -202,9 +202,18 @@ development only.
 
 Visit objects include: `id, person_name, location_name, location_display, camera_source, first_seen, last_seen, duration_secs, duration_fmt, ended, confidence, footage_url, activity`.
 
-`duration_secs` = `last_seen − first_seen` (wall-clock duration of the visit). It is **not** the on-camera/visible time. A visit with `duration_secs = 0` typically means a single-frame detection that closed before any subsequent frame refreshed `last_seen`. The `visible_duration` column tracked by the footage writer (real on-camera seconds) is currently not exposed in the visit serializer.
+`duration_secs` = `last_seen − first_seen` (wall-clock duration of the visit). It is **not** the on-camera/visible time. A visit with `duration_secs = 0` typically means a single-frame detection that closed before any subsequent frame refreshed `last_seen`. `visible_duration` (real on-camera seconds tracked by the footage writer) is used by the analytics `/longest` endpoint but is not currently exposed in the visit serializer.
 
-### 4.5 Attendance
+### 4.5 Analytics
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| GET | `/api/analytics/earliest?date=YYYY-MM-DD` | Top 10 employees with the earliest first arrival on a given day (default today). Add `&order=latest` to get the 10 latest arrivals instead. Add `&shift=morning` (04:00–16:00 local) or `&shift=night` (16:00–04:00 local) to restrict to a shift window. Night-shift results automatically exclude anyone who already appeared in the morning window (each person in at most one shift). Returns `{person_name, arrival_time}` rows. Excludes `unknown_N` names. The in-tree UI fetches both earliest and latest in parallel on load and caches them; the Earliest/Latest toggle switches between views without a new request. |
+| GET | `/api/analytics/longest?period=day\|week\|month\|year` | Top 10 employees with the longest total on-camera duration for the period (calendar-aligned: week = Sun–Sat, month = 1st–last, year = Jan–Dec). Uses `visible_duration` when recorded, falls back to `last_seen − first_seen`. Returns `{person_name, total_secs, duration_fmt}` sorted descending. The in-tree UI renders this as an interactive horizontal bar chart (Chart.js). |
+| GET | `/api/analytics/headcount?from=YYYY-MM-DD&to=YYYY-MM-DD` | Distinct people present per day over a date range (default: current month). Returns `{rows: [{date, count}]}` ordered by date ascending. Excludes `unknown_N`. |
+| GET | `/api/analytics/heatmap?from=YYYY-MM-DD&to=YYYY-MM-DD` | Presence heatmap over a date range (default: current month). Returns `{dates, persons, present: {person: {date: true}}}`. The in-tree UI renders this as a scrollable employee × day grid with green cells for present days. |
+
+### 4.6 Attendance
 
 | Method | Path                          | Description                                          |
 | ------ | ----------------------------- | ---------------------------------------------------- |
@@ -212,7 +221,7 @@ Visit objects include: `id, person_name, location_name, location_display, camera
 | POST   | `/api/attendance/reset`       | Clear in-memory attendance state.                    |
 | GET    | `/api/attendance/stream`      | Server-Sent Events: `state`, `new`, `repeat`.        |
 
-### 4.6 Test runner (offline video)
+### 4.7 Test runner (offline video)
 
 | Method | Path                              | Description                                        |
 | ------ | --------------------------------- | -------------------------------------------------- |
@@ -220,7 +229,7 @@ Visit objects include: `id, person_name, location_name, location_display, camera
 | GET    | `/api/test/status/<job_id>`       | `{status, progress, result_url?, error?}`.         |
 | GET    | `/test/results/<filename>`        | Download a finished output (key required).         |
 
-### 4.7 Static assets (key required)
+### 4.8 Static assets (key required)
 
 | Path                       | What                                              |
 | -------------------------- | ------------------------------------------------- |
