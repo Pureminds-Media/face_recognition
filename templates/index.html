@@ -381,6 +381,22 @@
             <!-- Analytics Tab -->
             <div id="tab-analytics" class="tab-content">
 
+              <!-- Summary tiles -->
+              <div class="grid grid-cols-3 gap-4 mb-6">
+                <div class="rounded-xl border border-slate-800 bg-slate-900 px-5 py-4 text-center">
+                  <p class="text-xs text-slate-500 uppercase tracking-wide mb-1">Peak Hour Today</p>
+                  <p id="tilePeakHour" class="text-2xl font-semibold text-white">—</p>
+                </div>
+                <div class="rounded-xl border border-slate-800 bg-slate-900 px-5 py-4 text-center">
+                  <p class="text-xs text-slate-500 uppercase tracking-wide mb-1">People Present Today</p>
+                  <p id="tilePresentToday" class="text-2xl font-semibold text-emerald-400">—</p>
+                </div>
+                <div class="rounded-xl border border-slate-800 bg-slate-900 px-5 py-4 text-center">
+                  <p class="text-xs text-slate-500 uppercase tracking-wide mb-1">Unknowns to Resolve</p>
+                  <p id="tileUnknowns" class="text-2xl font-semibold text-amber-400">—</p>
+                </div>
+              </div>
+
               <!-- Arrivals: shared date picker + two shift rows -->
               <div class="mb-6">
                 <div class="flex items-center justify-between mb-4 gap-2 flex-wrap">
@@ -1246,6 +1262,7 @@
       window.addEventListener("DOMContentLoaded", async () => {
         try { await loadCameraOptions(); } catch (e) {}
         loadDaily();
+        loadSummaryTiles();
         loadHeadcount();
         loadHeatmap();
         loadEarliest();
@@ -1577,6 +1594,16 @@
 
       arrivalDateInput.addEventListener("change", loadArrivals);
 
+      async function loadSummaryTiles() {
+        const date = todayStr();
+        const r = await fetch(`/api/analytics/summary?date=${date}`);
+        const j = await r.json();
+        if (!j.ok) return;
+        document.getElementById("tilePeakHour").textContent    = j.peak_hour      ?? "—";
+        document.getElementById("tilePresentToday").textContent = j.present_today;
+        document.getElementById("tileUnknowns").textContent     = j.unknowns_today;
+      }
+
       let _longestPeriod = "day";
       let _longestChart = null;
       const longestChartMsg = document.getElementById("longestChartMsg");
@@ -1713,6 +1740,7 @@
       document.querySelectorAll(".tab-btn").forEach(btn => {
         if (btn.dataset.tab === "analytics") {
           btn.addEventListener("click", () => {
+            loadSummaryTiles();
             loadHeadcount();
             loadHeatmap();
             loadEarliest();

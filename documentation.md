@@ -483,6 +483,16 @@ All date pickers use `dd-mm-yyyy` display (Flatpickr with `altInput`).
 
 All analytics endpoints live under `/api/analytics/`. Dates use the server's **local timezone** for shift boundaries; stored timestamps are UTC and converted on query.
 
+### Summary Tiles (`/api/analytics/summary`)
+
+A single endpoint that returns three KPIs for a given day, loaded in one request to populate the stat tile row at the top of the Analytics tab:
+
+| Field | Description |
+|-------|-------------|
+| `peak_hour` | Local-time hour bucket with the most distinct people spotted, e.g. `"09:00 – 10:00"`. `null` if no visits that day. |
+| `present_today` | Count of distinct known persons (non-`unknown_N`) with at least one visit. |
+| `unknowns_today` | Count of `unknown_N` folders currently in `faces/` — total unresolved auto-captured persons in the system, regardless of when they were last seen. |
+
 ### Earliest / Latest Arrivals (`/api/analytics/earliest`)
 
 - Returns top 10 persons by first arrival time on a given date.

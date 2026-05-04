@@ -2656,6 +2656,91 @@ def attendance_stream():
     )
 
 
+@app.route("/api/analytics/summary")
+def api_analytics_summary():
+    """Single-request summary tiles for the analytics dashboard.
+
+    Query params:
+      ?date=YYYY-MM-DD  (default: today in local time)
+
+    Returns:
+      peak_hour        str   e.g. "09:00 – 10:00" (local time), or null if no data
+      unknowns_today   int   distinct unknown_N persons with at least one visit today
+      present_today    int   distinct known persons with at least one visit today
+    """
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+
+    date_str = request.args.get("date", datetime.now().strftime("%Y-%m-%d"))
+    try:
+        local_midnight = datetime.strptime(date_str, "%Y-%m-%d").astimezone()
+    except ValueError:
+        return jsonify({"ok": False, "error": "invalid date format"}), 400
+
+    day_start = local_midnight.astimezone(timezone.utc)
+    day_end   = (local_midnight + timedelta(days=1)).astimezone(timezone.utc)
+    ph = "?" if db._backend == "sqlite" else "%s"
+
+    ds = day_start.isoformat() if db._backend == "sqlite" else day_start
+    de = day_end.isoformat()   if db._backend == "sqlite" else day_end
+
+    # Peak hour — hour bucket (local time) with the most visit records
+    if db._backend == "sqlite":
+        hour_sql = f"""
+            SELECT strftime('%H', datetime(first_seen, 'localtime')) as hr,
+                   COUNT(DISTINCT person_name) as cnt
+            FROM visits
+            WHERE first_seen >= {ph} AND first_seen < {ph}
+            GROUP BY hr ORDER BY cnt DESC LIMIT 1
+        """
+    else:
+        hour_sql = f"""
+            SELECT date_part('hour', first_seen AT TIME ZONE 'localtime') as hr,
+                   COUNT(DISTINCT person_name) as cnt
+            FROM visits
+            WHERE first_seen >= {ph} AND first_seen < {ph}
+            GROUP BY hr ORDER BY cnt DESC LIMIT 1
+        """
+
+    # People present today — distinct known persons seen today
+    present_sql = f"""
+        SELECT COUNT(DISTINCT person_name) as cnt FROM visits
+        WHERE first_seen >= {ph} AND first_seen < {ph}
+          AND person_name NOT LIKE 'unknown_%'
+    """
+
+    params = (ds, de)
+    with db._cursor() as cur:
+        cur.execute(hour_sql, params)
+        hour_row = db._row_to_dict(cur.fetchone())
+
+        cur.execute(present_sql, params)
+        present_row = db._row_to_dict(cur.fetchone())
+
+    # Unknowns to resolve — count unknown_N folders currently in faces/
+    known_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "faces")
+    import re as _re
+    unknowns_count = 0
+    if os.path.isdir(known_dir):
+        unknowns_count = sum(
+            1 for d in os.listdir(known_dir)
+            if _re.match(r'^unknown_\d+$', d) and os.path.isdir(os.path.join(known_dir, d))
+        )
+
+    peak_hour = None
+    if hour_row and hour_row.get("hr") is not None:
+        h = int(hour_row["hr"])
+        peak_hour = f"{h:02d}:00 – {(h + 1) % 24:02d}:00"
+
+    return jsonify({
+        "ok": True,
+        "date": date_str,
+        "peak_hour": peak_hour,
+        "unknowns_today": unknowns_count,
+        "present_today":  int(present_row["cnt"])  if present_row  else 0,
+    })
+
+
 @app.route("/api/analytics/earliest")
 def api_analytics_earliest():
     """Top 10 employees with the earliest first arrival on a specific date.
