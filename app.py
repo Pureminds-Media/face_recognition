@@ -2717,15 +2717,22 @@ def api_analytics_summary():
         cur.execute(present_sql, params)
         present_row = db._row_to_dict(cur.fetchone())
 
-    # Unknowns to resolve — count unknown_N folders currently in faces/
+    # Count named faces/ folders (excludes unknown_N) for absent calculation
     known_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "faces")
     import re as _re
     unknowns_count = 0
+    enrolled_known = 0
     if os.path.isdir(known_dir):
-        unknowns_count = sum(
-            1 for d in os.listdir(known_dir)
-            if _re.match(r'^unknown_\d+$', d) and os.path.isdir(os.path.join(known_dir, d))
-        )
+        for d in os.listdir(known_dir):
+            if not os.path.isdir(os.path.join(known_dir, d)):
+                continue
+            if _re.match(r'^unknown_\d+$', d):
+                unknowns_count += 1
+            else:
+                enrolled_known += 1
+
+    present_today = int(present_row["cnt"]) if present_row else 0
+    absent_today  = max(0, enrolled_known - present_today)
 
     peak_hour = None
     if hour_row and hour_row.get("hr") is not None:
@@ -2735,10 +2742,64 @@ def api_analytics_summary():
     return jsonify({
         "ok": True,
         "date": date_str,
-        "peak_hour": peak_hour,
+        "peak_hour":      peak_hour,
+        "present_today":  present_today,
+        "absent_today":   absent_today,
         "unknowns_today": unknowns_count,
-        "present_today":  int(present_row["cnt"])  if present_row  else 0,
     })
+
+
+@app.route("/api/analytics/present_absent")
+def api_analytics_present_absent():
+    """Return lists of present and absent known persons for a given day.
+
+    Query params:
+      ?date=YYYY-MM-DD  (default: today in local time)
+
+    Returns:
+      present  list of person names with at least one visit today
+      absent   list of enrolled known persons with no visit today
+    """
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+
+    date_str = request.args.get("date", datetime.now().strftime("%Y-%m-%d"))
+    try:
+        local_midnight = datetime.strptime(date_str, "%Y-%m-%d").astimezone()
+    except ValueError:
+        return jsonify({"ok": False, "error": "invalid date format"}), 400
+
+    day_start = local_midnight.astimezone(timezone.utc)
+    day_end   = (local_midnight + timedelta(days=1)).astimezone(timezone.utc)
+    ph = "?" if db._backend == "sqlite" else "%s"
+    ds = day_start.isoformat() if db._backend == "sqlite" else day_start
+    de = day_end.isoformat()   if db._backend == "sqlite" else day_end
+
+    present_sql = f"""
+        SELECT DISTINCT person_name FROM visits
+        WHERE first_seen >= {ph} AND first_seen < {ph}
+          AND person_name NOT LIKE 'unknown_%'
+        ORDER BY person_name
+    """
+    with db._cursor() as cur:
+        cur.execute(present_sql, (ds, de))
+        present = [r["person_name"] for r in db._rows_to_dicts(cur.fetchall())]
+
+    # Absent = enrolled known folders not in present list
+    known_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "faces")
+    import re as _re
+    absent = []
+    if os.path.isdir(known_dir):
+        present_set = set(present)
+        for d in sorted(os.listdir(known_dir)):
+            if not os.path.isdir(os.path.join(known_dir, d)):
+                continue
+            if _re.match(r'^unknown_\d+$', d):
+                continue
+            if d not in present_set:
+                absent.append(d)
+
+    return jsonify({"ok": True, "date": date_str, "present": present, "absent": absent})
 
 
 @app.route("/api/analytics/earliest")

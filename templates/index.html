@@ -382,17 +382,21 @@
             <div id="tab-analytics" class="tab-content">
 
               <!-- Summary tiles -->
-              <div class="grid grid-cols-3 gap-4 mb-6">
+              <div class="grid grid-cols-4 gap-4 mb-6">
                 <div class="rounded-xl border border-slate-800 bg-slate-900 px-5 py-4 text-center">
                   <p class="text-xs text-slate-500 uppercase tracking-wide mb-1">Peak Hour Today</p>
                   <p id="tilePeakHour" class="text-2xl font-semibold text-white">—</p>
                 </div>
-                <div class="rounded-xl border border-slate-800 bg-slate-900 px-5 py-4 text-center">
-                  <p class="text-xs text-slate-500 uppercase tracking-wide mb-1">People Present Today</p>
+                <div onclick="openPresenceModal('present')" class="rounded-xl border border-slate-800 bg-slate-900 px-5 py-4 text-center cursor-pointer hover:border-emerald-700 transition-colors">
+                  <p class="text-xs text-slate-500 uppercase tracking-wide mb-1">Present Today</p>
                   <p id="tilePresentToday" class="text-2xl font-semibold text-emerald-400">—</p>
                 </div>
+                <div onclick="openPresenceModal('absent')" class="rounded-xl border border-slate-800 bg-slate-900 px-5 py-4 text-center cursor-pointer hover:border-rose-700 transition-colors">
+                  <p class="text-xs text-slate-500 uppercase tracking-wide mb-1">Absent Today</p>
+                  <p id="tileAbsentToday" class="text-2xl font-semibold text-rose-400">—</p>
+                </div>
                 <div class="rounded-xl border border-slate-800 bg-slate-900 px-5 py-4 text-center">
-                  <p class="text-xs text-slate-500 uppercase tracking-wide mb-1">Unknowns to Resolve</p>
+                  <p class="text-xs text-slate-500 uppercase tracking-wide mb-1">Unknowns Captured</p>
                   <p id="tileUnknowns" class="text-2xl font-semibold text-amber-400">—</p>
                 </div>
               </div>
@@ -1599,8 +1603,9 @@
         const r = await fetch(`/api/analytics/summary?date=${date}`);
         const j = await r.json();
         if (!j.ok) return;
-        document.getElementById("tilePeakHour").textContent    = j.peak_hour      ?? "—";
+        document.getElementById("tilePeakHour").textContent    = j.peak_hour ?? "—";
         document.getElementById("tilePresentToday").textContent = j.present_today;
+        document.getElementById("tileAbsentToday").textContent  = j.absent_today;
         document.getElementById("tileUnknowns").textContent     = j.unknowns_today;
       }
 
@@ -2100,5 +2105,38 @@
         else if (e.key === "0") fsPZ.reset();
       });
     </script>
+
+  <!-- Present / Absent names modal -->
+  <div id="presenceModal" class="hidden fixed inset-0 z-50 flex items-center justify-center">
+    <div class="absolute inset-0 bg-black/60" onclick="closePresenceModal()"></div>
+    <div class="relative bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl w-80 max-h-[70vh] flex flex-col">
+      <div class="flex items-center justify-between px-5 py-4 border-b border-slate-800">
+        <h3 id="presenceModalTitle" class="text-sm font-semibold text-slate-200"></h3>
+        <button onclick="closePresenceModal()" class="text-slate-500 hover:text-white text-lg leading-none">&times;</button>
+      </div>
+      <ul id="presenceModalList" class="overflow-y-auto px-5 py-3 space-y-2 text-sm"></ul>
+    </div>
+  </div>
+
+  <script>
+    async function openPresenceModal(type) {
+      const date = todayStr();
+      const r = await fetch(`/api/analytics/present_absent?date=${date}`);
+      const j = await r.json();
+      if (!j.ok) return;
+      const names = type === "present" ? j.present : j.absent;
+      const color = type === "present" ? "text-emerald-400" : "text-rose-400";
+      document.getElementById("presenceModalTitle").textContent =
+        type === "present" ? `Present Today (${names.length})` : `Absent Today (${names.length})`;
+      document.getElementById("presenceModalList").innerHTML = names.length
+        ? names.map(n => `<li class="${color} font-medium">${fmtName(n)}</li>`).join("")
+        : `<li class="text-slate-500">No data</li>`;
+      document.getElementById("presenceModal").classList.remove("hidden");
+    }
+    function closePresenceModal() {
+      document.getElementById("presenceModal").classList.add("hidden");
+    }
+    document.addEventListener("keydown", e => { if (e.key === "Escape") closePresenceModal(); });
+  </script>
   </body>
 </html>

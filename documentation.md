@@ -483,6 +483,15 @@ All date pickers use `dd-mm-yyyy` display (Flatpickr with `altInput`).
 
 All analytics endpoints live under `/api/analytics/`. Dates use the server's **local timezone** for shift boundaries; stored timestamps are UTC and converted on query.
 
+### Present / Absent Name Lists (`/api/analytics/present_absent`)
+
+Returns the full name lists behind the Present and Absent tiles. Called lazily on tile click rather than on page load.
+
+- `present` — enrolled known persons with at least one visit on the given day, sorted alphabetically.
+- `absent` — enrolled known `faces/` folders (non-`unknown_N`) with no visit that day, sorted alphabetically.
+
+The Present and Absent tiles have a hover border effect (emerald / rose) and open a modal with the name list and count on click. The modal closes on backdrop click or Escape.
+
 ### Summary Tiles (`/api/analytics/summary`)
 
 A single endpoint that returns three KPIs for a given day, loaded in one request to populate the stat tile row at the top of the Analytics tab:
@@ -490,7 +499,8 @@ A single endpoint that returns three KPIs for a given day, loaded in one request
 | Field | Description |
 |-------|-------------|
 | `peak_hour` | Local-time hour bucket with the most distinct people spotted, e.g. `"09:00 – 10:00"`. `null` if no visits that day. |
-| `present_today` | Count of distinct known persons (non-`unknown_N`) with at least one visit. |
+| `present_today` | Count of distinct known persons (non-`unknown_N`) with at least one visit today. |
+| `absent_today` | Count of enrolled known persons with no visit today (`enrolled_known − present_today`). |
 | `unknowns_today` | Count of `unknown_N` folders currently in `faces/` — total unresolved auto-captured persons in the system, regardless of when they were last seen. |
 
 ### Earliest / Latest Arrivals (`/api/analytics/earliest`)
