@@ -23,6 +23,9 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
     <script src="/static/i18n.js"></script>
     <script>
+    /* Branch state — persisted in localStorage */
+    window._branch = localStorage.getItem("branch") || "Riyadh";
+
     /* Page-specific applyLang wrapper — reinits flatpickr and rerenders charts */
     function applyLang(lang, rerender) {
       window._applyLang(lang, rerender ? function() {
@@ -36,6 +39,37 @@
       } : function() {
         if (typeof initFlatpickrs === "function") initFlatpickrs();
       });
+    }
+
+    function switchBranch(branch) {
+      window._branch = branch;
+      localStorage.setItem("branch", branch);
+      // Update button styles
+      document.querySelectorAll(".branch-btn").forEach(btn => {
+        const active = btn.dataset.branch === branch;
+        btn.classList.toggle("bg-emerald-600", active);
+        btn.classList.toggle("text-white", active);
+        btn.classList.toggle("bg-slate-800", !active);
+        btn.classList.toggle("text-slate-400", !active);
+      });
+      // Re-filter cameras for the new branch and switch to first available
+      if (typeof allSingleCamDevices !== "undefined") {
+        singleCamDevices = allSingleCamDevices.filter(d =>
+          !_deadCameras.has(String(d.value)) && (!d.branch || d.branch === branch)
+        );
+        singleCamIndex = 0;
+        updateCarouselUI();
+        if (singleCamDevices.length > 0) showSingleCameraAt(0);
+      }
+      // Reload all active tab data
+      if (typeof loadDaily === "function") loadDaily();
+      if (typeof loadPersons === "function") loadPersons();
+      if (typeof loadLocations === "function") loadLocations();
+      if (typeof loadSummaryTiles === "function") loadSummaryTiles();
+      if (typeof loadHeadcount === "function") loadHeadcount();
+      if (typeof loadHeatmap === "function") loadHeatmap();
+      if (typeof loadArrivals === "function") loadArrivals();
+      if (typeof loadLongest === "function") loadLongest(window._longestPeriod || "day");
     }
     </script>
     <script>
@@ -121,6 +155,11 @@
             >
               <div class="font-medium" data-i18n="live_feed">Live feed</div>
               <div class="text-xs text-slate-400" id="statusText">—</div>
+              <!-- Branch switcher -->
+              <div class="flex rounded-lg overflow-hidden border border-slate-700">
+                <button class="branch-btn px-3 py-1 text-xs font-medium bg-emerald-600 text-white" data-branch="Riyadh" data-i18n="branch_riyadh" onclick="switchBranch('Riyadh')">Riyadh</button>
+                <button class="branch-btn px-3 py-1 text-xs font-medium bg-slate-800 text-slate-400 hover:bg-slate-700 border-l border-slate-700" data-branch="Egypt" data-i18n="branch_egypt" onclick="switchBranch('Egypt')">Egypt</button>
+              </div>
               <div class="flex flex-wrap items-center gap-2">
                 <!-- Zoom controls -->
                 <div class="flex rounded-lg overflow-hidden border border-slate-700">
@@ -259,7 +298,7 @@
             </div>
 
             <!-- Sub-tab bar -->
-            <div class="flex gap-1 mb-6 border-b border-slate-800">
+            <div class="flex items-center gap-1 mb-6 border-b border-slate-800 flex-wrap">
               <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-emerald-500 text-emerald-400" data-tab="analytics" data-i18n="tab_analytics">Analytics</button>
               <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200" data-tab="attendance" data-i18n="tab_attendance">Attendance</button>
               <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200" data-tab="daily" data-i18n="tab_daily">Daily Summary</button>
@@ -653,8 +692,10 @@
         allSingleCamDevices = devices.filter(d => !String(d.value || "").startsWith("grid_"));
         multiCamLayouts = devices.filter(d => String(d.value || "").startsWith("grid_"));
 
-        // Apply known-dead filter from this session
-        singleCamDevices = allSingleCamDevices.filter(d => !_deadCameras.has(String(d.value)));
+        // Apply known-dead filter and branch filter from this session
+        singleCamDevices = allSingleCamDevices.filter(d =>
+          !_deadCameras.has(String(d.value)) && (!d.branch || d.branch === window._branch)
+        );
 
         // UI is single-mode only. If the backend currently has the viewer
         // in grid mode (e.g. from a saved layout), force it to single on
@@ -1219,7 +1260,7 @@
         if (!name || !date) { attendanceMsg.textContent = t("empty_person_date"); return; }
         attendanceMsg.textContent = t("loading");
         try {
-          const r = await fetch(`/api/history/person/${encodeURIComponent(name)}?from=${date}&to=${date}`);
+          const r = await fetch(`/api/history/person/${encodeURIComponent(name)}?from=${date}&to=${date}&branch=${encodeURIComponent(window._branch)}`);
           const j = await r.json();
           if (!j.ok) { attendanceMsg.textContent = j.error || "Error"; return; }
           if (!j.visits.length) {
@@ -1267,7 +1308,7 @@
         if (!d) return;
         dailyMsg.textContent = t("loading");
         try {
-          const r = await fetch(`/api/history/daily?date=${d}`);
+          const r = await fetch(`/api/history/daily?date=${d}&branch=${encodeURIComponent(window._branch)}`);
           const j = await r.json();
           if (!j.ok) { dailyMsg.textContent = j.error || "Error"; return; }
           dailyMsg.textContent = `${j.visits.length} visit(s)`;
@@ -1277,6 +1318,8 @@
       dailyDate.addEventListener("change", loadDaily);
       dailyDate.addEventListener("keydown", (e) => { if (e.key === "Enter") loadDaily(); });
       window.addEventListener("DOMContentLoaded", async () => {
+        // Initialize branch button states
+        switchBranch(window._branch);
         applyLang(window._lang, false);
         try { await loadCameraOptions(); } catch (e) {}
         loadDaily();
@@ -1296,7 +1339,7 @@
 
       async function loadPersons() {
         try {
-          const r = await fetch("/api/history/persons");
+          const r = await fetch(`/api/history/persons?branch=${encodeURIComponent(window._branch)}`);
           const j = await r.json();
           if (j.ok && j.persons) {
             const opts = `<option value="">Select...</option>` +
@@ -1313,6 +1356,7 @@
         const params = [];
         if (personFrom.value) params.push(`from=${personFrom.value}`);
         if (personTo.value) params.push(`to=${personTo.value}`);
+        params.push(`branch=${encodeURIComponent(window._branch)}`);
         if (params.length) url += "?" + params.join("&");
         try {
           const r = await fetch(url);
@@ -1339,7 +1383,7 @@
 
       async function loadLocations() {
         try {
-          const r = await fetch("/api/history/locations");
+          const r = await fetch(`/api/history/locations?branch=${encodeURIComponent(window._branch)}`);
           const j = await r.json();
           if (j.ok && j.locations) {
             locationSelect.innerHTML = `<option value="">Select...</option>` +
@@ -1356,6 +1400,7 @@
         const params = [];
         if (locationFrom.value) params.push(`from=${locationFrom.value}`);
         if (locationTo.value) params.push(`to=${locationTo.value}`);
+        params.push(`branch=${encodeURIComponent(window._branch)}`);
         if (params.length) url += "?" + params.join("&");
         try {
           const r = await fetch(url);
@@ -1443,7 +1488,7 @@
         headcountMsg.textContent = t("loading");
         headcountMsg.classList.remove("hidden");
         try {
-          const r = await fetch(`/api/analytics/headcount?from=${from}&to=${to}`);
+          const r = await fetch(`/api/analytics/headcount?from=${from}&to=${to}&branch=${encodeURIComponent(window._branch)}`);
           const j = await r.json();
           if (!j.ok || !j.rows.length) {
             headcountMsg.textContent = j.ok ? t("no_data_range") : (j.error || "Error");
@@ -1507,7 +1552,7 @@
         heatmapGrid.classList.add("hidden");
         heatmapGrid.innerHTML = "";
         try {
-          const r = await fetch(`/api/analytics/heatmap?from=${from}&to=${to}`);
+          const r = await fetch(`/api/analytics/heatmap?from=${from}&to=${to}&branch=${encodeURIComponent(window._branch)}`);
           const j = await r.json();
           if (!j.ok || !j.persons.length) {
             heatmapMsg.textContent = j.ok ? t("no_data_range") : (j.error || "Error");
@@ -1583,7 +1628,7 @@
       }
 
       async function _fetchArrival(date, shift, order) {
-        const r = await fetch(`/api/analytics/earliest?date=${date}&shift=${shift}${order === "latest" ? "&order=latest" : ""}`);
+        const r = await fetch(`/api/analytics/earliest?date=${date}&shift=${shift}${order === "latest" ? "&order=latest" : ""}&branch=${encodeURIComponent(window._branch)}`);
         const j = await r.json();
         return j.ok ? j.rows : [];
       }
@@ -1615,7 +1660,7 @@
 
       async function loadSummaryTiles() {
         const date = todayStr();
-        const r = await fetch(`/api/analytics/summary?date=${date}`);
+        const r = await fetch(`/api/analytics/summary?date=${date}&branch=${encodeURIComponent(window._branch)}`);
         const j = await r.json();
         if (!j.ok) return;
         document.getElementById("tilePeakHour").textContent    = j.peak_hour ?? "—";
@@ -1640,7 +1685,7 @@
         longestChartMsg.classList.remove("hidden");
         longestChartCanvas.classList.add("hidden");
         try {
-          const r = await fetch(`/api/analytics/longest?period=${period}`);
+          const r = await fetch(`/api/analytics/longest?period=${period}&branch=${encodeURIComponent(window._branch)}`);
           const j = await r.json();
           if (!j.ok || !j.rows.length) {
             longestChartMsg.textContent = j.ok ? t("no_data_range") : (j.error || "Error");
@@ -2146,7 +2191,7 @@
   <script>
     async function openPresenceModal(type) {
       const date = todayStr();
-      const r = await fetch(`/api/analytics/present_absent?date=${date}`);
+      const r = await fetch(`/api/analytics/present_absent?date=${date}&branch=${encodeURIComponent(window._branch)}`);
       const j = await r.json();
       if (!j.ok) return;
       const names = type === "present" ? j.present : j.absent;

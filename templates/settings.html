@@ -247,6 +247,11 @@
                   </button>
                 </div>
               </div>
+              <!-- Branch sub-tabs for camera section -->
+              <div class="px-4 pt-3 pb-0 flex gap-1">
+                <button class="cam-branch-btn px-3 py-1 text-xs font-medium rounded-t-lg bg-emerald-600 text-white" data-cam-branch="Riyadh" data-i18n="branch_riyadh" onclick="setCamBranch('Riyadh')">Riyadh</button>
+                <button class="cam-branch-btn px-3 py-1 text-xs font-medium rounded-t-lg bg-slate-800 text-slate-400 hover:bg-slate-700 border border-slate-700" data-cam-branch="Egypt" data-i18n="branch_egypt" onclick="setCamBranch('Egypt')">Egypt</button>
+              </div>
               <div class="p-4 space-y-4">
                 <div id="ipCamMsg" class="text-xs"></div>
                 <div id="ipCamGroups" class="space-y-4">
@@ -1276,6 +1281,27 @@
       const ipCamMsg = document.getElementById("ipCamMsg");
       const addGroupBtn = document.getElementById("addGroupBtn");
 
+      /* Camera branch state */
+      window._camBranch = localStorage.getItem("camBranch") || "Riyadh";
+
+      function setCamBranch(branch) {
+        window._camBranch = branch;
+        localStorage.setItem("camBranch", branch);
+        document.querySelectorAll(".cam-branch-btn").forEach(btn => {
+          const active = btn.dataset.camBranch === branch;
+          btn.classList.toggle("bg-emerald-600", active);
+          btn.classList.toggle("text-white", active);
+          btn.classList.toggle("bg-slate-800", !active);
+          btn.classList.toggle("text-slate-400", !active);
+          btn.classList.toggle("border", !active);
+          btn.classList.toggle("border-slate-700", !active);
+        });
+        loadIpCameras();
+      }
+
+      // Initialize cam branch button states immediately
+      document.addEventListener("DOMContentLoaded", () => { setCamBranch(window._camBranch); });
+
       const _saveTimers = new Map();        // key -> setTimeout id
 
       function _ipCamMsg(text, kind = "info") {
@@ -1435,9 +1461,10 @@
           const r = await fetch("/api/ip_cameras");
           const j = await r.json();
           if (!j.ok) { _ipCamMsg(j.error || "Failed to load", "error"); return; }
-          const groups = j.groups || [];
+          const allGroups = j.groups || [];
+          const groups = allGroups.filter(g => (g.branch || "Riyadh") === window._camBranch);
           if (!groups.length) {
-            ipCamGroupsEl.innerHTML = `<div class="text-slate-500 text-xs text-center py-6">No groups yet. Click "+ Add Group" to create one.</div>`;
+            ipCamGroupsEl.innerHTML = `<div class="text-slate-500 text-xs text-center py-6">No groups for this branch. Click "+ Add Group" to create one.</div>`;
           } else {
             ipCamGroupsEl.innerHTML = groups.map(renderGroup).join("");
           }
@@ -1788,7 +1815,7 @@
             const r = await fetch("/api/ip_cameras/groups", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ name, base_url }),
+              body: JSON.stringify({ name, base_url, branch: window._camBranch }),
             });
             const j = await r.json();
             if (!j.ok) { _ipCamMsg(j.error || "Add failed", "error"); return; }

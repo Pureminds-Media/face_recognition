@@ -185,6 +185,7 @@ def _normalize_ip_cameras(data):
             "id": str(g["id"]),
             "name": str(g.get("name") or "Group").strip(),
             "base_url": str(g.get("base_url") or "").strip(),
+            "branch": str(g.get("branch") or "Riyadh").strip(),
             "cameras": cams,
         })
     return ({"groups": groups}, False)
@@ -241,6 +242,22 @@ def _find_camera(state, camera_id):
     return None, None
 
 
+def _get_camera_branch(camera_source):
+    """Return the branch name for a camera_source URL by scanning ip_cameras.json.
+
+    Checks which group's resolved URLs contain camera_source and returns that
+    group's branch. Defaults to 'Riyadh' if not found.
+    """
+    try:
+        state = _load_ip_cameras()
+        for g, c, url in _expanded_cameras(state):
+            if str(url) == str(camera_source):
+                return g.get("branch") or "Riyadh"
+    except Exception:
+        pass
+    return "Riyadh"
+
+
 def _expanded_cameras(state):
     """Yield (group, cam, resolved_url) for every camera that has a URL."""
     for g in state.get("groups", []):
@@ -270,6 +287,7 @@ def _serialize_state(state):
             "id": g.get("id"),
             "name": g.get("name") or "",
             "base_url": base,
+            "branch": g.get("branch") or "Riyadh",
             "cameras": cams_out,
         })
     return out
@@ -852,7 +870,8 @@ def _update_visit_for_person(name, camera_source, confidence=None, last_detect_t
 
     if active is None:
         # No active visit — open a new one
-        vid = db.open_visit(name, loc_id, confidence=confidence, session_id=_current_session_id)
+        branch = _get_camera_branch(camera_source)
+        vid = db.open_visit(name, loc_id, confidence=confidence, session_id=_current_session_id, branch=branch)
         _active_visits[name] = {
             "location_id": loc_id,
             "visit_id": vid,
@@ -884,7 +903,8 @@ def _update_visit_for_person(name, camera_source, confidence=None, last_detect_t
                       name, active["location_id"], camera_source, elapsed, VISIT_TRANSITION_SECS)
             _stop_visit_footage(active["visit_id"])
             db.close_visit(active["visit_id"])
-            vid = db.open_visit(name, loc_id, confidence=confidence, session_id=_current_session_id)
+            branch = _get_camera_branch(camera_source)
+            vid = db.open_visit(name, loc_id, confidence=confidence, session_id=_current_session_id, branch=branch)
             _active_visits[name] = {
                 "location_id": loc_id,
                 "visit_id": vid,
@@ -1228,7 +1248,7 @@ def _list_camera_devices():
             label = f"{cam_name} — {group_name} (IP)"
         else:
             label = f"{cam_name} (IP)"
-        devices.append({"value": url, "label": label, "path": url})
+        devices.append({"value": url, "label": label, "path": url, "branch": group.get("branch") or "Riyadh"})
 
     if devices:
         # Insert grid options for each supported layout
@@ -2030,9 +2050,10 @@ def api_ip_cameras_group_add():
     payload = request.get_json(silent=True) or {}
     name = str(payload.get("name", "")).strip() or "Group"
     base_url = str(payload.get("base_url", "")).strip()
+    branch = str(payload.get("branch", "Riyadh")).strip() or "Riyadh"
     with _ip_cameras_lock:
         state = _load_ip_cameras()
-        group = {"id": _new_id(), "name": name, "base_url": base_url, "cameras": []}
+        group = {"id": _new_id(), "name": name, "base_url": base_url, "branch": branch, "cameras": []}
         state["groups"].append(group)
         _save_ip_cameras(state)
     return jsonify({"ok": True, "group": group})
@@ -2043,6 +2064,7 @@ def api_ip_cameras_group_update(group_id):
     payload = request.get_json(silent=True) or {}
     new_name = payload.get("name")
     new_base = payload.get("base_url")
+    new_branch = payload.get("branch")
     with _ip_cameras_lock:
         state = _load_ip_cameras()
         g = _find_group(state, group_id)
@@ -2054,9 +2076,14 @@ def api_ip_cameras_group_update(group_id):
                 g["name"] = n
         if new_base is not None:
             g["base_url"] = str(new_base).strip()
+        if new_branch is not None:
+            b = str(new_branch).strip()
+            if b:
+                g["branch"] = b
         _save_ip_cameras(state)
     return jsonify({"ok": True, "group": {
         "id": g["id"], "name": g["name"], "base_url": g["base_url"],
+        "branch": g.get("branch") or "Riyadh",
     }})
 
 
@@ -2459,7 +2486,8 @@ def api_history_daily():
     except ValueError:
         return jsonify({"ok": False, "error": "invalid date format, use YYYY-MM-DD"}), 400
 
-    visits = db.get_daily_summary(day)
+    branch = request.args.get("branch") or None
+    visits = db.get_daily_summary(day, branch=branch)
     rows = [_serialize_visit(v) for v in visits]
 
     # Group by person for the summary
@@ -2491,7 +2519,8 @@ def api_history_person(name):
     except ValueError:
         return jsonify({"ok": False, "error": "invalid date format"}), 400
 
-    visits = db.get_person_visits(name, date_from=df, date_to=dt)
+    branch = request.args.get("branch") or None
+    visits = db.get_person_visits(name, date_from=df, date_to=dt, branch=branch)
     rows = [_serialize_visit(v) for v in visits]
     total_secs = sum(r["duration_secs"] for r in rows)
     return jsonify({
@@ -2516,7 +2545,8 @@ def api_history_location(location_id):
     except ValueError:
         return jsonify({"ok": False, "error": "invalid date format"}), 400
 
-    visits = db.get_location_visits(location_id, date_from=df, date_to=dt)
+    branch = request.args.get("branch") or None
+    visits = db.get_location_visits(location_id, date_from=df, date_to=dt, branch=branch)
     rows = [_serialize_visit(v) for v in visits]
     return jsonify({"ok": True, "location_id": location_id, "visits": rows})
 
@@ -2537,7 +2567,8 @@ def api_history_persons():
     """List all known person names with visits."""
     if not db.is_available():
         return jsonify({"ok": False, "error": "database not available"}), 503
-    return jsonify({"ok": True, "persons": db.get_known_persons()})
+    branch = request.args.get("branch") or None
+    return jsonify({"ok": True, "persons": db.get_known_persons(branch=branch)})
 
 
 @app.route("/api/history/sessions")
@@ -2680,9 +2711,12 @@ def api_analytics_summary():
     day_start = local_midnight.astimezone(timezone.utc)
     day_end   = (local_midnight + timedelta(days=1)).astimezone(timezone.utc)
     ph = "?" if db._backend == "sqlite" else "%s"
+    branch = request.args.get("branch") or None
 
     ds = day_start.isoformat() if db._backend == "sqlite" else day_start
     de = day_end.isoformat()   if db._backend == "sqlite" else day_end
+
+    branch_clause = f"AND branch = {ph}" if branch else ""
 
     # Peak hour — hour bucket (local time) with the most visit records
     if db._backend == "sqlite":
@@ -2691,6 +2725,7 @@ def api_analytics_summary():
                    COUNT(DISTINCT person_name) as cnt
             FROM visits
             WHERE first_seen >= {ph} AND first_seen < {ph}
+            {branch_clause}
             GROUP BY hr ORDER BY cnt DESC LIMIT 1
         """
     else:
@@ -2699,6 +2734,7 @@ def api_analytics_summary():
                    COUNT(DISTINCT person_name) as cnt
             FROM visits
             WHERE first_seen >= {ph} AND first_seen < {ph}
+            {branch_clause}
             GROUP BY hr ORDER BY cnt DESC LIMIT 1
         """
 
@@ -2707,9 +2743,13 @@ def api_analytics_summary():
         SELECT COUNT(DISTINCT person_name) as cnt FROM visits
         WHERE first_seen >= {ph} AND first_seen < {ph}
           AND person_name NOT LIKE 'unknown_%'
+          {branch_clause}
     """
 
-    params = (ds, de)
+    base_params = [ds, de]
+    if branch:
+        base_params.append(branch)
+    params = tuple(base_params)
     with db._cursor() as cur:
         cur.execute(hour_sql, params)
         hour_row = db._row_to_dict(cur.fetchone())
@@ -2717,22 +2757,37 @@ def api_analytics_summary():
         cur.execute(present_sql, params)
         present_row = db._row_to_dict(cur.fetchone())
 
-    # Count named faces/ folders (excludes unknown_N) for absent calculation
+    # Count unknowns from faces/ folder
     known_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "faces")
     import re as _re
     unknowns_count = 0
-    enrolled_known = 0
     if os.path.isdir(known_dir):
         for d in os.listdir(known_dir):
-            if not os.path.isdir(os.path.join(known_dir, d)):
-                continue
-            if _re.match(r'^unknown_\d+$', d):
+            if os.path.isdir(os.path.join(known_dir, d)) and _re.match(r'^unknown_\d+$', d):
                 unknowns_count += 1
-            else:
-                enrolled_known += 1
 
     present_today = int(present_row["cnt"]) if present_row else 0
-    absent_today  = max(0, enrolled_known - present_today)
+
+    # Absent = branch members (historically visited this branch) minus present today.
+    # Without branch filter, fall back to total enrolled known folders.
+    if branch:
+        branch_members_sql = f"""
+            SELECT COUNT(DISTINCT person_name) as cnt FROM visits
+            WHERE person_name NOT LIKE 'unknown_%'
+              AND branch = {ph}
+        """
+        with db._cursor() as cur:
+            cur.execute(branch_members_sql, (branch,))
+            row = db._row_to_dict(cur.fetchone())
+        enrolled_known = int(row["cnt"]) if row else 0
+    else:
+        enrolled_known = 0
+        if os.path.isdir(known_dir):
+            for d in os.listdir(known_dir):
+                if os.path.isdir(os.path.join(known_dir, d)) and not _re.match(r'^unknown_\d+$', d):
+                    enrolled_known += 1
+
+    absent_today = max(0, enrolled_known - present_today)
 
     peak_hour = None
     if hour_row and hour_row.get("hr") is not None:
@@ -2772,32 +2827,52 @@ def api_analytics_present_absent():
     day_start = local_midnight.astimezone(timezone.utc)
     day_end   = (local_midnight + timedelta(days=1)).astimezone(timezone.utc)
     ph = "?" if db._backend == "sqlite" else "%s"
+    branch = request.args.get("branch") or None
     ds = day_start.isoformat() if db._backend == "sqlite" else day_start
     de = day_end.isoformat()   if db._backend == "sqlite" else day_end
+
+    branch_clause = f"AND branch = {ph}" if branch else ""
+    base_params = [ds, de]
+    if branch:
+        base_params.append(branch)
 
     present_sql = f"""
         SELECT DISTINCT person_name FROM visits
         WHERE first_seen >= {ph} AND first_seen < {ph}
           AND person_name NOT LIKE 'unknown_%'
+          {branch_clause}
         ORDER BY person_name
     """
     with db._cursor() as cur:
-        cur.execute(present_sql, (ds, de))
+        cur.execute(present_sql, tuple(base_params))
         present = [r["person_name"] for r in db._rows_to_dicts(cur.fetchall())]
 
-    # Absent = enrolled known folders not in present list
-    known_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "faces")
+    # Absent = persons who have visited this branch at least once historically
+    # but did not appear today. When no branch filter, fall back to all enrolled folders.
     import re as _re
-    absent = []
-    if os.path.isdir(known_dir):
-        present_set = set(present)
-        for d in sorted(os.listdir(known_dir)):
-            if not os.path.isdir(os.path.join(known_dir, d)):
-                continue
-            if _re.match(r'^unknown_\d+$', d):
-                continue
-            if d not in present_set:
-                absent.append(d)
+    present_set = set(present)
+    if branch:
+        branch_members_sql = f"""
+            SELECT DISTINCT person_name FROM visits
+            WHERE person_name NOT LIKE 'unknown_%'
+              AND branch = {ph}
+            ORDER BY person_name
+        """
+        with db._cursor() as cur:
+            cur.execute(branch_members_sql, (branch,))
+            branch_members = [r["person_name"] for r in db._rows_to_dicts(cur.fetchall())]
+        absent = [n for n in branch_members if n not in present_set]
+    else:
+        known_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "faces")
+        absent = []
+        if os.path.isdir(known_dir):
+            for d in sorted(os.listdir(known_dir)):
+                if not os.path.isdir(os.path.join(known_dir, d)):
+                    continue
+                if _re.match(r'^unknown_\d+$', d):
+                    continue
+                if d not in present_set:
+                    absent.append(d)
 
     return jsonify({"ok": True, "date": date_str, "present": present, "absent": absent})
 
@@ -2828,6 +2903,7 @@ def api_analytics_earliest():
 
     shift = request.args.get("shift", "")  # "morning", "night", or ""
     order = "DESC" if request.args.get("order") == "latest" else "ASC"
+    branch = request.args.get("branch") or None
     ph = "?" if db._backend == "sqlite" else "%s"
 
     if shift == "morning":
@@ -2840,13 +2916,17 @@ def api_analytics_earliest():
         start = day.astimezone(timezone.utc)
         end   = (day + timedelta(days=1)).astimezone(timezone.utc)
 
-    params = (start.isoformat() if db._backend == "sqlite" else start,
-              end.isoformat()   if db._backend == "sqlite" else end)
+    s_val = start.isoformat() if db._backend == "sqlite" else start
+    e_val = end.isoformat()   if db._backend == "sqlite" else end
+    params = [s_val, e_val]
+    if branch:
+        params.append(branch)
+    branch_clause = f"AND branch = {ph}" if branch else ""
 
     # For night shift: exclude anyone who already arrived during morning shift
     # so each person appears in at most one shift row.
     morning_exclusion = ""
-    morning_params = ()
+    morning_params = []
     if shift == "night":
         morning_start = (day + timedelta(hours=4)).astimezone(timezone.utc)
         morning_end   = (day + timedelta(hours=16)).astimezone(timezone.utc)
@@ -2857,20 +2937,21 @@ def api_analytics_earliest():
             SELECT DISTINCT person_name FROM visits
             WHERE first_seen >= {ph} AND first_seen < {ph}
           )"""
-        morning_params = (ms, me)
+        morning_params = [ms, me]
 
     sql = f"""
         SELECT person_name, MIN(first_seen) as earliest
         FROM visits
         WHERE first_seen >= {ph} AND first_seen < {ph}
           AND person_name NOT LIKE 'unknown_%'
+          {branch_clause}
           {morning_exclusion}
         GROUP BY person_name
         ORDER BY earliest {order}
         LIMIT 10
     """
     with db._cursor() as cur:
-        cur.execute(sql, params + morning_params)
+        cur.execute(sql, tuple(params) + tuple(morning_params))
         rows = db._rows_to_dicts(cur.fetchall())
 
     result = []
@@ -2914,6 +2995,11 @@ def api_analytics_longest():
 
     ph = "?" if db._backend == "sqlite" else "%s"
     start_val = start.isoformat() if db._backend == "sqlite" else start
+    branch = request.args.get("branch") or None
+    branch_clause = f"AND branch = {ph}" if branch else ""
+    params = [start_val]
+    if branch:
+        params.append(branch)
 
     # Use visible_duration when available, otherwise derive from timestamps.
     if db._backend == "sqlite":
@@ -2926,12 +3012,13 @@ def api_analytics_longest():
         FROM visits
         WHERE first_seen >= {ph}
           AND person_name NOT LIKE 'unknown_%'
+          {branch_clause}
         GROUP BY person_name
         ORDER BY total_secs DESC
         LIMIT 10
     """
     with db._cursor() as cur:
-        cur.execute(sql, (start_val,))
+        cur.execute(sql, tuple(params))
         rows = db._rows_to_dicts(cur.fetchall())
 
     result = []
@@ -2963,6 +3050,12 @@ def api_analytics_headcount():
     to_date = request.args.get("to", default_to)
 
     ph = "?" if db._backend == "sqlite" else "%s"
+    branch = request.args.get("branch") or None
+    branch_clause = f"AND branch = {ph}" if branch else ""
+    params = [from_date, to_date]
+    if branch:
+        params.append(branch)
+
     if db._backend == "sqlite":
         date_expr = "DATE(first_seen)"
     else:
@@ -2973,11 +3066,12 @@ def api_analytics_headcount():
         FROM visits
         WHERE {date_expr} >= {ph} AND {date_expr} <= {ph}
           AND person_name NOT LIKE 'unknown_%'
+          {branch_clause}
         GROUP BY day
         ORDER BY day ASC
     """
     with db._cursor() as cur:
-        cur.execute(sql, (from_date, to_date))
+        cur.execute(sql, tuple(params))
         rows = db._rows_to_dicts(cur.fetchall())
 
     return jsonify({"ok": True, "rows": [{"date": r["day"], "count": int(r["count"])} for r in rows]})
@@ -3000,6 +3094,12 @@ def api_analytics_heatmap():
     to_date = request.args.get("to", default_to)
 
     ph = "?" if db._backend == "sqlite" else "%s"
+    branch = request.args.get("branch") or None
+    branch_clause = f"AND branch = {ph}" if branch else ""
+    params = [from_date, to_date]
+    if branch:
+        params.append(branch)
+
     if db._backend == "sqlite":
         date_expr = "DATE(first_seen)"
     else:
@@ -3010,11 +3110,12 @@ def api_analytics_heatmap():
         FROM visits
         WHERE {date_expr} >= {ph} AND {date_expr} <= {ph}
           AND person_name NOT LIKE 'unknown_%'
+          {branch_clause}
         GROUP BY day, person_name
         ORDER BY person_name ASC, day ASC
     """
     with db._cursor() as cur:
-        cur.execute(sql, (from_date, to_date))
+        cur.execute(sql, tuple(params))
         rows = db._rows_to_dicts(cur.fetchall())
 
     dates_set = sorted({r["day"] for r in rows})

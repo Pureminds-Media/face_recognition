@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS visits (
     screenshot      TEXT,
     footage         TEXT,
     visible_duration REAL,
-    activity        TEXT
+    activity        TEXT,
+    branch          TEXT NOT NULL DEFAULT 'Riyadh'
 );
 
 CREATE INDEX IF NOT EXISTS idx_visits_person     ON visits (person_name);
@@ -97,7 +98,8 @@ CREATE TABLE IF NOT EXISTS visits (
     screenshot      TEXT,
     footage         TEXT,
     visible_duration FLOAT,
-    activity        TEXT
+    activity        TEXT,
+    branch          TEXT NOT NULL DEFAULT 'Riyadh'
 );
 
 CREATE INDEX IF NOT EXISTS idx_visits_person     ON visits (person_name);
@@ -152,6 +154,15 @@ def init_db(dsn=None):
                     cur.execute("ALTER TABLE visits ADD COLUMN activity TEXT")
                 except Exception:
                     pass  # column already exists
+                # Migration: add branch column to existing databases
+                try:
+                    cur.execute("ALTER TABLE visits ADD COLUMN branch TEXT DEFAULT 'Riyadh'")
+                except Exception:
+                    pass  # column already exists
+                try:
+                    cur.execute("UPDATE visits SET branch = 'Riyadh' WHERE branch IS NULL")
+                except Exception:
+                    pass
             _backend = "postgres"
             log.info("Database initialised (PostgreSQL)")
             return
@@ -188,6 +199,17 @@ def init_db(dsn=None):
             conn.commit()
         except Exception:
             pass  # column already exists
+        # Migration: add branch column to existing databases
+        try:
+            conn.execute("ALTER TABLE visits ADD COLUMN branch TEXT DEFAULT 'Riyadh'")
+            conn.commit()
+        except Exception:
+            pass  # column already exists
+        try:
+            conn.execute("UPDATE visits SET branch = 'Riyadh' WHERE branch IS NULL")
+            conn.commit()
+        except Exception:
+            pass
         conn.commit()
         _backend = "sqlite"
         log.info("Database initialised (SQLite: %s)", _sqlite_path)
@@ -404,7 +426,7 @@ def get_sessions(limit=50, offset=0):
 # Visits
 # ---------------------------------------------------------------------------
 
-def open_visit(person_name, location_id, confidence=None, session_id=None):
+def open_visit(person_name, location_id, confidence=None, session_id=None, branch='Riyadh'):
     """Create a new open visit. Returns the visit id."""
     now = _now_str() if _backend == "sqlite" else _now()
     ended_val = 0 if _backend == "sqlite" else False
@@ -413,21 +435,21 @@ def open_visit(person_name, location_id, confidence=None, session_id=None):
             cur.execute(
                 """
                 INSERT INTO visits (person_name, location_id, first_seen, last_seen,
-                                    ended, confidence, session_id)
-                VALUES (%s, %s, %s, %s, FALSE, %s, %s)
+                                    ended, confidence, session_id, branch)
+                VALUES (%s, %s, %s, %s, FALSE, %s, %s, %s)
                 RETURNING id
                 """,
-                (person_name, location_id, now, now, confidence, session_id),
+                (person_name, location_id, now, now, confidence, session_id, branch),
             )
             return cur.fetchone()["id"]
         else:
             cur.execute(
                 """
                 INSERT INTO visits (person_name, location_id, first_seen, last_seen,
-                                    ended, confidence, session_id)
-                VALUES (?, ?, ?, ?, 0, ?, ?)
+                                    ended, confidence, session_id, branch)
+                VALUES (?, ?, ?, ?, 0, ?, ?, ?)
                 """,
-                (person_name, location_id, now, now, confidence, session_id),
+                (person_name, location_id, now, now, confidence, session_id, branch),
             )
             return cur.lastrowid
 
@@ -550,8 +572,8 @@ def close_all_open_visits():
 # Queries for reports
 # ---------------------------------------------------------------------------
 
-def get_person_visits(person_name, date_from=None, date_to=None, limit=200):
-    """All visits for a person, optionally filtered by date range."""
+def get_person_visits(person_name, date_from=None, date_to=None, limit=200, branch=None):
+    """All visits for a person, optionally filtered by date range and branch."""
     ph = "?" if _backend == "sqlite" else "%s"
     clauses = [f"v.person_name = {ph}"]
     params = [person_name]
@@ -561,6 +583,9 @@ def get_person_visits(person_name, date_from=None, date_to=None, limit=200):
     if date_to:
         clauses.append(f"v.first_seen < {ph}")
         params.append(date_to if _backend == "postgres" else str(date_to))
+    if branch:
+        clauses.append(f"v.branch = {ph}")
+        params.append(branch)
     params.append(limit)
 
     sql = f"""
@@ -578,8 +603,8 @@ def get_person_visits(person_name, date_from=None, date_to=None, limit=200):
         return _rows_to_dicts(cur.fetchall())
 
 
-def get_location_visits(location_id, date_from=None, date_to=None, limit=200):
-    """All visits at a location, optionally filtered by date range."""
+def get_location_visits(location_id, date_from=None, date_to=None, limit=200, branch=None):
+    """All visits at a location, optionally filtered by date range and branch."""
     ph = "?" if _backend == "sqlite" else "%s"
     clauses = [f"v.location_id = {ph}"]
     params = [location_id]
@@ -589,6 +614,9 @@ def get_location_visits(location_id, date_from=None, date_to=None, limit=200):
     if date_to:
         clauses.append(f"v.first_seen < {ph}")
         params.append(date_to if _backend == "postgres" else str(date_to))
+    if branch:
+        clauses.append(f"v.branch = {ph}")
+        params.append(branch)
     params.append(limit)
 
     sql = f"""
@@ -606,25 +634,32 @@ def get_location_visits(location_id, date_from=None, date_to=None, limit=200):
         return _rows_to_dicts(cur.fetchall())
 
 
-def get_daily_summary(date):
+def get_daily_summary(date, branch=None):
     """All visits for a calendar day, grouped by person then time.
 
     Parameters
     ----------
     date : datetime.date
         The calendar day to query.
+    branch : str or None
+        When provided, filter to this branch only.
 
     Returns a list of dicts sorted by first_seen descending (most recent first).
     """
     day_start = datetime(date.year, date.month, date.day, tzinfo=timezone.utc)
     day_end = day_start + timedelta(days=1)
 
-    if _backend == "postgres":
-        params = (day_start, day_end)
-    else:
-        params = (day_start.isoformat(), day_end.isoformat())
-
     ph = "?" if _backend == "sqlite" else "%s"
+    if _backend == "postgres":
+        params = [day_start, day_end]
+    else:
+        params = [day_start.isoformat(), day_end.isoformat()]
+
+    branch_clause = ""
+    if branch:
+        branch_clause = f"AND v.branch = {ph}"
+        params.append(branch)
+
     sql = f"""
         SELECT v.id, v.person_name, v.first_seen, v.last_seen, v.ended,
                v.confidence, v.screenshot, v.footage, v.visible_duration, v.activity,
@@ -632,6 +667,7 @@ def get_daily_summary(date):
         FROM visits v
         JOIN locations l ON l.id = v.location_id
         WHERE v.first_seen >= {ph} AND v.first_seen < {ph}
+        {branch_clause}
         ORDER BY v.first_seen DESC
     """
     with _cursor() as cur:
@@ -639,12 +675,17 @@ def get_daily_summary(date):
         return _rows_to_dicts(cur.fetchall())
 
 
-def get_known_persons(limit=500):
-    """Return distinct person names that have visits."""
+def get_known_persons(limit=500, branch=None):
+    """Return distinct person names that have visits, optionally filtered by branch."""
     ph = "?" if _backend == "sqlite" else "%s"
-    sql = f"SELECT DISTINCT person_name FROM visits ORDER BY person_name LIMIT {ph}"
+    if branch:
+        sql = f"SELECT DISTINCT person_name FROM visits WHERE branch = {ph} ORDER BY person_name LIMIT {ph}"
+        params = (branch, limit)
+    else:
+        sql = f"SELECT DISTINCT person_name FROM visits ORDER BY person_name LIMIT {ph}"
+        params = (limit,)
     with _cursor() as cur:
-        cur.execute(sql, (limit,))
+        cur.execute(sql, params)
         return [dict(r)["person_name"] for r in cur.fetchall()]
 
 

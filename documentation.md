@@ -139,6 +139,7 @@ The Flask server and the face-recognition engine run in **separate OS processes*
 - Configured via the UI under Settings → IP Cameras.
 - Stored as groups (e.g. "Floor 1") containing cameras with a name and RTSP URL or channel number.
 - `POST /api/ip_cameras/groups/<id>/cameras` accepts `{name, channel}` (builds URL from group `base_url`) or `{name, url}` (explicit RTSP URL).
+- Each group has a `branch` field (e.g. `"Riyadh"` or `"Egypt"`). Visits opened by cameras in that group are automatically tagged with that branch. Defaults to `"Riyadh"` if not set.
 
 ### Grid config file (`grid_config.json`)
 
@@ -199,6 +200,7 @@ close_visit()  ─── sets ended=1, final last_seen
 | `footage` | text | Filename of WebM footage clip |
 | `visible_duration` | float | Actual seconds on camera (footage writer clock) |
 | `activity` | text | Most frequent CLIP action label during visit |
+| `branch` | text | Branch this visit belongs to (e.g. `"Riyadh"`, `"Egypt"`). Auto-assigned from the camera's IP group. |
 
 ### `duration_secs` vs `visible_duration`
 
@@ -349,6 +351,7 @@ Core table. One row per continuous presence of a person at a location.
 | `footage` | text | WebM clip filename (served at `/footage/`) |
 | `visible_duration` | float | Seconds tracked on camera (footage clock) |
 | `activity` | text | Most frequent CLIP action label |
+| `branch` | text NOT NULL DEFAULT 'Riyadh' | Branch identifier — auto-assigned from the camera's IP group |
 
 #### Indexes on `visits`
 
@@ -361,7 +364,7 @@ Core table. One row per continuous presence of a person at a location.
 
 ### Migrations
 
-Additive columns (`screenshot`, `footage`, `visible_duration`, `activity`) are added with `ALTER TABLE … ADD COLUMN` at startup, wrapped in try/except so re-running on an already-migrated DB is safe.
+Additive columns (`screenshot`, `footage`, `visible_duration`, `activity`, `branch`) are added with `ALTER TABLE … ADD COLUMN` at startup, wrapped in try/except so re-running on an already-migrated DB is safe. The `branch` column back-fills all pre-existing rows to `'Riyadh'`.
 
 ### Clearing data
 
@@ -453,6 +456,7 @@ README.md                     Setup, features, and troubleshooting guide
 
 ### `/` — Main Dashboard
 
+- **Branch switcher**: Riyadh / Egypt tabs at the top of the page. The active branch is persisted in `localStorage`. All history and analytics requests include `?branch=<active>` so each tab shows data for its own location.
 - **Live feed**: MJPEG stream from `/video`. Auto-reconnects on error; retries every 2 s after engine recovery.
 - **Camera controls**: carousel arrows / swipe to cycle cameras in single mode; grid layout selector.
 - **Analytics tab** (default): Arrivals by shift (single table per shift with an Earliest/Latest toggle; both datasets fetched in parallel on load and cached so toggling is instant), Top 10 Longest Working bar chart, Daily Headcount bar chart, Attendance Heatmap.
@@ -483,12 +487,14 @@ All date pickers use `dd-mm-yyyy` display (Flatpickr with `altInput`).
 
 All analytics endpoints live under `/api/analytics/`. Dates use the server's **local timezone** for shift boundaries; stored timestamps are UTC and converted on query.
 
+All analytics (and history) endpoints accept an optional `?branch=<name>` query parameter (e.g. `?branch=Riyadh` or `?branch=Egypt`). When omitted, data for all branches is returned. The in-tree UI always appends the active branch tab's value.
+
 ### Present / Absent Name Lists (`/api/analytics/present_absent`)
 
 Returns the full name lists behind the Present and Absent tiles. Called lazily on tile click rather than on page load.
 
-- `present` — enrolled known persons with at least one visit on the given day, sorted alphabetically.
-- `absent` — enrolled known `faces/` folders (non-`unknown_N`) with no visit that day, sorted alphabetically.
+- `present` — known persons with at least one visit on the given day (branch-filtered when `?branch=` is provided), sorted alphabetically.
+- `absent` — persons who have visited this branch at least once historically but had no visit that day, sorted alphabetically. Without a branch filter, falls back to all enrolled known `faces/` folders with no visit that day.
 
 The Present and Absent tiles have a hover border effect (emerald / rose) and open a modal with the name list and count on click. The modal closes on backdrop click or Escape.
 
@@ -499,8 +505,8 @@ A single endpoint that returns three KPIs for a given day, loaded in one request
 | Field | Description |
 |-------|-------------|
 | `peak_hour` | Local-time hour bucket with the most distinct people spotted, e.g. `"09:00 – 10:00"`. `null` if no visits that day. |
-| `present_today` | Count of distinct known persons (non-`unknown_N`) with at least one visit today. |
-| `absent_today` | Count of enrolled known persons with no visit today (`enrolled_known − present_today`). |
+| `present_today` | Count of distinct known persons (non-`unknown_N`) with at least one visit today (branch-filtered). |
+| `absent_today` | Count of persons who have visited this branch at least once historically but had no visit today. Without a branch filter, counts all enrolled known folders minus present. |
 | `unknowns_today` | Count of `unknown_N` folders currently in `faces/` — total unresolved auto-captured persons in the system, regardless of when they were last seen. |
 
 ### Earliest / Latest Arrivals (`/api/analytics/earliest`)

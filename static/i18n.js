@@ -68,6 +68,7 @@ const TRANSLATIONS = {
     card_image:"image", card_images:"images",
     people_enrolled:"people enrolled", people_known:"known", people_auto:"auto-captured",
     folder_hint:"Folder names are sanitized (letters/numbers/_-).",
+    branch_riyadh:"Riyadh", branch_egypt:"Egypt",
   },
   ar: {
     /* ── nav / header ── */
@@ -136,6 +137,7 @@ const TRANSLATIONS = {
     card_image:"صورة", card_images:"صور",
     people_enrolled:"شخص مسجل", people_known:"معروف", people_auto:"مُلتقط تلقائياً",
     folder_hint:"أسماء المجلدات تُعقَّم (حروف/أرقام/_-).",
+    branch_riyadh:"الرياض", branch_egypt:"مصر",
   }
 };
 
