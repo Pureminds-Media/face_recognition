@@ -15,8 +15,29 @@
       .flatpickr-current-month .flatpickr-monthDropdown-months, .numInput { color: #e2e8f0; background: #1e293b; }
       .flatpickr-prev-month svg, .flatpickr-next-month svg { fill: #94a3b8; }
     </style>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+    <script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/ar.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+    <script src="/static/i18n.js"></script>
+    <script>
+    /* Page-specific applyLang wrapper — reinits flatpickr and rerenders charts */
+    function applyLang(lang, rerender) {
+      window._applyLang(lang, rerender ? function() {
+        if (typeof loadArrivals === "function") loadArrivals();
+        if (typeof _renderArrivalShift === "function") { _renderArrivalShift("morning"); _renderArrivalShift("night"); }
+        if (typeof loadDaily === "function") loadDaily();
+        if (typeof loadLongest === "function") loadLongest(window._longestPeriod || "day");
+        if (typeof loadHeadcount === "function") loadHeadcount();
+        if (typeof loadHeatmap === "function") loadHeatmap();
+        if (typeof initFlatpickrs === "function") initFlatpickrs();
+      } : function() {
+        if (typeof initFlatpickrs === "function") initFlatpickrs();
+      });
+    }
+    </script>
     <script>
       // Attach the server's API key to every fetch() and EventSource so the
       // local UI keeps working when the key is enabled. Safe to inline:
@@ -74,23 +95,15 @@
           class="mx-auto max-w-6xl px-4 py-4 flex items-center justify-between"
         >
           <div>
-            <div class="text-xl font-semibold">Face Recognition</div>
-            <div class="text-slate-400 text-sm">Home</div>
+            <div class="text-xl font-semibold" data-i18n="app_title">Face Recognition</div>
+            <div class="text-slate-400 text-sm" data-i18n="nav_home">Home</div>
           </div>
 
           <div class="flex gap-2">
-            <a
-              href="/"
-              class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium"
-            >
-              Home
-            </a>
-            <a
-              href="/settings"
-              class="rounded-lg bg-slate-800 hover:bg-slate-700 px-3 py-2 text-sm"
-            >
-              Settings
-            </a>
+            <button id="langToggleBtn" onclick="applyLang(window._lang==='ar'?'en':'ar', true)"
+              class="rounded-lg bg-slate-700 hover:bg-slate-600 px-3 py-2 text-sm font-medium">AR</button>
+            <a href="/" class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium" data-i18n="nav_home">Home</a>
+            <a href="/settings" class="rounded-lg bg-slate-800 hover:bg-slate-700 px-3 py-2 text-sm" data-i18n="nav_settings">Settings</a>
           </div>
         </div>
       </div>
@@ -106,7 +119,7 @@
             <div
               class="px-4 py-3 border-b border-slate-800 flex items-center justify-between rounded-t-xl flex-wrap"
             >
-              <div class="font-medium">Live feed</div>
+              <div class="font-medium" data-i18n="live_feed">Live feed</div>
               <div class="text-xs text-slate-400" id="statusText">—</div>
               <div class="flex flex-wrap items-center gap-2">
                 <!-- Zoom controls -->
@@ -184,7 +197,7 @@
                    Lives outside videoStage so it's visible even when
                    the video img has no src (zero height). -->
               <div id="loadingOverlay" class="hidden mt-3 rounded-lg bg-slate-800/60 px-4 py-4 flex flex-col items-center gap-2">
-                <div class="text-slate-300 text-sm font-medium" id="loadingText">Loading cameras…</div>
+                <div class="text-slate-300 text-sm font-medium" id="loadingText" data-i18n="loading_cameras">Loading cameras…</div>
                 <div class="w-full bg-slate-700 rounded-full h-2 overflow-hidden">
                   <div id="loadingBar" class="h-full bg-emerald-500 rounded-full transition-all duration-300" style="width:0%"></div>
                 </div>
@@ -231,8 +244,8 @@
           <div class="mt-8">
             <div class="flex items-center justify-between mb-4">
               <div>
-                <div class="text-lg font-semibold">Visit History</div>
-                <div class="text-xs text-slate-400">Location-based attendance tracking</div>
+                <div class="text-lg font-semibold" data-i18n="visit_history">Visit History</div>
+                <div class="text-xs text-slate-400" data-i18n="visit_history_sub">Location-based attendance tracking</div>
               </div>
               <!-- "Clear Visit Data" button intentionally hidden — use the
                    terminal command documented in README.md instead. -->
@@ -247,19 +260,19 @@
 
             <!-- Sub-tab bar -->
             <div class="flex gap-1 mb-6 border-b border-slate-800">
-              <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-emerald-500 text-emerald-400" data-tab="analytics">Analytics</button>
-              <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200" data-tab="attendance">Attendance</button>
-              <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200" data-tab="daily">Daily Summary</button>
-              <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200" data-tab="person">Per Person</button>
-              <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200" data-tab="location">Per Location</button>
+              <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-emerald-500 text-emerald-400" data-tab="analytics" data-i18n="tab_analytics">Analytics</button>
+              <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200" data-tab="attendance" data-i18n="tab_attendance">Attendance</button>
+              <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200" data-tab="daily" data-i18n="tab_daily">Daily Summary</button>
+              <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200" data-tab="person" data-i18n="tab_person">Per Person</button>
+              <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200" data-tab="location" data-i18n="tab_location">Per Location</button>
             </div>
 
             <!-- Attendance Tab -->
             <div id="tab-attendance" class="tab-content hidden">
               <div class="flex items-center gap-3 mb-4 flex-wrap">
-                <label class="text-sm text-slate-400">Person:</label>
-                <select id="attendancePersonSelect" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm min-w-48"><option value="">Select...</option></select>
-                <label class="text-sm text-slate-400 ml-2">Date:</label>
+                <label class="text-sm text-slate-400" data-i18n="label_person">Person:</label>
+                <select id="attendancePersonSelect" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm min-w-48"><option value="" data-i18n="select_placeholder">Select...</option></select>
+                <label class="text-sm text-slate-400 ml-2" data-i18n="label_date">Date:</label>
                 <input id="attendanceDate" type="date" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm" />
                 <div id="attendanceMsg" class="text-xs text-slate-400"></div>
               </div>
@@ -267,15 +280,15 @@
                 <table class="w-full text-sm">
                   <thead>
                     <tr class="border-b border-slate-800 text-slate-400 text-xs">
-                      <th class="px-4 py-3 text-left">Footage</th>
-                      <th class="px-4 py-3 text-left">Person</th>
-                      <th class="px-4 py-3 text-left">Arrived</th>
-                      <th class="px-4 py-3 text-left">Left</th>
-                      <th class="px-4 py-3 text-left">Status</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_footage">Footage</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_person">Person</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_arrived">Arrived</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_left">Left</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_status">Status</th>
                     </tr>
                   </thead>
                   <tbody id="attendanceTableBody">
-                    <tr><td colspan="5" class="px-4 py-6 text-center text-slate-500">Select a person and date</td></tr>
+                    <tr><td colspan="5" class="px-4 py-6 text-center text-slate-500" data-i18n="empty_person_date">Select a person and date</td></tr>
                   </tbody>
                 </table>
               </div>
@@ -285,7 +298,7 @@
             <!-- Daily Summary Tab -->
             <div id="tab-daily" class="tab-content hidden">
               <div class="flex items-center gap-3 mb-4">
-                <label class="text-sm text-slate-400">Date:</label>
+                <label class="text-sm text-slate-400" data-i18n="label_date">Date:</label>
                 <input id="dailyDate" type="date" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm" />
                 <div id="dailyMsg" class="text-xs text-slate-400"></div>
               </div>
@@ -295,18 +308,18 @@
                 <table class="w-full text-sm">
                   <thead>
                     <tr class="border-b border-slate-800 text-slate-400 text-xs">
-                      <th class="px-4 py-3 text-left">Footage</th>
-                      <th class="px-4 py-3 text-left">Person</th>
-                      <th class="px-4 py-3 text-left">Location</th>
-                      <th class="px-4 py-3 text-left">Arrived</th>
-                      <th class="px-4 py-3 text-left">Left</th>
-                      <th class="px-4 py-3 text-left">Duration</th>
-                      <th class="px-4 py-3 text-left activity-col">Action</th>
-                      <th class="px-4 py-3 text-left">Status</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_footage">Footage</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_person">Person</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_location">Location</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_arrived">Arrived</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_left">Left</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_duration">Duration</th>
+                      <th class="px-4 py-3 text-left activity-col" data-i18n="col_action">Action</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_status">Status</th>
                     </tr>
                   </thead>
                   <tbody id="dailyTableBody">
-                    <tr><td class="px-4 py-6 text-center text-slate-500 empty-msg">Select a date and click Load</td></tr>
+                    <tr><td class="px-4 py-6 text-center text-slate-500 empty-msg" data-i18n="empty_date">Select a date and click Load</td></tr>
                   </tbody>
                 </table>
                 <div id="dailyPager" class="px-4 py-3 border-t border-slate-800 hidden"></div>
@@ -316,11 +329,11 @@
             <!-- Per Person Tab -->
             <div id="tab-person" class="tab-content hidden">
               <div class="flex items-center gap-3 mb-4 flex-wrap">
-                <label class="text-sm text-slate-400">Person:</label>
-                <select id="personSelect" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm min-w-48"><option value="">Select...</option></select>
-                <label class="text-sm text-slate-400 ml-2">From:</label>
+                <label class="text-sm text-slate-400" data-i18n="label_person">Person:</label>
+                <select id="personSelect" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm min-w-48"><option value="" data-i18n="select_placeholder">Select...</option></select>
+                <label class="text-sm text-slate-400 ml-2" data-i18n="label_from">From:</label>
                 <input id="personFrom" type="date" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm" />
-                <label class="text-sm text-slate-400">To:</label>
+                <label class="text-sm text-slate-400" data-i18n="label_to">To:</label>
                 <input id="personTo" type="date" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm" />
               </div>
               <div id="personSummary" class="mb-4"></div>
@@ -328,18 +341,18 @@
                 <table class="w-full text-sm">
                   <thead>
                     <tr class="border-b border-slate-800 text-slate-400 text-xs">
-                      <th class="px-4 py-3 text-left">Footage</th>
-                      <th class="px-4 py-3 text-left">Date</th>
-                      <th class="px-4 py-3 text-left">Location</th>
-                      <th class="px-4 py-3 text-left">Arrived</th>
-                      <th class="px-4 py-3 text-left">Left</th>
-                      <th class="px-4 py-3 text-left">Duration</th>
-                      <th class="px-4 py-3 text-left activity-col">Action</th>
-                      <th class="px-4 py-3 text-left">Status</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_footage">Footage</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_date">Date</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_location">Location</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_arrived">Arrived</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_left">Left</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_duration">Duration</th>
+                      <th class="px-4 py-3 text-left activity-col" data-i18n="col_action">Action</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_status">Status</th>
                     </tr>
                   </thead>
                   <tbody id="personTableBody">
-                    <tr><td class="px-4 py-6 text-center text-slate-500 empty-msg">Select a person and click Load</td></tr>
+                    <tr><td class="px-4 py-6 text-center text-slate-500 empty-msg" data-i18n="empty_person">Select a person and click Load</td></tr>
                   </tbody>
                 </table>
                 <div id="personPager" class="px-4 py-3 border-t border-slate-800 hidden"></div>
@@ -349,29 +362,29 @@
             <!-- Per Location Tab -->
             <div id="tab-location" class="tab-content hidden">
               <div class="flex items-center gap-3 mb-4 flex-wrap">
-                <label class="text-sm text-slate-400">Location:</label>
-                <select id="locationSelect" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm min-w-48"><option value="">Select...</option></select>
-                <label class="text-sm text-slate-400 ml-2">From:</label>
+                <label class="text-sm text-slate-400" data-i18n="label_location">Location:</label>
+                <select id="locationSelect" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm min-w-48"><option value="" data-i18n="select_placeholder">Select...</option></select>
+                <label class="text-sm text-slate-400 ml-2" data-i18n="label_from">From:</label>
                 <input id="locationFrom" type="date" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm" />
-                <label class="text-sm text-slate-400">To:</label>
+                <label class="text-sm text-slate-400" data-i18n="label_to">To:</label>
                 <input id="locationTo" type="date" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm" />
               </div>
               <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-hidden">
                 <table class="w-full text-sm">
                   <thead>
                     <tr class="border-b border-slate-800 text-slate-400 text-xs">
-                      <th class="px-4 py-3 text-left">Footage</th>
-                      <th class="px-4 py-3 text-left">Person</th>
-                      <th class="px-4 py-3 text-left">Date</th>
-                      <th class="px-4 py-3 text-left">Arrived</th>
-                      <th class="px-4 py-3 text-left">Left</th>
-                      <th class="px-4 py-3 text-left">Duration</th>
-                      <th class="px-4 py-3 text-left activity-col">Action</th>
-                      <th class="px-4 py-3 text-left">Status</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_footage">Footage</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_person">Person</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_date">Date</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_arrived">Arrived</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_left">Left</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_duration">Duration</th>
+                      <th class="px-4 py-3 text-left activity-col" data-i18n="col_action">Action</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_status">Status</th>
                     </tr>
                   </thead>
                   <tbody id="locationTableBody">
-                    <tr><td class="px-4 py-6 text-center text-slate-500 empty-msg">Select a location and click Load</td></tr>
+                    <tr><td class="px-4 py-6 text-center text-slate-500 empty-msg" data-i18n="empty_location">Select a location and click Load</td></tr>
                   </tbody>
                 </table>
                 <div id="locationPager" class="px-4 py-3 border-t border-slate-800 hidden"></div>
@@ -384,19 +397,19 @@
               <!-- Summary tiles -->
               <div class="grid grid-cols-4 gap-4 mb-6">
                 <div class="rounded-xl border border-slate-800 bg-slate-900 px-5 py-4 text-center">
-                  <p class="text-xs text-slate-500 uppercase tracking-wide mb-1">Peak Hour Today</p>
+                  <p class="text-xs text-slate-500 uppercase tracking-wide mb-1" data-i18n="tile_peak_hour">Peak Hour Today</p>
                   <p id="tilePeakHour" class="text-2xl font-semibold text-white">—</p>
                 </div>
                 <div onclick="openPresenceModal('present')" class="rounded-xl border border-slate-800 bg-slate-900 px-5 py-4 text-center cursor-pointer hover:border-emerald-700 transition-colors">
-                  <p class="text-xs text-slate-500 uppercase tracking-wide mb-1">Present Today</p>
+                  <p class="text-xs text-slate-500 uppercase tracking-wide mb-1" data-i18n="tile_present">Present Today</p>
                   <p id="tilePresentToday" class="text-2xl font-semibold text-emerald-400">—</p>
                 </div>
                 <div onclick="openPresenceModal('absent')" class="rounded-xl border border-slate-800 bg-slate-900 px-5 py-4 text-center cursor-pointer hover:border-rose-700 transition-colors">
-                  <p class="text-xs text-slate-500 uppercase tracking-wide mb-1">Absent Today</p>
+                  <p class="text-xs text-slate-500 uppercase tracking-wide mb-1" data-i18n="tile_absent">Absent Today</p>
                   <p id="tileAbsentToday" class="text-2xl font-semibold text-rose-400">—</p>
                 </div>
                 <div class="rounded-xl border border-slate-800 bg-slate-900 px-5 py-4 text-center">
-                  <p class="text-xs text-slate-500 uppercase tracking-wide mb-1">Unknowns Captured</p>
+                  <p class="text-xs text-slate-500 uppercase tracking-wide mb-1" data-i18n="tile_unknowns">Unknowns to Resolve</p>
                   <p id="tileUnknowns" class="text-2xl font-semibold text-amber-400">—</p>
                 </div>
               </div>
@@ -404,7 +417,7 @@
               <!-- Arrivals: shared date picker + two shift rows -->
               <div class="mb-6">
                 <div class="flex items-center justify-between mb-4 gap-2 flex-wrap">
-                  <h3 class="text-sm font-semibold text-slate-300">Arrivals by Shift</h3>
+                  <h3 class="text-sm font-semibold text-slate-300" data-i18n="arrivals_by_shift">Arrivals by Shift</h3>
                   <input id="arrivalDateInput" type="date" class="rounded-lg bg-slate-900 border border-slate-700 px-2 py-1 text-xs" />
                 </div>
 
@@ -412,18 +425,18 @@
                   <!-- Morning shift (04:00–16:00) -->
                   <div class="flex flex-col">
                     <div class="flex items-center justify-between mb-2">
-                      <p class="text-xs text-slate-500 font-medium uppercase tracking-wide">Morning shift &nbsp;04:00 – 16:00</p>
+                      <p class="text-xs text-slate-500 font-medium uppercase tracking-wide"><span data-i18n="morning_shift">Morning shift</span> &nbsp;04:00 – 16:00</p>
                       <div class="flex rounded-lg overflow-hidden border border-slate-700 text-xs">
-                        <button id="morningToggleEarliest" onclick="setArrivalOrder('morning','earliest')" class="px-3 py-1 bg-emerald-700 text-white">Earliest</button>
-                        <button id="morningToggleLatest"   onclick="setArrivalOrder('morning','latest')"   class="px-3 py-1 text-slate-400 hover:text-white">Latest</button>
+                        <button id="morningToggleEarliest" onclick="setArrivalOrder('morning','earliest')" class="px-3 py-1 bg-emerald-700 text-white" data-i18n="btn_earliest">Earliest</button>
+                        <button id="morningToggleLatest"   onclick="setArrivalOrder('morning','latest')"   class="px-3 py-1 text-slate-400 hover:text-white" data-i18n="btn_latest">Latest</button>
                       </div>
                     </div>
                     <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-hidden flex-1">
                       <table class="w-full text-sm">
                         <thead><tr class="border-b border-slate-800 text-slate-400 text-xs">
-                          <th class="px-4 py-3 text-left w-8">#</th>
-                          <th class="px-4 py-3 text-left">Employee</th>
-                          <th class="px-4 py-3 text-left">Arrived</th>
+                          <th class="px-4 py-3 text-left w-8" data-i18n="col_num">#</th>
+                          <th class="px-4 py-3 text-left" data-i18n="col_employee">Employee</th>
+                          <th class="px-4 py-3 text-left" data-i18n="col_arrived">Arrived</th>
                         </tr></thead>
                         <tbody id="morningArrivalBody"><tr><td colspan="3" class="px-4 py-6 text-center text-slate-500">Loading...</td></tr></tbody>
                       </table>
@@ -433,18 +446,18 @@
                   <!-- Night shift (16:00–04:00) -->
                   <div class="flex flex-col">
                     <div class="flex items-center justify-between mb-2">
-                      <p class="text-xs text-slate-500 font-medium uppercase tracking-wide">Night shift &nbsp;16:00 – 04:00</p>
+                      <p class="text-xs text-slate-500 font-medium uppercase tracking-wide"><span data-i18n="night_shift">Night shift</span> &nbsp;16:00 – 04:00</p>
                       <div class="flex rounded-lg overflow-hidden border border-slate-700 text-xs">
-                        <button id="nightToggleEarliest" onclick="setArrivalOrder('night','earliest')" class="px-3 py-1 bg-emerald-700 text-white">Earliest</button>
-                        <button id="nightToggleLatest"   onclick="setArrivalOrder('night','latest')"   class="px-3 py-1 text-slate-400 hover:text-white">Latest</button>
+                        <button id="nightToggleEarliest" onclick="setArrivalOrder('night','earliest')" class="px-3 py-1 bg-emerald-700 text-white" data-i18n="btn_earliest">Earliest</button>
+                        <button id="nightToggleLatest"   onclick="setArrivalOrder('night','latest')"   class="px-3 py-1 text-slate-400 hover:text-white" data-i18n="btn_latest">Latest</button>
                       </div>
                     </div>
                     <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-hidden flex-1">
                       <table class="w-full text-sm">
                         <thead><tr class="border-b border-slate-800 text-slate-400 text-xs">
-                          <th class="px-4 py-3 text-left w-8">#</th>
-                          <th class="px-4 py-3 text-left">Employee</th>
-                          <th class="px-4 py-3 text-left">Arrived</th>
+                          <th class="px-4 py-3 text-left w-8" data-i18n="col_num">#</th>
+                          <th class="px-4 py-3 text-left" data-i18n="col_employee">Employee</th>
+                          <th class="px-4 py-3 text-left" data-i18n="col_arrived">Arrived</th>
                         </tr></thead>
                         <tbody id="nightArrivalBody"><tr><td colspan="3" class="px-4 py-6 text-center text-slate-500">Loading...</td></tr></tbody>
                       </table>
@@ -456,10 +469,10 @@
               <!-- Daily Headcount -->
               <div class="mb-6">
                 <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
-                  <h3 class="text-sm font-semibold text-slate-300">Daily Headcount</h3>
+                  <h3 class="text-sm font-semibold text-slate-300" data-i18n="daily_headcount">Daily Headcount</h3>
                   <div class="flex items-center gap-2">
                     <input id="headcountFrom" type="date" class="rounded-lg bg-slate-900 border border-slate-700 px-2 py-1 text-xs" />
-                    <span class="text-slate-500 text-xs">to</span>
+                    <span class="text-slate-500 text-xs" data-i18n="label_to_range">to</span>
                     <input id="headcountTo" type="date" class="rounded-lg bg-slate-900 border border-slate-700 px-2 py-1 text-xs" />
                   </div>
                 </div>
@@ -472,10 +485,10 @@
               <!-- Attendance Heatmap -->
               <div class="mb-6">
                 <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
-                  <h3 class="text-sm font-semibold text-slate-300">Attendance Heatmap</h3>
+                  <h3 class="text-sm font-semibold text-slate-300" data-i18n="attendance_heatmap">Attendance Heatmap</h3>
                   <div class="flex items-center gap-2">
                     <input id="heatmapFrom" type="date" class="rounded-lg bg-slate-900 border border-slate-700 px-2 py-1 text-xs" />
-                    <span class="text-slate-500 text-xs">to</span>
+                    <span class="text-slate-500 text-xs" data-i18n="label_to_range">to</span>
                     <input id="heatmapTo" type="date" class="rounded-lg bg-slate-900 border border-slate-700 px-2 py-1 text-xs" />
                   </div>
                 </div>
@@ -488,12 +501,12 @@
               <!-- Longest Working -->
               <div class="mb-6">
                 <div class="flex items-center justify-between mb-3">
-                  <h3 class="text-sm font-semibold text-slate-300">Top 10 Longest Working</h3>
+                  <h3 class="text-sm font-semibold text-slate-300" data-i18n="longest_working">Top 10 Longest Working</h3>
                   <div class="flex gap-1">
-                    <button class="longest-period-btn px-3 py-1 text-xs rounded-lg bg-emerald-600 text-white" data-period="day">Today</button>
-                    <button class="longest-period-btn px-3 py-1 text-xs rounded-lg bg-slate-800 text-slate-400 hover:bg-slate-700" data-period="week">This Week</button>
-                    <button class="longest-period-btn px-3 py-1 text-xs rounded-lg bg-slate-800 text-slate-400 hover:bg-slate-700" data-period="month">This Month</button>
-                    <button class="longest-period-btn px-3 py-1 text-xs rounded-lg bg-slate-800 text-slate-400 hover:bg-slate-700" data-period="year">This Year</button>
+                    <button class="longest-period-btn px-3 py-1 text-xs rounded-lg bg-emerald-600 text-white" data-period="day" data-i18n="period_today">Today</button>
+                    <button class="longest-period-btn px-3 py-1 text-xs rounded-lg bg-slate-800 text-slate-400 hover:bg-slate-700" data-period="week" data-i18n="period_week">This Week</button>
+                    <button class="longest-period-btn px-3 py-1 text-xs rounded-lg bg-slate-800 text-slate-400 hover:bg-slate-700" data-period="month" data-i18n="period_month">This Month</button>
+                    <button class="longest-period-btn px-3 py-1 text-xs rounded-lg bg-slate-800 text-slate-400 hover:bg-slate-700" data-period="year" data-i18n="period_year">This Year</button>
                   </div>
                 </div>
                 <div class="rounded-xl border border-slate-800 bg-slate-900 p-4">
@@ -619,8 +632,8 @@
 
         if (statusText)
           statusText.textContent = running
-            ? "Camera running"
-            : "Camera stopped";
+            ? t("cam_running")
+            : t("cam_stopped");
 
         // Keep MJPEG aligned — always restart to pick up new camera source
         if (running) {
@@ -1030,7 +1043,7 @@
           if (loading) {
             const pct = Math.round((opened / total) * 100);
             loadingBar.style.width = pct + "%";
-            loadingCount.textContent = opened + " / " + total + " cams loaded";
+            loadingCount.textContent = opened + " / " + total + " " + t("cams_loaded");
           }
         } catch (_) { loadingOverlay.classList.add("hidden"); }
       }, 600);
@@ -1203,8 +1216,8 @@
       async function loadAttendance() {
         const name = attendancePersonSelect.value;
         const date = attendanceDateInput.value;
-        if (!name || !date) { attendanceMsg.textContent = "Select a person and date."; return; }
-        attendanceMsg.textContent = "Loading...";
+        if (!name || !date) { attendanceMsg.textContent = t("empty_person_date"); return; }
+        attendanceMsg.textContent = t("loading");
         try {
           const r = await fetch(`/api/history/person/${encodeURIComponent(name)}?from=${date}&to=${date}`);
           const j = await r.json();
@@ -1252,7 +1265,7 @@
       async function loadDaily() {
         const d = dailyDate.value;
         if (!d) return;
-        dailyMsg.textContent = "Loading...";
+        dailyMsg.textContent = t("loading");
         try {
           const r = await fetch(`/api/history/daily?date=${d}`);
           const j = await r.json();
@@ -1264,6 +1277,7 @@
       dailyDate.addEventListener("change", loadDaily);
       dailyDate.addEventListener("keydown", (e) => { if (e.key === "Enter") loadDaily(); });
       window.addEventListener("DOMContentLoaded", async () => {
+        applyLang(window._lang, false);
         try { await loadCameraOptions(); } catch (e) {}
         loadDaily();
         loadSummaryTiles();
@@ -1426,13 +1440,13 @@
       async function loadHeadcount() {
         const from = headcountFrom.value, to = headcountTo.value;
         if (!from || !to) return;
-        headcountMsg.textContent = "Loading…";
+        headcountMsg.textContent = t("loading");
         headcountMsg.classList.remove("hidden");
         try {
           const r = await fetch(`/api/analytics/headcount?from=${from}&to=${to}`);
           const j = await r.json();
           if (!j.ok || !j.rows.length) {
-            headcountMsg.textContent = j.ok ? "No data for this range" : (j.error || "Error");
+            headcountMsg.textContent = j.ok ? t("no_data_range") : (j.error || "Error");
             if (_headcountChart) { _headcountChart.destroy(); _headcountChart = null; }
             headcountCanvas.classList.add("hidden");
             return;
@@ -1442,12 +1456,13 @@
           const labels = j.rows.map(r => { const d = r.date; return d.slice(8)+"-"+d.slice(5,7)+"-"+d.slice(0,4); });
           const values = j.rows.map(r => r.count);
           if (_headcountChart) { _headcountChart.destroy(); _headcountChart = null; }
+          const _hcRtl = window._lang === "ar";
           _headcountChart = new Chart(headcountCanvas, {
             type: "bar",
             data: {
               labels,
               datasets: [{
-                label: "People",
+                label: t("people_label"),
                 data: values,
                 backgroundColor: "rgba(59,130,246,0.7)",
                 borderColor: "rgba(59,130,246,1)",
@@ -1462,8 +1477,8 @@
                 tooltip: { callbacks: { label: ctx => ` ${ctx.parsed.y} people` } },
               },
               scales: {
-                x: { grid: { color: "rgba(51,65,85,0.5)" }, ticks: { color: "#94a3b8", maxRotation: 45, font: { size: 11 } } },
-                y: { grid: { color: "rgba(51,65,85,0.5)" }, ticks: { color: "#94a3b8", stepSize: 1 }, beginAtZero: true },
+                x: { reverse: _hcRtl, grid: { color: "rgba(51,65,85,0.5)" }, ticks: { color: "#94a3b8", maxRotation: 45, font: { size: 11 } } },
+                y: { position: _hcRtl ? "right" : "left", grid: { color: "rgba(51,65,85,0.5)" }, ticks: { color: "#94a3b8", stepSize: 1 }, beginAtZero: true },
               },
             },
           });
@@ -1487,7 +1502,7 @@
       async function loadHeatmap() {
         const from = heatmapFrom.value, to = heatmapTo.value;
         if (!from || !to) return;
-        heatmapMsg.textContent = "Loading…";
+        heatmapMsg.textContent = t("loading");
         heatmapMsg.classList.remove("hidden");
         heatmapGrid.classList.add("hidden");
         heatmapGrid.innerHTML = "";
@@ -1495,7 +1510,7 @@
           const r = await fetch(`/api/analytics/heatmap?from=${from}&to=${to}`);
           const j = await r.json();
           if (!j.ok || !j.persons.length) {
-            heatmapMsg.textContent = j.ok ? "No data for this range" : (j.error || "Error");
+            heatmapMsg.textContent = j.ok ? t("no_data_range") : (j.error || "Error");
             return;
           }
           heatmapMsg.classList.add("hidden");
@@ -1505,7 +1520,7 @@
           const fmtCol = iso => { const p = iso.split("-"); return `${p[2]}-${p[1]}`; };
           let html = `<table class="text-xs border-collapse" style="min-width:100%">
             <thead><tr>
-              <th class="sticky left-0 bg-slate-900 pr-3 py-1 text-left text-slate-400 font-medium whitespace-nowrap" style="min-width:120px">Employee</th>`;
+              <th class="sticky left-0 bg-slate-900 pr-3 py-1 text-start text-slate-400 font-medium whitespace-nowrap" style="min-width:120px">${t("col_employee")}</th>`;
           for (const d of j.dates) html += `<th class="px-1 py-1 text-slate-500 font-normal text-center whitespace-nowrap">${fmtCol(d)}</th>`;
           html += `</tr></thead><tbody>`;
           for (const person of j.persons) {
@@ -1541,12 +1556,12 @@
 
       function _arrivalRows(rows, order) {
         const color = order === "latest" ? "text-amber-400" : "text-emerald-400";
-        if (!rows.length) return `<tr><td colspan="3" class="px-4 py-6 text-center text-slate-500">No data</td></tr>`;
+        if (!rows.length) return `<tr><td colspan="3" class="px-4 py-6 text-center text-slate-500">${t("no_data")}</td></tr>`;
         return rows.map((row, i) => `
           <tr class="border-b border-slate-800/50 hover:bg-slate-800/30">
             <td class="px-4 py-3 text-slate-500 text-xs">${i + 1}</td>
             <td class="px-4 py-3 font-medium">${fmtName(row.person_name)}</td>
-            <td class="px-4 py-3 ${color} font-mono text-sm">${row.arrival_time}</td>
+            <td class="px-4 py-3 ${color} font-mono text-sm" dir="ltr">${row.arrival_time}</td>
           </tr>`).join("");
       }
 
@@ -1576,7 +1591,7 @@
       async function loadArrivals() {
         const date = arrivalDateInput.value;
         if (!date) return;
-        const loading = `<tr><td colspan="3" class="px-4 py-6 text-center text-slate-500">Loading...</td></tr>`;
+        const loading = `<tr><td colspan="3" class="px-4 py-6 text-center text-slate-500">${t("loading")}</td></tr>`;
         document.getElementById("morningArrivalBody").innerHTML = loading;
         document.getElementById("nightArrivalBody").innerHTML   = loading;
         const [em, lm, en, ln] = await Promise.all([
@@ -1621,14 +1636,14 @@
       }
 
       async function loadLongest(period) {
-        longestChartMsg.textContent = "Loading…";
+        longestChartMsg.textContent = t("loading");
         longestChartMsg.classList.remove("hidden");
         longestChartCanvas.classList.add("hidden");
         try {
           const r = await fetch(`/api/analytics/longest?period=${period}`);
           const j = await r.json();
           if (!j.ok || !j.rows.length) {
-            longestChartMsg.textContent = j.ok ? "No data for this period" : (j.error || "Error");
+            longestChartMsg.textContent = j.ok ? t("no_data_range") : (j.error || "Error");
             if (_longestChart) { _longestChart.destroy(); _longestChart = null; }
             return;
           }
@@ -1643,12 +1658,13 @@
 
           if (_longestChart) { _longestChart.destroy(); _longestChart = null; }
 
+          const _lwRtl = window._lang === "ar";
           _longestChart = new Chart(longestChartCanvas, {
             type: "bar",
             data: {
               labels,
               datasets: [{
-                label: "Duration",
+                label: t("duration_label"),
                 data: values,
                 backgroundColor: "rgba(16, 185, 129, 0.75)",
                 borderColor: "rgba(16, 185, 129, 1)",
@@ -1680,6 +1696,7 @@
               },
               scales: {
                 x: {
+                  reverse: _lwRtl,
                   grid: { color: "rgba(51,65,85,0.5)" },
                   ticks: {
                     color: "#94a3b8",
@@ -1729,17 +1746,25 @@
         allowInput: true,
         theme: "dark",
       };
-      [
-        "attendanceDate", "dailyDate",
-        "personFrom", "personTo",
-        "locationFrom", "locationTo",
-        "arrivalDateInput",
-        "headcountFrom", "headcountTo",
-        "heatmapFrom", "heatmapTo",
-      ].forEach(id => {
-        const el = document.getElementById(id);
-        if (el) flatpickr(el, _fpCfg);
-      });
+      function initFlatpickrs() {
+        const locale = window._lang === "ar" ? flatpickr.l10ns.ar : flatpickr.l10ns.default;
+        [
+          "attendanceDate", "dailyDate",
+          "personFrom", "personTo",
+          "locationFrom", "locationTo",
+          "arrivalDateInput",
+          "headcountFrom", "headcountTo",
+          "heatmapFrom", "heatmapTo",
+        ].forEach(id => {
+          const el = document.getElementById(id);
+          if (!el) return;
+          const prev = el._flatpickr ? el._flatpickr.selectedDates[0] : null;
+          if (el._flatpickr) el._flatpickr.destroy();
+          const inst = flatpickr(el, { ..._fpCfg, locale });
+          if (prev) inst.setDate(prev, false);
+        });
+      }
+      initFlatpickrs();
 
       // Load analytics when tab is clicked
       document.querySelectorAll(".tab-btn").forEach(btn => {
@@ -2127,10 +2152,10 @@
       const names = type === "present" ? j.present : j.absent;
       const color = type === "present" ? "text-emerald-400" : "text-rose-400";
       document.getElementById("presenceModalTitle").textContent =
-        type === "present" ? `Present Today (${names.length})` : `Absent Today (${names.length})`;
+        type === "present" ? `${t("modal_present")} (${names.length})` : `${t("modal_absent")} (${names.length})`;
       document.getElementById("presenceModalList").innerHTML = names.length
         ? names.map(n => `<li class="${color} font-medium">${fmtName(n)}</li>`).join("")
-        : `<li class="text-slate-500">No data</li>`;
+        : `<li class="text-slate-500">${t("no_data")}</li>`;
       document.getElementById("presenceModal").classList.remove("hidden");
     }
     function closePresenceModal() {

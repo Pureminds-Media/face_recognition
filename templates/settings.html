@@ -5,6 +5,20 @@
     <title>Settings</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="/static/i18n.js"></script>
+    <script>
+    function applyLang(lang) {
+      _applyLang(lang, function() {
+        if (typeof renderPeople === "function") renderPeople();
+        const camSection = document.getElementById("section-camera");
+        if (camSection && !camSection.classList.contains("hidden") && typeof loadIpCameras === "function") loadIpCameras();
+      });
+    }
+    document.addEventListener("DOMContentLoaded", () => applyLang(window._lang));
+    </script>
     <script>
       (function () {
         const KEY = "{{ API_KEY|default('', true)|e }}";
@@ -52,22 +66,14 @@
       <div class="border-b border-slate-800">
         <div class="mx-auto max-w-6xl px-4 py-4 flex items-center justify-between">
           <div>
-            <div class="text-xl font-semibold">Face Recognition</div>
-            <div class="text-slate-400 text-sm">Settings</div>
+            <div class="text-xl font-semibold" data-i18n="app_title">Face Recognition</div>
+            <div class="text-slate-400 text-sm" data-i18n="nav_settings">Settings</div>
           </div>
           <div class="flex gap-2">
-            <a
-              href="/"
-              class="rounded-lg bg-slate-800 hover:bg-slate-700 px-3 py-2 text-sm"
-            >
-              Home
-            </a>
-            <a
-              href="/settings"
-              class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium"
-            >
-              Settings
-            </a>
+            <button id="langToggleBtn" onclick="applyLang(window._lang==='ar'?'en':'ar')"
+              class="rounded-lg bg-slate-700 hover:bg-slate-600 px-3 py-2 text-sm font-medium">AR</button>
+            <a href="/" class="rounded-lg bg-slate-800 hover:bg-slate-700 px-3 py-2 text-sm" data-i18n="nav_home">Home</a>
+            <a href="/settings" class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium" data-i18n="nav_settings">Settings</a>
           </div>
         </div>
       </div>
@@ -77,14 +83,16 @@
           <aside class="w-48 shrink-0">
             <nav class="space-y-1 sticky top-4">
               <button
-                class="section-btn w-full text-left rounded-lg px-3 py-2 text-sm font-medium bg-slate-800 text-emerald-400"
+                class="section-btn w-full text-start rounded-lg px-3 py-2 text-sm font-medium bg-slate-800 text-emerald-400"
                 data-section="people"
+                data-i18n="sec_people"
               >
                 People
               </button>
               <button
-                class="section-btn w-full text-left rounded-lg px-3 py-2 text-sm font-medium text-slate-300 hover:bg-slate-800"
+                class="section-btn w-full text-start rounded-lg px-3 py-2 text-sm font-medium text-slate-300 hover:bg-slate-800"
                 data-section="camera"
+                data-i18n="sec_camera"
               >
                 Camera
               </button>
@@ -98,8 +106,8 @@
             <!-- Add image -->
             <div class="rounded-xl border border-slate-800 bg-slate-900 mb-6">
               <div class="px-4 py-3 border-b border-slate-800">
-                <div class="font-medium">Add image</div>
-                <div class="text-xs text-slate-400">
+                <div class="font-medium" data-i18n="add_image">Add image</div>
+                <div class="text-xs text-slate-400" data-i18n="add_image_sub">
                   Saves as 1.jpg, 2.jpg, … in faces/&lt;person&gt;/
                 </div>
               </div>
@@ -110,15 +118,15 @@
                 enctype="multipart/form-data"
               >
                 <div class="space-y-2">
-                  <div class="text-sm text-slate-300">Person</div>
+                  <div class="text-sm text-slate-300" data-i18n="label_person">Person</div>
                   <div class="flex items-center gap-3">
                     <label class="flex items-center gap-2 text-sm">
                       <input type="radio" name="mode" value="existing" checked class="accent-emerald-500" />
-                      Existing
+                      <span data-i18n="label_existing">Existing</span>
                     </label>
                     <label class="flex items-center gap-2 text-sm">
                       <input type="radio" name="mode" value="new" class="accent-emerald-500" />
-                      New
+                      <span data-i18n="label_new">New</span>
                     </label>
                   </div>
 
@@ -131,17 +139,17 @@
                   <input
                     id="newName"
                     name="new_name"
-                    placeholder="e.g. Ahmed_AlQahtani"
+                    placeholder="Ahmed_AlQahtani"
                     class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm hidden"
                   />
                   <div id="nameValidation" class="text-xs text-red-400 hidden"></div>
-                  <div class="text-xs text-slate-400">
+                  <div class="text-xs text-slate-400" data-i18n="folder_hint">
                     Folder names are sanitized (letters/numbers/_-).
                   </div>
                 </div>
 
                 <div class="space-y-2">
-                  <div class="text-sm text-slate-300">Image</div>
+                  <div class="text-sm text-slate-300" data-i18n="label_image">Image</div>
                   <div class="flex items-center gap-2">
                     <input
                       name="file"
@@ -168,6 +176,7 @@
                     type="submit"
                     id="uploadBtn"
                     class="w-full rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    data-i18n="btn_upload"
                   >
                     Upload
                   </button>
@@ -191,13 +200,13 @@
             <div id="mergeBar" class="hidden flex flex-wrap items-center gap-2 mb-4 p-3 rounded-lg border border-slate-800 bg-slate-900 text-sm">
               <span id="mergeSelCount" class="text-slate-300">0 selected</span>
               <span class="flex-1"></span>
-              <label class="text-slate-400">Merge into:</label>
+              <label class="text-slate-400" data-i18n="merge_into">Merge into:</label>
               <select id="mergeTarget" class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-white text-xs"></select>
-              <span class="text-slate-500 text-xs">or new:</span>
+              <span class="text-slate-500 text-xs" data-i18n="merge_or_new">or new:</span>
               <input id="mergeNewName" type="text" placeholder="new person name"
                 class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-white text-xs w-40" />
-              <button onclick="submitMerge()" class="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-xs font-medium">Merge</button>
-              <button onclick="clearPersonSelection()" class="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs">Clear</button>
+              <button onclick="submitMerge()" class="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-xs font-medium" data-i18n="btn_merge">Merge</button>
+              <button onclick="clearPersonSelection()" class="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs" data-i18n="btn_clear">Clear</button>
             </div>
 
             <div id="peopleGrid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
@@ -205,8 +214,8 @@
             </div>
 
             <div id="emptyState" class="hidden text-center py-20">
-              <div class="text-slate-500 text-lg">No people enrolled yet</div>
-              <div class="text-slate-600 text-sm mt-2">Use the form above to upload face images</div>
+              <div class="text-slate-500 text-lg" data-i18n="no_people">No people enrolled yet</div>
+              <div class="text-slate-600 text-sm mt-2" data-i18n="no_people_sub">Use the form above to upload face images</div>
             </div>
           </div>
 
@@ -216,14 +225,15 @@
             <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-hidden">
               <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between gap-3">
                 <div>
-                  <div class="font-medium">IP Cameras</div>
-                  <div class="text-xs text-slate-400">Group cameras under a shared RTSP base (e.g. an NVR). Add channels by number, or use the "Standalone" group for one-off URLs. All edits auto-save.</div>
+                  <div class="font-medium" data-i18n="ip_cameras">IP Cameras</div>
+                  <div class="text-xs text-slate-400" data-i18n="ip_cameras_sub">Group cameras under a shared RTSP base (e.g. an NVR). Add channels by number, or use the "Standalone" group for one-off URLs. All edits auto-save.</div>
                 </div>
                 <div class="flex gap-2 shrink-0">
                   <button
                     id="addCameraBtn"
                     type="button"
                     class="rounded-lg bg-slate-700 hover:bg-slate-600 px-3 py-2 text-sm font-medium"
+                    data-i18n="btn_add_camera"
                   >
                     + Add Camera
                   </button>
@@ -231,6 +241,7 @@
                     id="addGroupBtn"
                     type="button"
                     class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium"
+                    data-i18n="btn_add_group"
                   >
                     + Add Group
                   </button>
@@ -254,13 +265,13 @@
     <!-- Rename / Merge Modal -->
     <div id="renameModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60">
       <div class="bg-slate-900 border border-slate-700 rounded-xl p-6 w-full max-w-md mx-4">
-        <h3 class="text-lg font-semibold mb-4">Rename / Merge Person</h3>
+        <h3 class="text-lg font-semibold mb-4" data-i18n="modal_rename_title">Rename / Merge Person</h3>
         <div class="mb-3">
-          <label class="block text-sm text-slate-400 mb-1">Current name</label>
+          <label class="block text-sm text-slate-400 mb-1" data-i18n="label_current_name">Current name</label>
           <div id="renameOldName" class="text-white font-mono bg-slate-800 rounded px-3 py-2"></div>
         </div>
         <div class="mb-1">
-          <label class="block text-sm text-slate-400 mb-1">New name</label>
+          <label class="block text-sm text-slate-400 mb-1" data-i18n="label_new_name">New name</label>
           <input
             id="renameNewName"
             type="text"
@@ -269,12 +280,13 @@
             maxlength="64"
           />
         </div>
-        <div class="text-xs text-slate-500 mb-3">If the name already exists, the photos and visit history will be merged into that person.</div>
+        <div class="text-xs text-slate-500 mb-3" data-i18n="rename_merge_hint">If the name already exists, the photos and visit history will be merged into that person.</div>
         <div id="renameError" class="text-red-400 text-sm mb-3 hidden"></div>
         <div class="flex gap-3 justify-end">
           <button
             onclick="closeRenameModal()"
             class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm"
+            data-i18n="btn_cancel"
           >
             Cancel
           </button>
@@ -282,6 +294,7 @@
             id="renameSubmitBtn"
             onclick="submitRename()"
             class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-sm font-medium"
+            data-i18n="btn_rename"
           >
             Rename
           </button>
@@ -292,13 +305,14 @@
     <!-- Delete Confirm Modal -->
     <div id="deleteModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60">
       <div class="bg-slate-900 border border-slate-700 rounded-xl p-6 w-full max-w-md mx-4">
-        <h3 class="text-lg font-semibold mb-2 text-red-400">Delete Person</h3>
+        <h3 class="text-lg font-semibold mb-2 text-red-400" data-i18n="modal_delete_title">Delete Person</h3>
         <p class="text-slate-300 mb-1">Are you sure you want to delete <span id="deletePersonName" class="font-mono font-semibold text-white"></span>?</p>
-        <p class="text-slate-500 text-sm mb-4">This will remove all face images and visit history for this person. This action cannot be undone.</p>
+        <p class="text-slate-500 text-sm mb-4" data-i18n="delete_warning">This will remove all face images and visit history for this person. This action cannot be undone.</p>
         <div class="flex gap-3 justify-end">
           <button
             onclick="closeDeleteModal()"
             class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm"
+            data-i18n="btn_cancel"
           >
             Cancel
           </button>
@@ -306,6 +320,7 @@
             id="deleteSubmitBtn"
             onclick="submitDelete()"
             class="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-500 text-sm font-medium"
+            data-i18n="btn_delete"
           >
             Delete
           </button>
@@ -321,14 +336,14 @@
           <button onclick="closeGalleryModal()" class="text-slate-400 hover:text-white text-xl">&times;</button>
         </div>
         <div class="flex flex-wrap items-center gap-2 mb-3 text-xs">
-          <button onclick="gallerySelectAll()" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700">Select all</button>
-          <button onclick="gallerySelectClear()" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700">Clear</button>
+          <button onclick="gallerySelectAll()" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700" data-i18n="btn_select_all">Select all</button>
+          <button onclick="gallerySelectClear()" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700" data-i18n="btn_clear">Clear</button>
           <span id="gallerySelCount" class="text-slate-400">0 selected</span>
           <span class="flex-1"></span>
           <button id="galleryBulkMoveBtn" onclick="openBulkTransferModal()" disabled
-            class="px-3 py-1 rounded bg-blue-700 hover:bg-blue-600 disabled:bg-slate-800 disabled:text-slate-600">Move selected</button>
+            class="px-3 py-1 rounded bg-blue-700 hover:bg-blue-600 disabled:bg-slate-800 disabled:text-slate-600" data-i18n="btn_move_selected">Move selected</button>
           <button id="galleryBulkDelBtn" onclick="bulkDeleteImages()" disabled
-            class="px-3 py-1 rounded bg-red-700 hover:bg-red-600 disabled:bg-slate-800 disabled:text-slate-600">Delete selected</button>
+            class="px-3 py-1 rounded bg-red-700 hover:bg-red-600 disabled:bg-slate-800 disabled:text-slate-600" data-i18n="btn_delete_selected">Delete selected</button>
         </div>
         <div id="galleryImages" class="grid grid-cols-2 sm:grid-cols-3 gap-3">
           <!-- Images rendered by JS -->
@@ -339,13 +354,13 @@
     <!-- Transfer Image Modal -->
     <div id="transferModal" class="hidden fixed inset-0 z-[60] flex items-center justify-center bg-black/60">
       <div class="bg-slate-900 border border-slate-700 rounded-xl p-6 w-full max-w-md mx-4">
-        <h3 class="text-lg font-semibold mb-3">Transfer Image</h3>
+        <h3 class="text-lg font-semibold mb-3" data-i18n="modal_transfer_title">Transfer Image</h3>
         <div class="mb-3">
           <div class="text-sm text-slate-400 mb-1">Moving image from <span id="transferFrom" class="font-mono text-white"></span></div>
           <img id="transferPreview" class="w-24 h-24 object-cover rounded border border-slate-600 mt-1" />
         </div>
         <div class="mb-4">
-          <label class="block text-sm text-slate-400 mb-1">Transfer to</label>
+          <label class="block text-sm text-slate-400 mb-1" data-i18n="label_transfer_to">Transfer to</label>
           <select
             id="transferTarget"
             class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500"
@@ -353,7 +368,7 @@
             <!-- Options rendered by JS -->
           </select>
           <div class="mt-2">
-            <label class="block text-xs text-slate-500 mb-1">Or create new person</label>
+            <label class="block text-xs text-slate-500 mb-1" data-i18n="label_new_person">Or create new person</label>
             <input
               id="transferNewName"
               type="text"
@@ -368,6 +383,7 @@
           <button
             onclick="closeTransferModal()"
             class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm"
+            data-i18n="btn_cancel"
           >
             Cancel
           </button>
@@ -375,6 +391,7 @@
             id="transferSubmitBtn"
             onclick="submitTransfer()"
             class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-sm font-medium"
+            data-i18n="btn_transfer"
           >
             Transfer
           </button>
@@ -385,16 +402,16 @@
     <!-- Add Solo Camera Modal -->
     <div id="addCameraModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60">
       <div class="bg-slate-900 border border-slate-700 rounded-xl p-6 w-full max-w-md mx-4">
-        <h3 class="text-lg font-semibold mb-1">Add Camera</h3>
+        <h3 class="text-lg font-semibold mb-1" data-i18n="modal_add_camera_title">Add Camera</h3>
         <p class="text-slate-400 text-xs mb-4">Enter a full RTSP URL — e.g. <span class="font-mono">rtsp://admin:pass@192.168.1.81:554/h264_stream</span></p>
         <div class="space-y-3 mb-4">
           <div>
-            <label class="block text-sm text-slate-400 mb-1">Name</label>
+            <label class="block text-sm text-slate-400 mb-1" data-i18n="label_name">Name</label>
             <input id="addCamName" type="text" maxlength="64" placeholder="e.g. Lobby"
               class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white focus:outline-none focus:border-emerald-500 text-sm" />
           </div>
           <div>
-            <label class="block text-sm text-slate-400 mb-1">RTSP URL</label>
+            <label class="block text-sm text-slate-400 mb-1" data-i18n="label_rtsp_url">RTSP URL</label>
             <input id="addCamUrl" type="text" placeholder="rtsp://..."
               class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white focus:outline-none focus:border-emerald-500 text-sm font-mono" />
           </div>
@@ -402,9 +419,9 @@
         </div>
         <div class="flex gap-3 justify-end">
           <button onclick="closeAddCameraModal()"
-            class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm">Cancel</button>
+            class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm" data-i18n="btn_cancel">Cancel</button>
           <button id="addCamSubmitBtn" onclick="submitAddCamera()"
-            class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium">Add Camera</button>
+            class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium" data-i18n="modal_add_camera_title">Add Camera</button>
         </div>
       </div>
     </div>
@@ -416,7 +433,7 @@
     <div id="captureModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
       <div class="relative bg-slate-900 rounded-xl border border-slate-700 shadow-2xl p-4 max-w-lg w-full mx-4 space-y-3">
         <div class="flex items-center justify-between">
-          <div class="text-sm font-medium">Take Photo</div>
+          <div class="text-sm font-medium" data-i18n="modal_take_photo">Take Photo</div>
           <button onclick="closeCaptureModal()" class="text-slate-400 hover:text-red-400 text-xl font-bold transition-colors">&times;</button>
         </div>
         <select id="captureDeviceSelect" onchange="switchCaptureCamera()"
@@ -429,7 +446,8 @@
         </div>
         <canvas id="captureCanvas" class="hidden"></canvas>
         <button type="button" onclick="capturePhoto()"
-          class="w-full rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium">
+          class="w-full rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium"
+          data-i18n="btn_capture">
           Capture
         </button>
       </div>
@@ -557,7 +575,7 @@
         if (_people.length === 0) {
           grid.classList.add("hidden");
           empty.classList.remove("hidden");
-          stats.textContent = "0 people enrolled";
+          stats.textContent = `0 ${t("people_enrolled")}`;
           return;
         }
 
@@ -566,9 +584,9 @@
 
         const unknowns = _people.filter(p => p.name.match(/^unknown_\d+$/)).length;
         const known = _people.length - unknowns;
-        let statsStr = `${_people.length} people enrolled`;
+        let statsStr = `${_people.length} ${t("people_enrolled")}`;
         if (unknowns > 0) {
-          statsStr += ` (${known} known, ${unknowns} auto-captured)`;
+          statsStr += ` (${known} ${t("people_known")}, ${unknowns} ${t("people_auto")})`;
         }
         stats.textContent = statsStr;
 
@@ -598,20 +616,20 @@
                     <span class="font-mono text-sm font-medium truncate max-w-[140px]" title="${p.name}">${p.name}</span>
                     ${badge}
                   </div>
-                  <span class="text-xs text-slate-500">${p.count} image${p.count !== 1 ? "s" : ""}</span>
+                  <span class="text-xs text-slate-500">${p.count} ${p.count !== 1 ? t("card_images") : t("card_image")}</span>
                 </div>
                 <div class="flex gap-2">
                   <button
                     onclick="openRenameModal('${p.name}')"
                     class="flex-1 text-center px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-xs text-slate-300"
                   >
-                    Rename
+                    ${t("btn_rename")}
                   </button>
                   <button
                     onclick="openDeleteModal('${p.name}')"
                     class="px-2 py-1.5 rounded bg-slate-800 hover:bg-red-900/50 text-xs text-red-400"
                   >
-                    Delete
+                    ${t("btn_delete")}
                   </button>
                 </div>
               </div>
@@ -788,14 +806,14 @@
                     class="px-2 py-1 rounded text-xs bg-slate-700 hover:bg-blue-600 text-slate-300 hover:text-white transition-colors"
                     title="Transfer to another person"
                   >
-                    Move
+                    ${t("btn_transfer")}
                   </button>
                   <button
                     onclick="deleteImage('${name}', '${img.filename}')"
                     class="px-2 py-1 rounded text-xs bg-slate-700 hover:bg-red-600 text-slate-300 hover:text-white transition-colors"
                     title="Delete this image"
                   >
-                    Del
+                    ${t("btn_delete")}
                   </button>
                 </div>
               </div>
@@ -1317,7 +1335,7 @@
               <input data-field="url" type="text" placeholder="rtsp://..."
                 class="rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm font-mono" />
               <button type="submit"
-                class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-4 py-2 text-sm font-medium">+ Add</button>
+                class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-4 py-2 text-sm font-medium">${t("btn_add_row")}</button>
             </form>`
           : `<form data-add-form data-group="${g.id}" data-mode="channel"
                 class="grid grid-cols-1 md:grid-cols-[1fr_1fr_auto] gap-2 items-start mt-3">
@@ -1326,7 +1344,7 @@
               <input data-field="channel" type="text" placeholder="Channel (e.g. 102)" maxlength="16"
                 class="rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm font-mono" />
               <button type="submit"
-                class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-4 py-2 text-sm font-medium">+ Add</button>
+                class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-4 py-2 text-sm font-medium">${t("btn_add_row")}</button>
             </form>`;
 
         return `
@@ -1342,7 +1360,7 @@
               ${_saveIndicator(`group:${g.id}`)}
               <button type="button" data-group-action="delete"
                 class="rounded bg-slate-800 hover:bg-red-600 text-xs text-red-400 hover:text-white px-2 py-1">
-                Delete group
+                ${t("btn_delete_group")}
               </button>
             </div>
             <div class="p-3">
@@ -1350,9 +1368,9 @@
                 <thead>
                   <tr class="border-b border-slate-800/50 text-slate-400 text-xs">
                     <th class="px-1 py-1 w-6"></th>
-                    <th class="px-2 py-1 text-left w-48">Name</th>
-                    <th class="px-2 py-1 text-left">${isStandalone ? "URL" : "Channel"}</th>
-                    <th class="px-2 py-1 text-right w-44">Actions</th>
+                    <th class="px-2 py-1 text-left w-48">${t("col_name")}</th>
+                    <th class="px-2 py-1 text-left">${isStandalone ? t("col_url") : t("col_channel")}</th>
+                    <th class="px-2 py-1 text-right w-44">${t("col_actions")}</th>
                   </tr>
                 </thead>
                 <tbody>${camRows}</tbody>
@@ -1404,9 +1422,9 @@
           <td class="px-2 py-1 text-right whitespace-nowrap">
             ${_saveIndicator(`cam:${c.id}`)}
             <button type="button" data-cam-action="test"
-              class="ml-1 px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-medium">Test</button>
+              class="ml-1 px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-medium">${t("btn_test")}</button>
             <button type="button" data-cam-action="delete"
-              class="ml-1 px-2 py-1 rounded bg-slate-800 hover:bg-red-600 text-xs text-red-400 hover:text-white">Delete</button>
+              class="ml-1 px-2 py-1 rounded bg-slate-800 hover:bg-red-600 text-xs text-red-400 hover:text-white">${t("btn_delete")}</button>
           </td>
         </tr>`;
       }
@@ -1743,7 +1761,7 @@
           errEl.classList.remove("hidden");
         } finally {
           btn.disabled = false;
-          btn.textContent = "Add Camera";
+          btn.textContent = t("modal_add_camera_title");
         }
       }
 

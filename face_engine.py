@@ -305,7 +305,7 @@ class FaceEngine:
         # Save an unknown after they've been tracked continuously for this
         # many seconds. Time-based (not detection-count-based) so cadence
         # changes / lock contention don't affect when capture fires.
-        self._unknown_capture_min_seconds = 5.0
+        self._unknown_capture_min_seconds = 3.0
         self._unknown_max_auto = 150  # max unknown_N folders
         # After an unknown_N is created, keep adding sample images while
         # the same track is still in frame, up to this cap. More samples
