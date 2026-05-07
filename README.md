@@ -135,7 +135,7 @@ You can also take or upload images via the web UI, or let auto-capture create en
 python app.py
 ```
 
-Open http://127.0.0.1:5000
+Open http://127.0.0.1:5001
 
 > The engine does **not** auto-start. Press **Start** in the UI.
 > Multi-camera grid mode is the default if a saved grid config exists.
@@ -232,7 +232,7 @@ python3 -c "import db; print(db.clear_all_data(), 'visits deleted')"
 If the server is running, you can also call the API directly:
 
 ```bash
-curl -X POST http://localhost:5000/api/history/clear
+curl -X POST http://localhost:5001/api/history/clear
 ```
 
 ## Troubleshooting

@@ -69,6 +69,19 @@ CREATE INDEX IF NOT EXISTS idx_visits_person     ON visits (person_name);
 CREATE INDEX IF NOT EXISTS idx_visits_location   ON visits (location_id);
 CREATE INDEX IF NOT EXISTS idx_visits_first_seen ON visits (first_seen);
 CREATE INDEX IF NOT EXISTS idx_visits_open       ON visits (person_name, location_id) WHERE NOT ended;
+
+CREATE TABLE IF NOT EXISTS people (
+    name        TEXT PRIMARY KEY,
+    section     TEXT NOT NULL DEFAULT '',
+    branch      TEXT NOT NULL DEFAULT 'Riyadh',
+    email       TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS sections (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    name    TEXT NOT NULL UNIQUE,
+    manager TEXT NOT NULL DEFAULT ''
+);
 """
 
 _PG_SCHEMA = """
@@ -106,6 +119,19 @@ CREATE INDEX IF NOT EXISTS idx_visits_person     ON visits (person_name);
 CREATE INDEX IF NOT EXISTS idx_visits_location   ON visits (location_id);
 CREATE INDEX IF NOT EXISTS idx_visits_first_seen ON visits (first_seen);
 CREATE INDEX IF NOT EXISTS idx_visits_open       ON visits (person_name, location_id) WHERE NOT ended;
+
+CREATE TABLE IF NOT EXISTS people (
+    name        TEXT PRIMARY KEY,
+    section     TEXT NOT NULL DEFAULT '',
+    branch      TEXT NOT NULL DEFAULT 'Riyadh',
+    email       TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS sections (
+    id      SERIAL PRIMARY KEY,
+    name    TEXT NOT NULL UNIQUE,
+    manager TEXT NOT NULL DEFAULT ''
+);
 """
 
 
@@ -163,6 +189,22 @@ def init_db(dsn=None):
                     cur.execute("UPDATE visits SET branch = 'Riyadh' WHERE branch IS NULL")
                 except Exception:
                     pass
+                try:
+                    cur.execute("CREATE TABLE IF NOT EXISTS people (name TEXT PRIMARY KEY, section TEXT NOT NULL DEFAULT '', branch TEXT NOT NULL DEFAULT 'Riyadh', email TEXT NOT NULL DEFAULT '')")
+                except Exception:
+                    pass
+                try:
+                    cur.execute("ALTER TABLE people ADD COLUMN email TEXT NOT NULL DEFAULT ''")
+                except Exception:
+                    pass
+                try:
+                    cur.execute("CREATE TABLE IF NOT EXISTS sections (id SERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, manager TEXT NOT NULL DEFAULT '')")
+                except Exception:
+                    pass
+                try:
+                    cur.execute("ALTER TABLE sections ADD COLUMN manager TEXT NOT NULL DEFAULT ''")
+                except Exception:
+                    pass
             _backend = "postgres"
             log.info("Database initialised (PostgreSQL)")
             return
@@ -207,6 +249,26 @@ def init_db(dsn=None):
             pass  # column already exists
         try:
             conn.execute("UPDATE visits SET branch = 'Riyadh' WHERE branch IS NULL")
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS people (name TEXT PRIMARY KEY, section TEXT NOT NULL DEFAULT '', branch TEXT NOT NULL DEFAULT 'Riyadh', email TEXT NOT NULL DEFAULT '')")
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE people ADD COLUMN email TEXT NOT NULL DEFAULT ''")
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS sections (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, manager TEXT NOT NULL DEFAULT '')")
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE sections ADD COLUMN manager TEXT NOT NULL DEFAULT ''")
             conn.commit()
         except Exception:
             pass
@@ -717,3 +779,148 @@ def clear_all_data():
         visit_count = cur.rowcount
         cur.execute("DELETE FROM sessions")
     return visit_count
+
+
+# ---------------------------------------------------------------------------
+# People metadata
+# ---------------------------------------------------------------------------
+
+def get_person_meta(name):
+    """Return {name, section, branch} for a person, or None if not found."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    with _cursor() as cur:
+        cur.execute(f"SELECT name, section, branch FROM people WHERE name = {ph}", (name,))
+        row = cur.fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def upsert_person_meta(name, section=None, branch=None, email=None):
+    """Insert or update section/branch/email for a person."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    existing = get_person_meta(name)
+    if existing is None:
+        section = section if section is not None else ""
+        branch = branch if branch is not None else "Riyadh"
+        email = email if email is not None else ""
+        with _cursor(commit=True) as cur:
+            cur.execute(
+                f"INSERT INTO people (name, section, branch, email) VALUES ({ph},{ph},{ph},{ph})",
+                (name, section, branch, email),
+            )
+    else:
+        updates, params = [], []
+        if section is not None:
+            updates.append(f"section = {ph}"); params.append(section)
+        if branch is not None:
+            updates.append(f"branch = {ph}"); params.append(branch)
+        if email is not None:
+            updates.append(f"email = {ph}"); params.append(email)
+        if updates:
+            params.append(name)
+            with _cursor(commit=True) as cur:
+                cur.execute(f"UPDATE people SET {', '.join(updates)} WHERE name = {ph}", params)
+
+
+def rename_person_meta(old_name, new_name):
+    """Rename a person row in the people table."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    with _cursor(commit=True) as cur:
+        cur.execute(f"UPDATE people SET name = {ph} WHERE name = {ph}", (new_name, old_name))
+
+
+def delete_person_meta(name):
+    """Remove a person's metadata row."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    with _cursor(commit=True) as cur:
+        cur.execute(f"DELETE FROM people WHERE name = {ph}", (name,))
+
+
+def get_all_people_meta():
+    """Return list of {name, section, branch, email} for all people with metadata."""
+    with _cursor() as cur:
+        cur.execute("SELECT name, section, branch, email FROM people ORDER BY name")
+        return _rows_to_dicts(cur.fetchall())
+
+
+def get_branch_members(branch):
+    """Return list of person names assigned to a branch."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    with _cursor() as cur:
+        cur.execute(f"SELECT name FROM people WHERE branch = {ph} ORDER BY name", (branch,))
+        return [r["name"] for r in _rows_to_dicts(cur.fetchall())]
+
+
+# ---------------------------------------------------------------------------
+# Sections
+# ---------------------------------------------------------------------------
+
+def get_all_sections():
+    """Return list of {id, name, manager} for all sections."""
+    with _cursor() as cur:
+        cur.execute("SELECT id, name, manager FROM sections ORDER BY name")
+        return _rows_to_dicts(cur.fetchall())
+
+
+def set_section_manager(section_name, person_name):
+    """Set or clear the manager for a section. Pass '' to clear."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    with _cursor(commit=True) as cur:
+        cur.execute(f"UPDATE sections SET manager = {ph} WHERE name = {ph}", (person_name, section_name))
+
+
+def create_section(name):
+    """Insert a new section. Returns {id, name} or raises on duplicate."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    if _backend == "postgres":
+        with _cursor(commit=True) as cur:
+            cur.execute(
+                "INSERT INTO sections (name) VALUES (%s) RETURNING id, name",
+                (name,),
+            )
+            return _row_to_dict(cur.fetchone())
+    else:
+        with _cursor(commit=True) as cur:
+            cur.execute("INSERT INTO sections (name) VALUES (?)", (name,))
+            new_id = cur.lastrowid
+        return {"id": new_id, "name": name}
+
+
+def delete_section(name):
+    """Delete a section and clear people.section for anyone in it."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    with _cursor(commit=True) as cur:
+        cur.execute(f"UPDATE people SET section = '' WHERE section = {ph}", (name,))
+        cur.execute(f"DELETE FROM sections WHERE name = {ph}", (name,))
+
+
+def get_section_members(section_name):
+    """Return list of person names assigned to a section."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    with _cursor() as cur:
+        cur.execute(f"SELECT name FROM people WHERE section = {ph} ORDER BY name", (section_name,))
+        return [r["name"] for r in _rows_to_dicts(cur.fetchall())]
+
+
+def assign_person_section(person_name, section_name):
+    """Set people.section = section_name for a person (upsert if missing)."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    existing = get_person_meta(person_name)
+    if existing is None:
+        with _cursor(commit=True) as cur:
+            cur.execute(
+                f"INSERT INTO people (name, section, branch, email) VALUES ({ph},{ph},{ph},{ph})",
+                (person_name, section_name, "Riyadh", ""),
+            )
+    else:
+        with _cursor(commit=True) as cur:
+            cur.execute(
+                f"UPDATE people SET section = {ph} WHERE name = {ph}",
+                (section_name, person_name),
+            )
+
+
+def remove_person_section(person_name):
+    """Clear people.section for a person."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    with _cursor(commit=True) as cur:
+        cur.execute(f"UPDATE people SET section = '' WHERE name = {ph}", (person_name,))

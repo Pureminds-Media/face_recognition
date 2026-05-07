@@ -69,6 +69,13 @@ const TRANSLATIONS = {
     people_enrolled:"people enrolled", people_known:"known", people_auto:"auto-captured",
     folder_hint:"Folder names are sanitized (letters/numbers/_-).",
     branch_riyadh:"Riyadh", branch_egypt:"Egypt",
+    label_section:"Section",
+    nav_sections:"Sections",
+    no_sections:"No sections yet. Create one above.",
+    no_members:"No members",
+    no_section:"No section",
+    btn_assign:"Assign",
+    nav_email:"Email",
   },
   ar: {
     /* ── nav / header ── */
@@ -138,6 +145,13 @@ const TRANSLATIONS = {
     people_enrolled:"شخص مسجل", people_known:"معروف", people_auto:"مُلتقط تلقائياً",
     folder_hint:"أسماء المجلدات تُعقَّم (حروف/أرقام/_-).",
     branch_riyadh:"الرياض", branch_egypt:"مصر",
+    label_section:"القسم",
+    nav_sections:"الأقسام",
+    no_sections:"لا توجد أقسام. أنشئ قسماً أعلاه.",
+    no_members:"لا يوجد أعضاء",
+    no_section:"بدون قسم",
+    btn_assign:"إضافة",
+    nav_email:"البريد الإلكتروني",
   }
 };
 

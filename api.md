@@ -8,7 +8,7 @@ can do too.
 
 ## 1. Hosting & exposing the server
 
-The server runs on `http://localhost:5000` by default (`python app.py`).
+The server runs on `http://localhost:5001` by default (`python app.py`).
 
 ### 1.1 Install ngrok
 
@@ -63,7 +63,7 @@ python app.py
 In a second terminal:
 
 ```bash
-ngrok http 5000
+ngrok http 5001
 ```
 
 ngrok prints a public URL like `https://1a2b-3c4d.ngrok-free.app`. The
@@ -75,7 +75,7 @@ Free-plan URLs change every restart. To pin a stable hostname:
 
 - **Paid plan**: reserve a domain at
   <https://dashboard.ngrok.com/cloud-edge/domains>, then run
-  `ngrok http --domain=your-app.ngrok.app 5000`.
+  `ngrok http --domain=your-app.ngrok.app 5001`.
 - **Free plan**: each restart, update the remote client's base URL with
   the new hostname.
 
@@ -90,7 +90,7 @@ agent:
 tunnels:
   face-recognition:
     proto: http
-    addr: 5000
+    addr: 5001
     # domain: your-app.ngrok.app   # uncomment on paid plan
 ```
 
@@ -158,7 +158,7 @@ development only.
 
 | Method | Path                                        | Description                                                 |
 | ------ | ------------------------------------------- | ----------------------------------------------------------- |
-| GET    | `/api/people`                               | List of `{name, count, thumbnail_url}`.                     |
+| GET    | `/api/people`                               | List of `{name, count, thumbnail_url, section, branch}`.    |
 | POST   | `/api/upload_face`                          | Upload one face image. `multipart/form-data`: `file`, `name` (existing or new). |
 | POST   | `/api/rename_person`                        | Body: `{old_name, new_name}`. Renames folder and DB visits. |
 | DELETE | `/api/person/<name>`                        | Delete a person and all their images.                       |
@@ -169,6 +169,20 @@ development only.
 | POST   | `/api/person/<name>/images/bulk_transfer`   | Body: `{target, filenames: [...]}`. Bulk move.              |
 | POST   | `/api/people/merge`                         | Body: `{sources: [...], target}`. Merge folders + DB visits. |
 | POST   | `/api/reload_faces`                         | Force a synchronous embedding rebuild.                      |
+| GET    | `/api/person/<name>/meta`                   | Returns `{name, section, branch}` for a person.            |
+| POST   | `/api/person/<name>/meta`                   | Body: `{section?, branch?}`. Update section and/or branch. Auto-creates the row if missing. |
+
+### 4.2.1 Sections
+
+Sections are named groups (e.g. "IT", "HR") that people are assigned to. Managed from **Settings → Sections**.
+
+| Method | Path                                        | Description                                                 |
+| ------ | ------------------------------------------- | ----------------------------------------------------------- |
+| GET    | `/api/sections`                             | List all sections. Returns `{sections: [{name, members: [...names]}]}`. |
+| POST   | `/api/sections`                             | Body: `{name}`. Create a new section. Returns `{ok: true}`. |
+| DELETE | `/api/sections/<name>`                      | Delete a section. Does NOT delete the assigned people; it clears their `section` field. |
+| POST   | `/api/sections/<name>/assign`               | Body: `{person}`. Assign a person to this section (replaces any existing section). Returns `{ok: true}`. |
+| POST   | `/api/sections/<name>/unassign`             | Body: `{person}`. Remove a person from this section (clears their section field). Returns `{ok: true}`. |
 
 ### 4.3 Cameras
 
@@ -214,7 +228,7 @@ All analytics endpoints accept an optional `?branch=<name>` query parameter. Whe
 
 | Method | Path | Description |
 | ------ | ---- | ----------- |
-| GET | `/api/analytics/present_absent?date=YYYY-MM-DD` | Returns `{present: [...names], absent: [...names]}` for a given day. `present` = known persons with at least one visit on that day (filtered by `?branch=` if provided). `absent` = persons who have visited this branch at least once historically but had no visit that day. Without a branch filter, `absent` falls back to all enrolled known folders (`faces/`) with no visit that day. Used by the Present/Absent tile modals. |
+| GET | `/api/analytics/present_absent?date=YYYY-MM-DD` | Returns `{present: [...names], absent: [...names]}` for a given day. `present` = known persons with at least one visit on that day (filtered by `?branch=` if provided). `absent` = persons assigned to this branch in the `people` table with no visit that day. Without a branch filter, `absent` falls back to all enrolled known folders (`faces/`) with no visit that day. Used by the Present/Absent tile modals. |
 | GET | `/api/analytics/summary?date=YYYY-MM-DD` | Single-request summary tiles for a given day (default today). Returns `{peak_hour, present_today, absent_today, unknowns_today}`. `peak_hour` is the local-time hour bucket with the most distinct people spotted (e.g. `"09:00 – 10:00"`), or `null` if no data. `present_today` is the count of distinct known persons with at least one visit today (branch-filtered). `absent_today` is the count of persons who have visited this branch historically but had no visit today; without a branch filter, counts all enrolled known folders minus present. `unknowns_today` is the count of `unknown_N` folders in `faces/` — unresolved auto-captured persons regardless of when they were last seen. |
 | GET | `/api/analytics/earliest?date=YYYY-MM-DD` | Top 10 employees with the earliest first arrival on a given day (default today). Add `&order=latest` to get the 10 latest arrivals instead. Add `&shift=morning` (04:00–16:00 local) or `&shift=night` (16:00–04:00 local) to restrict to a shift window. Night-shift results automatically exclude anyone who already appeared in the morning window (each person in at most one shift). Returns `{person_name, arrival_time}` rows. Excludes `unknown_N` names. The in-tree UI fetches both earliest and latest in parallel on load and caches them; the Earliest/Latest toggle switches between views without a new request. |
 | GET | `/api/analytics/longest?period=day\|week\|month\|year` | Top 10 employees with the longest total on-camera duration for the period (calendar-aligned: week = Sun–Sat, month = 1st–last, year = Jan–Dec). Uses `visible_duration` when recorded, falls back to `last_seen − first_seen`. Returns `{person_name, total_secs, duration_fmt}` sorted descending. The in-tree UI renders this as an interactive horizontal bar chart (Chart.js). |

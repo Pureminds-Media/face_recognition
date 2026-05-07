@@ -10,18 +10,32 @@ the heavy DeepFace / OpenCV imports and so CUDA contexts are clean.
 
 from __future__ import annotations
 
+import faulthandler
 import logging
 import os
+import sys
 import threading
 import time
 import uuid
 
+# Dump a C-level traceback to stderr on SIGSEGV/SIGFPE/SIGBUS.
+# This survives the crash and appears in the parent's log so we can
+# see exactly which thread and C frame caused the segfault.
+faulthandler.enable(file=sys.stderr, all_threads=True)
+
 
 def run(conn, state, engine_kwargs, log_level=logging.INFO):
-    logging.basicConfig(
-        level=log_level,
-        format="[engine] %(asctime)s %(levelname)s %(message)s",
-    )
+    _fmt = "[engine] %(asctime)s %(levelname)s %(message)s"
+    logging.basicConfig(level=log_level, format=_fmt)
+
+    # Also write engine logs to the same rotating file as the web process.
+    from logging.handlers import RotatingFileHandler as _RFH
+    os.makedirs("logs", exist_ok=True)
+    _fh = _RFH("logs/app.log", maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    _fh.setFormatter(logging.Formatter(_fmt))
+    _fh.setLevel(log_level)
+    logging.getLogger().addHandler(_fh)
+
     log = logging.getLogger("engine_runner")
 
     # Imports happen in the child so the parent stays light.

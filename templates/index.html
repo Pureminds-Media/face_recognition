@@ -208,12 +208,29 @@
                 <img id="videoFeed" class="w-full block" src="" alt="video" style="transform-origin: 0 0; cursor: default; will-change: transform;" />
                 <div id="gridOverlay" class="hidden absolute inset-0 pointer-events-auto"></div>
 
+                <!-- Offline overlay: shown when the current camera has no frames -->
+                <div id="camOfflineOverlay" class="hidden absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/70 pointer-events-auto">
+                  <svg class="w-10 h-10 text-slate-400 mb-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M17 17H7a2 2 0 0 1-2-2V7"/>
+                    <path d="M21 15V7a2 2 0 0 0-2-2H9"/>
+                    <line x1="2" y1="2" x2="22" y2="22"/>
+                  </svg>
+                  <p class="text-slate-300 text-sm font-medium mb-1" id="camOfflineLabel">Camera offline</p>
+                  <button id="camReconnectBtn" type="button"
+                    class="px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 active:bg-amber-700 text-white text-sm font-semibold transition flex items-center gap-2">
+                    <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                      <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+                    </svg>
+                    Reconnect
+                  </button>
+                </div>
+
                 <!-- Carousel controls (single-camera mode only) -->
                 <button
                   id="carouselPrev"
                   type="button"
                   aria-label="Previous camera"
-                  class="hidden absolute left-2 top-1/2 -translate-y-1/2 z-10 rounded-full bg-black/55 hover:bg-black/75 text-white w-10 h-10 flex items-center justify-center transition"
+                  class="hidden absolute left-2 top-1/2 -translate-y-1/2 z-30 rounded-full bg-black/55 hover:bg-black/75 text-white w-10 h-10 flex items-center justify-center transition"
                 >
                   <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
                 </button>
@@ -221,7 +238,7 @@
                   id="carouselNext"
                   type="button"
                   aria-label="Next camera"
-                  class="hidden absolute right-2 top-1/2 -translate-y-1/2 z-10 rounded-full bg-black/55 hover:bg-black/75 text-white w-10 h-10 flex items-center justify-center transition"
+                  class="hidden absolute right-2 top-1/2 -translate-y-1/2 z-30 rounded-full bg-black/55 hover:bg-black/75 text-white w-10 h-10 flex items-center justify-center transition"
                 >
                   <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
                 </button>
@@ -2163,6 +2180,88 @@
         setTimeout(setupGridClickable, 100);
         return result;
       };
+
+      // ---- Camera offline overlay ----
+      (function () {
+        const overlay    = document.getElementById("camOfflineOverlay");
+        const label      = document.getElementById("camOfflineLabel");
+        const subLabel   = document.getElementById("camOfflineSubLabel");
+        const reconnBtn  = document.getElementById("camReconnectBtn");
+        if (!overlay || !reconnBtn) return;
+
+        let _camStatuses = {};
+        let _reconnecting = false;
+
+        function _currentSource() {
+          // The confirmed source wins; fall back to the carousel device.
+          if (_confirmedViewerSrc) return _confirmedViewerSrc;
+          const cam = singleCamDevices[singleCamIndex];
+          return cam ? String(cam.value) : null;
+        }
+
+        function _updateOverlay() {
+          const src = _currentSource();
+          if (!src) { overlay.classList.add("hidden"); return; }
+          const st = _camStatuses[src];
+          if (!st) { overlay.classList.add("hidden"); return; }
+          if (st.alive) {
+            overlay.classList.add("hidden");
+            _reconnecting = false;
+            reconnBtn.disabled = false;
+            reconnBtn.textContent = "";
+            reconnBtn.innerHTML = `<svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Reconnect`;
+          } else {
+            overlay.classList.remove("hidden");
+            if (st.stale_secs !== null && st.stale_secs > 0) {
+            }
+            if (st.reconnecting) {
+            }
+          }
+        }
+
+        async function _pollStatuses() {
+          try {
+            const r = await fetch("/api/camera/statuses");
+            if (r.ok) _camStatuses = await r.json();
+          } catch (_) {}
+          _updateOverlay();
+        }
+
+        reconnBtn.addEventListener("click", async () => {
+          if (_reconnecting) return;
+          const src = _currentSource();
+          if (!src) return;
+          _reconnecting = true;
+          reconnBtn.disabled = true;
+          reconnBtn.innerHTML = `<svg class="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Reconnecting…`;
+          try {
+            await fetch("/api/camera/reconnect", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ source: src }),
+            });
+          } catch (_) {}
+          // Re-enable after 3s so a failed attempt resets the 2-min timer
+          // but the button isn't immediately clickable again.
+          setTimeout(() => {
+            _reconnecting = false;
+            reconnBtn.disabled = false;
+            reconnBtn.innerHTML = `<svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Reconnect`;
+          }, 3000);
+        });
+
+        // Poll every 5s; also re-check whenever the user switches camera.
+        setInterval(_pollStatuses, 5000);
+        _pollStatuses();
+
+        // Re-check overlay whenever switchCamera resolves.
+        const _origSwitch2 = window.switchCamera;
+        window.switchCamera = async function (source) {
+          const res = await _origSwitch2(source);
+          setTimeout(_updateOverlay, 500);
+          return res;
+        };
+      })();
 
       // Keyboard support (fullscreen modal)
       document.addEventListener("keydown", (e) => {

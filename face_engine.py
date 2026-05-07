@@ -220,12 +220,14 @@ class FaceEngine:
         self._face_app_pool: list = []  # list of FaceAnalysis instances
         self._face_app_sema = None      # threading.Semaphore guarding pool size
         self.known_embeddings = []
+        self._embeddings_lock = threading.Lock()
         self.tracks = []
         self.in_q = Queue(maxsize=1)
         self.out_q = Queue(maxsize=1)
         self.stop_evt = threading.Event()
         self._cap = None
         self._grid_workers = {}
+        self._grid_workers_lock = threading.Lock()
         self._grid_sources = []
         # Optional friendly-name lookup for grid tile labels:
         # { "<source-string>": "<friendly name>" }
@@ -342,9 +344,11 @@ class FaceEngine:
         self._janitor_stop = threading.Event()
 
     # ---------- public ----------
-    # Number of parallel InsightFace instances. Each costs ~300 MB VRAM.
-    # 4 lets up to 4 cameras run detection simultaneously on the GPU.
-    INFERENCE_POOL_SIZE = 6
+    # Number of parallel InsightFace instances. buffalo_l costs ~1.2–1.5 GB VRAM
+    # each in practice. With 23 NVDEC streams also consuming VRAM, 6 instances
+    # (~9 GB) leaves enough headroom on a 32 GB card. Raise via env var only
+    # after confirming VRAM stays below ~24 GB under full load.
+    INFERENCE_POOL_SIZE = int(os.getenv("INFERENCE_POOL_SIZE", "6"))
 
     def _preload_inference_models(self):
         """Build a pool of independent InsightFace ONNX sessions on GPU.
@@ -477,7 +481,9 @@ class FaceEngine:
 
                 # 3) _unknown_pending per-worker: entries for tracks that died
                 #    leave a stale id(track) key that never matches again.
-                for worker in list(getattr(self, "_grid_workers", {}).values()):
+                with self._grid_workers_lock:
+                    _gw_snap = list(self._grid_workers.values())
+                for worker in _gw_snap:
                     try:
                         pending = worker.get("unknown_pending")
                         if not pending:
@@ -515,7 +521,9 @@ class FaceEngine:
                 # 5) Dead-thread detection: respawn capture/detect threads
                 #    that haven't ticked their heartbeat in 30 seconds.
                 THREAD_STALE_SECS = 30.0
-                for src, worker in list(getattr(self, "_grid_workers", {}).items()):
+                with self._grid_workers_lock:
+                    _gw_snap = list(self._grid_workers.items())
+                for src, worker in _gw_snap:
                     if worker.get("stop_evt") and worker["stop_evt"].is_set():
                         continue
                     try:
@@ -921,6 +929,12 @@ class FaceEngine:
                     rec["_queued_ahead"] = max(0, rec.get("_queued_ahead", 0) - count)
                 except Exception:
                     rec["_queued_ahead"] = max(0, rec.get("_queued_ahead", 0) - count)
+            # Release the writer here — after the last write — so stop_footage
+            # never calls release() concurrently with an in-progress write().
+            try:
+                rec["writer"].release()
+            except Exception:
+                pass
 
         rec = {
             "cam": cam_key,
@@ -1001,10 +1015,8 @@ class FaceEngine:
         # written before the file is closed.
         rec["write_q"].put(None)
         rec["write_thread"].join(timeout=10.0)
-        try:
-            rec["writer"].release()
-        except Exception:
-            pass
+        # writer.release() is called by _writer_thread after it drains the
+        # queue, so it is never concurrent with a write() call.
         visible_secs = rec["total_frames"] / max(1, rec["fps"])
         return rec["fname"], visible_secs
 
@@ -1029,10 +1041,7 @@ class FaceEngine:
             rec["write_q"].put(None)
         for vid, rec in recs:
             rec["write_thread"].join(timeout=10.0)
-            try:
-                rec["writer"].release()
-            except Exception:
-                pass
+            # writer.release() is owned by _writer_thread — do not call here.
             visible_secs = rec["total_frames"] / max(1, rec["fps"])
             results[vid] = (rec["fname"], visible_secs)
         return results
@@ -1696,7 +1705,9 @@ class FaceEngine:
         def _bg_reload():
             try:
                 self.reload_faces()
-                print(f"[auto-capture] reload_faces() done, {len(self.known_embeddings)} people")
+                with self._embeddings_lock:
+                    _n = len(self.known_embeddings)
+                print(f"[auto-capture] reload_faces() done, {_n} people")
             except Exception as e:
                 print(f"[auto-capture] reload_faces() error: {e}")
         threading.Thread(target=_bg_reload, daemon=True).start()
@@ -1765,8 +1776,10 @@ class FaceEngine:
         # promoted to unknown_N can drift onto a different person (the
         # detector treats any "unknown" detection as compatible with an
         # unknown_N track) and contaminate the folder with someone else.
+        with self._embeddings_lock:
+            _emb_snapshot = list(self.known_embeddings)
         template = next(
-            (emb for nm, emb in self.known_embeddings if nm == name),
+            (emb for nm, emb in _emb_snapshot if nm == name),
             None,
         )
         if template is None:
@@ -1962,9 +1975,10 @@ class FaceEngine:
 
         self._release_face_app(_reload_app)
 
-        prev_names = {name for name, _ in self.known_embeddings}
-        new_names = {name for name, _ in known}
-        self.known_embeddings = known
+        with self._embeddings_lock:
+            prev_names = {name for name, _ in self.known_embeddings}
+            new_names = {name for name, _ in known}
+            self.known_embeddings = known
 
         # Auto-wipe DB visits for persons whose folder is now empty/gone.
         # This fires when the user moves the last image out of a folder —
@@ -2052,9 +2066,11 @@ class FaceEngine:
                 continue
             emb_live = l2norm(emb)
 
+            with self._embeddings_lock:
+                _emb_snapshot = list(self.known_embeddings)
             name = "unknown"
             best = 1.0
-            for known_name, emb_known in self.known_embeddings:
+            for known_name, emb_known in _emb_snapshot:
                 d = cosine_distance(emb_live, emb_known)
                 if d < best:
                     best = d
@@ -2345,8 +2361,7 @@ class FaceEngine:
         with _cf.ThreadPoolExecutor(max_workers=min(len(real_sources), 16)) as _ex:
             for src_key, cap in _ex.map(_open_one, real_sources):
                 cap_results[src_key] = cap
-                if cap is not None:
-                    self._loading_opened += 1
+                self._loading_opened += 1  # count every attempt, success or failure
 
         _detect_period = max(0.25, float(self.detect_every))
         for source in unique_sources:
@@ -2408,7 +2423,8 @@ class FaceEngine:
                 "Check that at least one configured camera is connected."
             )
 
-        self._grid_workers = workers
+        with self._grid_workers_lock:
+            self._grid_workers = workers
         self._grid_sources = ordered_sources
 
         for source in self._grid_sources:
@@ -2421,6 +2437,38 @@ class FaceEngine:
 
         self._grid_render_t = threading.Thread(target=self._grid_render_loop, daemon=True)
         self._grid_render_t.start()
+
+    def get_camera_statuses(self) -> dict:
+        """Return a dict of {source: {"alive": bool, "reconnecting": bool, "attempts": int}}."""
+        now = time.monotonic()
+        result = {}
+        with self._grid_workers_lock:
+            workers_snap = list(self._grid_workers.items())
+        for src, w in workers_snap:
+            with w["lock"]:
+                last_good = float(w.get("last_good_frame_t", 0.0))
+                reconnecting = bool(w.get("_reconnecting", False))
+                attempts = int(w.get("_reconnect_attempts", 0))
+            stale_secs = now - last_good if last_good > 0 else None
+            alive = last_good > 0 and (now - last_good) < 10.0
+            result[src] = {"alive": alive, "reconnecting": reconnecting, "attempts": attempts,
+                           "stale_secs": round(stale_secs, 1) if stale_secs is not None else None}
+        return result
+
+    def force_reconnect_camera(self, source: str) -> bool:
+        """Immediately trigger a reconnect for *source*, bypassing backoff.
+
+        Sets a flag the capture loop checks so it resets its backoff state
+        and triggers a reconnect as if it were the first attempt.  Returns
+        True if the worker was found, False if *source* is not in the grid.
+        """
+        with self._grid_workers_lock:
+            w = self._grid_workers.get(source)
+        if w is None:
+            return False
+        with w["lock"]:
+            w["_force_reconnect"] = True
+        return True
 
     def _cleanup_grid_mode(self):
         # 1) Signal every worker to exit.
@@ -2475,7 +2523,8 @@ class FaceEngine:
                 _log.warning("_cleanup_grid: render_thread zombie")
             self._grid_render_t = None
 
-        self._grid_workers = {}
+        with self._grid_workers_lock:
+            self._grid_workers = {}
         self._grid_sources = []
         self._grid_qr_rr_idx = 0
         self._grid_stop_evt.clear()
@@ -2530,10 +2579,15 @@ class FaceEngine:
         cap = worker["cap"]
         _no_frame_since = None  # monotonic time of first consecutive failure
         _RECONNECT_SECS = 8.0   # reopen after this many seconds with no frames
+        _reconnect_attempts = 0  # consecutive failed reconnects for backoff
+        _last_reconnect_t = 0.0  # monotonic time of last reconnect trigger
+        _stable_since = None    # monotonic time camera first became stable after reconnect
+        _STABLE_RESET_SECS = 30.0  # must be alive this long before backoff resets
 
-        while not self.stop_evt.is_set() and not self._grid_stop_evt.is_set() and not worker["stop_evt"].is_set():
+        while not self._grid_stop_evt.is_set() and not worker["stop_evt"].is_set():
             # Pick up replacement cap if reconnect thread swapped it.
-            current_cap = worker.get("cap", cap)
+            with worker["lock"]:
+                current_cap = worker.get("cap", cap)
             if current_cap is not cap:
                 cap = current_cap
             ok, frame = cap.read()
@@ -2545,33 +2599,89 @@ class FaceEngine:
                 if _no_frame_since is None:
                     _no_frame_since = now
                 elif (now - _no_frame_since) >= _RECONNECT_SECS:
+                    # Manual reconnect: reset backoff so this counts as attempt 1.
+                    with worker["lock"]:
+                        forced = worker.pop("_force_reconnect", False)
+                    if forced:
+                        _reconnect_attempts = 0
+                        _last_reconnect_t = 0.0
+                    # First attempt: 8s. Subsequent attempts: 2 min flat.
+                    _backoff = _RECONNECT_SECS if _reconnect_attempts == 0 else 120.0
+                    if (now - _last_reconnect_t) < _backoff:
+                        time.sleep(0.05)
+                        continue
+                    # Skip if a reconnect is already in flight for this camera.
+                    with worker["lock"]:
+                        already = worker.get("_reconnecting", False)
+                        if not already:
+                            worker["_reconnecting"] = True
+                    if already:
+                        time.sleep(0.05)
+                        continue
                     # Stream dead — reconnect in a background thread so we
                     # don't block the engine command loop (PyAV open has a
                     # 10s timeout that would freeze all camera switches).
                     source = worker.get("source")
                     import logging as _log
                     _log.getLogger("face_engine").warning(
-                        "capture: no frames for %.0fs on %s — reconnecting", now - _no_frame_since, source
+                        "capture: no frames for %.0fs on %s — reconnecting (attempt %d, backoff %.0fs)",
+                        now - _no_frame_since, source, _reconnect_attempts + 1, _backoff,
                     )
                     _no_frame_since = None  # reset so we don't re-trigger immediately
+                    _last_reconnect_t = now
+                    _stable_since = None    # camera is dead — forget any stability window
                     old_cap = cap
 
-                    def _reconnect(w, old, src):
-                        try: old.release()
-                        except Exception: pass
+                    def _reconnect(w, old, src, _attempts_ref={"n": _reconnect_attempts}):
+                        import hw_capture as _hwc
+                        success = False
                         try:
-                            new_cap = _hw_open(src)
-                            w["cap"] = new_cap
-                            _log.getLogger("face_engine").info("reconnected %s", src)
-                        except Exception as _e:
-                            _log.getLogger("face_engine").warning("reconnect failed for %s: %s", src, _e)
+                            with _hwc._nvdec_reconnect_sem:
+                                # Enforce a global minimum gap between consecutive
+                                # NVDEC open/close operations to prevent CUDA corruption.
+                                gap = _hwc._NVDEC_RECONNECT_GAP - (time.monotonic() - _hwc._nvdec_last_reconnect_t)
+                                if gap > 0:
+                                    time.sleep(gap)
+                                try: old.release()
+                                except Exception: pass
+                                try:
+                                    new_cap = _hw_open(src)
+                                    _hwc._nvdec_last_reconnect_t = time.monotonic()
+                                    with w["lock"]:
+                                        w["cap"] = new_cap
+                                        w["_reconnect_attempts"] = 0
+                                    _log.getLogger("face_engine").info("reconnected %s", src)
+                                    success = True
+                                except Exception as _e:
+                                    _log.getLogger("face_engine").warning("reconnect failed for %s: %s", src, _e)
+                                finally:
+                                    _hwc._nvdec_last_reconnect_t = time.monotonic()
+                        finally:
+                            with w["lock"]:
+                                if not success:
+                                    w["_reconnect_attempts"] = _attempts_ref["n"] + 1
+                                w["_reconnecting"] = False
 
+                    _reconnect_attempts = worker.get("_reconnect_attempts", _reconnect_attempts) + 1
                     threading.Thread(target=_reconnect, args=(worker, old_cap, source), daemon=True).start()
                     # Keep reading from the old (dead) cap while reconnect runs;
                     # it'll just return (False, None) until the thread swaps it.
                 time.sleep(0.05)
                 continue
             _no_frame_since = None
+            if _reconnect_attempts > 0:
+                # Don't reset backoff immediately — wait until the camera has
+                # been delivering frames steadily for 30s. Cameras that connect
+                # and die within seconds (e.g. "Immediate exit requested") must
+                # still pay the 2-min backoff on the next failure.
+                if _stable_since is None:
+                    _stable_since = now
+                elif now - _stable_since >= _STABLE_RESET_SECS:
+                    _reconnect_attempts = 0
+                    _last_reconnect_t = 0.0
+                    _stable_since = None
+            else:
+                _stable_since = None  # healthy camera, nothing to track
 
             # Reject corrupt frames from NVDEC partial decodes (green-flash frames).
             if self._is_corrupt_frame(frame):
@@ -2609,7 +2719,7 @@ class FaceEngine:
         # 12 frames × 0.3 s detect_every ≈ 3.6 s of patience.
         UNKNOWN_TO_FORGET = 12
         detect_period = max(0.25, float(self.detect_every))
-        while not self.stop_evt.is_set() and not self._grid_stop_evt.is_set() and not worker["stop_evt"].is_set():
+        while not self._grid_stop_evt.is_set() and not worker["stop_evt"].is_set():
             try:
                 _frame_t, tile_frame = worker["frame_q"].get(timeout=0.1)
             except Empty:
@@ -2968,7 +3078,7 @@ class FaceEngine:
         known_reconfirm_secs = min(max(5.0, _detection_cycle * 2.5), 30.0)
 
         frame_interval = 1.0 / max(1, self.out_fps)
-        while not self.stop_evt.is_set() and not self._grid_stop_evt.is_set():
+        while not self._grid_stop_evt.is_set():
             loop_start = time.monotonic()
 
             # Skip the entire render iteration if we're not due for a new

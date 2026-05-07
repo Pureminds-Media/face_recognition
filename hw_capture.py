@@ -38,27 +38,40 @@ log = logging.getLogger(__name__)
 # corrupt internal NVDEC state and cause SIGSEGV.
 _nvdec_lock = threading.Lock()
 
+# Limit concurrent camera reconnects.  Each reconnect does: close old context
+# (joins its reader thread, up to 3 s) then opens a new context.  If multiple
+# cameras fail at the same time the dying reader threads overlap with new
+# context creates even though _nvdec_lock serialises each individual op —
+# the interleaving of live threads is enough to corrupt CUDA state.
+# Serialise all reconnects: concurrent NVDEC open+close pairs (even just two)
+# corrupt CUDA state when unstable cameras cycle rapidly, causing SIGSEGV.
+# One reconnect at a time is slower to recover but eliminates the crash.
+_nvdec_reconnect_sem = threading.Semaphore(1)
+# Monotonic time of the last reconnect completion; enforces a minimum gap
+# between consecutive reconnect operations to avoid back-to-back NVDEC churn.
+_nvdec_last_reconnect_t: float = 0.0
+_NVDEC_RECONNECT_GAP = float(os.getenv("NVDEC_RECONNECT_GAP_SECS", "10.0"))
+
 # Limit concurrent GPU→CPU frame downloads (frame.to_ndarray on NVDEC frames).
-# 23 threads doing simultaneous CUDA memcpy + colour conversion on one NVDEC
-# engine corrupts CUDA state and causes SIGSEGV.  A semaphore of 6 allows
-# enough parallelism while keeping the hardware from being overwhelmed.
+# Each camera's to_ndarray() runs only in its own reader thread, so concurrent
+# transfers == number of cameras actively decoding.  The semaphore caps this to
+# avoid overwhelming a single NVDEC engine.
 # Raise MAX_NVDEC_TRANSFERS in env if you have a high-end GPU with multiple
 # NVDEC engines (e.g. RTX 5090).
 def _max_nvdec_transfers() -> int:
     try:
-        return max(1, int(os.getenv("MAX_NVDEC_TRANSFERS", "6")))
+        return max(1, int(os.getenv("MAX_NVDEC_TRANSFERS", "3")))
     except (ValueError, TypeError):
-        return 6
+        return 3
 
 _nvdec_transfer_sem: Optional[threading.Semaphore] = None
 _nvdec_transfer_sem_lock = threading.Lock()
 
 def _get_transfer_sem() -> threading.Semaphore:
     global _nvdec_transfer_sem
-    if _nvdec_transfer_sem is None:
-        with _nvdec_transfer_sem_lock:
-            if _nvdec_transfer_sem is None:
-                _nvdec_transfer_sem = threading.Semaphore(_max_nvdec_transfers())
+    with _nvdec_transfer_sem_lock:
+        if _nvdec_transfer_sem is None:
+            _nvdec_transfer_sem = threading.Semaphore(_max_nvdec_transfers())
     return _nvdec_transfer_sem
 
 # Map of base FFmpeg codec name → CUVID hardware decoder. PyAV/FFmpeg
@@ -112,22 +125,25 @@ class HwRtspCapture:
         # rtsp_transport=tcp matches OPENCV_FFMPEG_CAPTURE_OPTIONS in app.py
         # and prevents UDP packet loss / NAT issues common on Wi-Fi cams.
         # stimeout caps socket waits so a dead camera fails cleanly.
+        _stimeout = os.getenv("RTSP_CONNECT_TIMEOUT_MS", "2000")
         options = {
             "rtsp_transport": "tcp",
-            "stimeout": "5000000",  # microseconds
+            "stimeout": str(int(_stimeout) * 1000),  # microseconds
             "fflags": "nobuffer",
             "flags": "low_delay",
         }
 
         # Pass an HWAccel object so PyAV/FFmpeg routes decode onto NVDEC.
-        # ``allow_software_fallback=False`` would force CUDA-only; we let
-        # it stay True so a codec the GPU doesn't support falls back to
-        # software inside this same container instead of erroring out.
-        hwaccel = HWAccel(device_type="cuda", allow_software_fallback=True)
+        # allow_software_fallback=False: unsupported codecs raise an exception
+        # which is caught by open_capture() and falls back to cv2 instead.
+        # Keeping it False avoids PyAV allocating both GPU and CPU frame
+        # buffers simultaneously, which roughly doubles VRAM consumption.
+        hwaccel = HWAccel(device_type="cuda", allow_software_fallback=False)
 
+        _av_timeout = int(_stimeout) / 1000.0 + 0.5  # slightly above stimeout
         with _nvdec_lock:
             self._container = av.open(
-                url, options=options, timeout=10.0, hwaccel=hwaccel,
+                url, options=options, timeout=_av_timeout, hwaccel=hwaccel,
             )
             try:
                 stream = self._container.streams.video[0]
@@ -164,7 +180,7 @@ class HwRtspCapture:
         try:
             for frame in self._container.decode(self._stream):
                 if self._stop.is_set():
-                    return
+                    break
                 # NVDEC produces NV12 frames in GPU memory; PyAV
                 # transparently downloads + reformats to BGR via
                 # libswscale. Cheaper than a CPU H.264/H.265 decode.
@@ -181,6 +197,19 @@ class HwRtspCapture:
         except Exception as e:
             log.warning("HwRtspCapture reader error on %s: %s", self._url, e)
         finally:
+            # Close the container from the reader thread so there is no race
+            # between container.close() and container.decode().  FFmpeg frees
+            # the AVFormatContext (including NVDEC CUDA context) in close(); if
+            # another thread calls close() while we are still inside decode() /
+            # av_read_frame() the freed memory causes SIGSEGV.  Closing here,
+            # after decode() has already returned, eliminates that race.
+            # to_ndarray() (the only other CUDA call) also runs in this thread,
+            # so it has always completed before we reach this finally block.
+            with _nvdec_lock:
+                try:
+                    self._container.close()
+                except Exception:
+                    pass
             self._opened = False
 
     # ---------- cv2.VideoCapture-compatible API ----------
@@ -197,16 +226,14 @@ class HwRtspCapture:
 
     def release(self):
         self._stop.set()
-        # Close the container first — this unblocks the blocking decode()
-        # call in the reader thread so the join below doesn't time out and
-        # leave the thread accessing a half-closed container (SIGSEGV).
-        with _nvdec_lock:
-            try:
-                self._container.close()
-            except Exception:
-                pass
+        # The reader thread owns container.close() — it calls it in its finally
+        # block after decode() has returned.  We just need to wait for the
+        # reader to finish.  stimeout=2 s means a stuck network read will abort
+        # within ~2 s of _stop being set; 7 s gives ample margin.
         if self._thread is not None:
-            self._thread.join(timeout=3.0)
+            self._thread.join(timeout=7.0)
+            if self._thread.is_alive():
+                log.warning("HwRtspCapture: reader thread did not exit in 7 s for %s", self._url)
             self._thread = None
         self._opened = False
 
@@ -254,6 +281,14 @@ def open_capture(source) -> object:
             log.info("opened %s via NVDEC", src_str)
             return cap
         except Exception as e:
-            log.warning("NVDEC failed for %s, falling back to CPU: %s", src_str, e)
+            _is_network_err = any(
+                kw in str(e).lower()
+                for kw in ("no route to host", "connection refused", "timed out",
+                           "name or service not known", "immediate exit")
+            )
+            if _is_network_err:
+                log.warning("Camera unreachable (network error) %s: %s", src_str, e)
+            else:
+                log.warning("NVDEC failed for %s, falling back to CPU: %s", src_str, e)
 
     return cv2.VideoCapture(source)

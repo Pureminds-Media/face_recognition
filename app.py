@@ -47,10 +47,19 @@ import engine_runner as _engine_runner
 import db
 
 load_dotenv()
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="[web]    %(asctime)s %(levelname)s %(message)s",
-)
+_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+_LOG_FMT   = "[web]    %(asctime)s %(levelname)s %(message)s"
+
+logging.basicConfig(level=_LOG_LEVEL, format=_LOG_FMT)
+
+# File handler — logs/app.log, rotating at 5 MB, keeping 5 backups
+from logging.handlers import RotatingFileHandler as _RFH
+os.makedirs("logs", exist_ok=True)
+_fh = _RFH("logs/app.log", maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+_fh.setFormatter(logging.Formatter(_LOG_FMT))
+_fh.setLevel(_LOG_LEVEL)
+logging.getLogger().addHandler(_fh)
+
 # Suppress "Client disconnected while serving …" noise — these fire every
 # time a browser closes an SSE/MJPEG/footage stream, which is normal.
 logging.getLogger("werkzeug").addFilter(
@@ -316,8 +325,8 @@ _ENGINE_KWARGS = dict(
     tracker_type="CSRT",
     width=1280,
     height=720,
-    out_fps=10,
-    jpeg_quality=80,
+    out_fps=15,
+    jpeg_quality=85,
     # Draw bounding boxes + name labels on the live MJPEG feed.
     # Default on. Set LIVE_ANNOTATIONS_ENABLED=0 in .env to get a clean
     # stream — useful when many people are in frame and box overlays
@@ -333,6 +342,7 @@ _engine_manager = None
 _engine_state = None
 _engine_proc = None
 _engine_parent_conn = None
+_engine_shutting_down = False
 
 
 def _spawn_engine_proc():
@@ -373,6 +383,8 @@ def _bootstrap_engine():
 
     import atexit as _atexit
     def _shutdown_engine():
+        global _engine_shutting_down
+        _engine_shutting_down = True
         try: _engine_parent_conn.send("shutdown")
         except Exception: pass
         try: _engine_proc.join(timeout=5)
@@ -403,6 +415,8 @@ def _engine_watchdog():
     global _engine_proc, _engine_parent_conn
     while True:
         time.sleep(5)
+        if _engine_shutting_down:
+            return
         try:
             if _engine_proc is not None and not _engine_proc.is_alive():
                 exit_code = _engine_proc.exitcode
@@ -1416,7 +1430,97 @@ def api_attendance_reset():
 
 @app.route("/api/people")
 def api_people():
-    return jsonify({"people": list_people()})
+    people = list_people()
+    meta_map = {p["name"]: p for p in db.get_all_people_meta()}
+    for p in people:
+        m = meta_map.get(p["name"], {})
+        p["section"] = m.get("section", "")
+        p["branch"]  = m.get("branch", "Riyadh")
+        p["email"]   = m.get("email", "")
+    return jsonify({"people": people})
+
+
+@app.route("/api/sections", methods=["GET"])
+def api_sections_list():
+    sections = db.get_all_sections()
+    for s in sections:
+        s["members"] = db.get_section_members(s["name"])
+    return jsonify({"ok": True, "sections": sections})
+
+
+@app.route("/api/sections", methods=["POST"])
+def api_sections_create():
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "Name is required"}), 400
+    try:
+        section = db.create_section(name)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    return jsonify({"ok": True, "section": section})
+
+
+@app.route("/api/sections/<name>", methods=["DELETE"])
+def api_sections_delete(name):
+    db.delete_section(name)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/sections/<name>/assign", methods=["POST"])
+def api_sections_assign(name):
+    data = request.get_json(silent=True) or {}
+    person = (data.get("person") or "").strip()
+    if not person:
+        return jsonify({"ok": False, "error": "person is required"}), 400
+    db.assign_person_section(person, name)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/sections/<name>/unassign", methods=["POST"])
+def api_sections_unassign(name):
+    data = request.get_json(silent=True) or {}
+    person = (data.get("person") or "").strip()
+    if not person:
+        return jsonify({"ok": False, "error": "person is required"}), 400
+    db.remove_person_section(person)
+    # Clear manager if the unassigned person was the manager
+    sections = db.get_all_sections()
+    sec = next((s for s in sections if s["name"] == name), None)
+    if sec and sec.get("manager") == person:
+        db.set_section_manager(name, "")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/sections/<name>/manager", methods=["POST"])
+def api_sections_set_manager(name):
+    data = request.get_json(silent=True) or {}
+    person = (data.get("person") or "").strip()
+    # person == "" clears the manager
+    db.set_section_manager(name, person)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/person/<name>/meta", methods=["GET"])
+def api_person_meta_get(name):
+    person = safe_person_name(name)
+    meta = db.get_person_meta(person) or {"name": person, "section": "", "branch": "Riyadh"}
+    return jsonify({"ok": True, **meta})
+
+
+@app.route("/api/person/<name>/meta", methods=["POST"])
+def api_person_meta_set(name):
+    person = safe_person_name(name)
+    if not person:
+        return jsonify({"ok": False, "error": "Invalid person name"}), 400
+    data = request.get_json(silent=True) or {}
+    section = data.get("section")
+    branch  = data.get("branch")
+    email   = data.get("email")
+    if section is None and branch is None and email is None:
+        return jsonify({"ok": False, "error": "Provide section, branch, and/or email"}), 400
+    db.upsert_person_meta(person, section=section, branch=branch, email=email)
+    return jsonify({"ok": True, "name": person, "section": section, "branch": branch, "email": email})
 
 def _reload_faces_async():
     """Fire engine.reload_faces() on a background thread.
@@ -1526,6 +1630,7 @@ def api_rename_person():
             moved += 1
         shutil.rmtree(old_dir, ignore_errors=True)
         rows = db.rename_person(old_name, new_name)
+        db.rename_person_meta(old_name, new_name)
         _reload_faces_async()
         return jsonify({"ok": True, "person": new_name, "renamed_visits": rows,
                         "merged": True, "images_moved": moved})
@@ -1533,6 +1638,7 @@ def api_rename_person():
     # Simple rename
     os.rename(old_dir, new_dir)
     rows = db.rename_person(old_name, new_name)
+    db.rename_person_meta(old_name, new_name)
     _reload_faces_async()
     return jsonify({"ok": True, "person": new_name, "renamed_visits": rows, "merged": False})
 
@@ -1550,8 +1656,9 @@ def api_delete_person(name):
     # Remove face images
     shutil.rmtree(person_dir)
 
-    # Delete visits from DB
+    # Delete visits and metadata from DB
     deleted_visits = db.delete_person_visits(person)
+    db.delete_person_meta(person)
 
     # Reload face embeddings
     _reload_faces_async()
@@ -2028,6 +2135,30 @@ def api_camera_reload():
         except Exception as e:
             return jsonify({"ok": False, "error": f"failed to start: {e}"}), 500
     return jsonify({"ok": True, "running": engine.is_running()})
+
+@app.route("/api/camera/statuses", methods=["GET"])
+def api_camera_statuses():
+    """Return live/dead status for all cameras in the active grid."""
+    try:
+        statuses = engine.get_camera_statuses()
+    except Exception:
+        statuses = {}
+    return jsonify(statuses)
+
+@app.route("/api/camera/reconnect", methods=["POST"])
+def api_camera_reconnect():
+    """Bypass the 2-minute reconnect backoff and immediately retry one camera.
+
+    Body: {"source": "<rtsp url or camera source string>"}
+    """
+    data = request.get_json(silent=True) or {}
+    source = data.get("source", "").strip()
+    if not source:
+        return jsonify({"ok": False, "error": "source required"}), 400
+    found = engine.force_reconnect_camera(source)
+    if not found:
+        return jsonify({"ok": False, "error": "camera not found in active grid"}), 404
+    return jsonify({"ok": True})
 
 def _all_resolved_urls(state, exclude_camera_id=None):
     """Return a set of resolved URLs across all groups, optionally
@@ -2768,18 +2899,10 @@ def api_analytics_summary():
 
     present_today = int(present_row["cnt"]) if present_row else 0
 
-    # Absent = branch members (historically visited this branch) minus present today.
+    # Absent = people assigned to this branch in the people table minus present today.
     # Without branch filter, fall back to total enrolled known folders.
     if branch:
-        branch_members_sql = f"""
-            SELECT COUNT(DISTINCT person_name) as cnt FROM visits
-            WHERE person_name NOT LIKE 'unknown_%'
-              AND branch = {ph}
-        """
-        with db._cursor() as cur:
-            cur.execute(branch_members_sql, (branch,))
-            row = db._row_to_dict(cur.fetchone())
-        enrolled_known = int(row["cnt"]) if row else 0
+        enrolled_known = len(db.get_branch_members(branch))
     else:
         enrolled_known = 0
         if os.path.isdir(known_dir):
@@ -2847,20 +2970,12 @@ def api_analytics_present_absent():
         cur.execute(present_sql, tuple(base_params))
         present = [r["person_name"] for r in db._rows_to_dicts(cur.fetchall())]
 
-    # Absent = persons who have visited this branch at least once historically
-    # but did not appear today. When no branch filter, fall back to all enrolled folders.
+    # Absent = persons assigned to this branch in the people table who didn't appear today.
+    # Falls back to all enrolled known folders when no branch filter.
     import re as _re
     present_set = set(present)
     if branch:
-        branch_members_sql = f"""
-            SELECT DISTINCT person_name FROM visits
-            WHERE person_name NOT LIKE 'unknown_%'
-              AND branch = {ph}
-            ORDER BY person_name
-        """
-        with db._cursor() as cur:
-            cur.execute(branch_members_sql, (branch,))
-            branch_members = [r["person_name"] for r in db._rows_to_dicts(cur.fetchall())]
+        branch_members = db.get_branch_members(branch)
         absent = [n for n in branch_members if n not in present_set]
     else:
         known_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "faces")
@@ -3140,7 +3255,7 @@ if __name__ == "__main__":
     # Use waitress (pure-Python production server) when available — it
     # handles many concurrent connections cleanly. Never enable the
     # Flask reloader: it would start the engine subprocess twice.
-    host, port = "0.0.0.0", 5000
+    host, port = "0.0.0.0", 5001
     try:
         from waitress import serve  # type: ignore
         log.info("Serving with waitress on %s:%s", host, port)

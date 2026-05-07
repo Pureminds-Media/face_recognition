@@ -67,6 +67,8 @@ class EngineClient:
 
     # ---------- recognition / faces ----------
     def reload_faces(self): return self._call("reload_faces")
+    def force_reconnect_camera(self, source): return self._call("force_reconnect_camera", source)
+    def get_camera_statuses(self): return self._call("get_camera_statuses")
 
     @property
     def known_embeddings(self):

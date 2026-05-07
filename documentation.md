@@ -353,6 +353,27 @@ Core table. One row per continuous presence of a person at a location.
 | `activity` | text | Most frequent CLIP action label |
 | `branch` | text NOT NULL DEFAULT 'Riyadh' | Branch identifier — auto-assigned from the camera's IP group |
 
+#### `people`
+
+Stores per-person metadata. One row per enrolled person (created on first save; absent until explicitly set).
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `name` | text PK | Matches `faces/<name>/` directory name |
+| `section` | text NOT NULL DEFAULT '' | Name of the section this person belongs to (read-only badge on the People card; managed from the Sections tab) |
+| `branch` | text NOT NULL DEFAULT 'Riyadh' | Home branch — determines which branch's absent list this person appears in |
+
+#### `sections`
+
+Named groups that people can be assigned to (e.g. "IT", "HR"). Managed from Settings → Sections.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | integer PK AUTOINCREMENT | Internal ID |
+| `name` | text NOT NULL UNIQUE | Section display name |
+
+The `people.section` column is kept in sync: assigning a person to a section sets `people.section = section_name`; unassigning or deleting a section clears it to `''`.
+
 #### Indexes on `visits`
 
 | Index | Columns | Purpose |
@@ -373,7 +394,7 @@ Additive columns (`screenshot`, `footage`, `visible_duration`, `activity`, `bran
 python3 -c "import db; db.init_db(); db.clear_all_data()"
 
 # Flask running — API:
-curl -X POST http://localhost:5000/api/history/clear
+curl -X POST http://localhost:5001/api/history/clear
 ```
 
 `clear_all_data()` deletes all visits and sessions. Locations, face images, and footage files are NOT deleted.
@@ -472,14 +493,23 @@ Four sub-views selectable by tab:
 
 All date pickers use `dd-mm-yyyy` display (Flatpickr with `altInput`).
 
-### `/people` — People Management
+### `/people` — People Management (Settings)
 
 - View all enrolled persons with face thumbnails and image count.
-- Rename (moves `faces/` directory and updates all `visits.person_name` rows).
-- Delete (removes `faces/` directory and all visit rows).
+- Each card shows a read-only **section badge** (set from the Sections tab) and a **branch** dropdown (Riyadh / Egypt) — branch changes save instantly to the `people` DB table.
+- Rename (moves `faces/` directory and updates all `visits.person_name` rows and the `people` row).
+- Delete (removes `faces/` directory and all visit and people rows).
 - View individual face images; delete single images; transfer images between persons.
 - Bulk delete / bulk transfer.
 - Merge multiple persons into one.
+
+### `/sections` — Sections Management (Settings)
+
+- Create named sections (e.g. "IT", "HR", "Security").
+- Each section card lists its current members.
+- Assign any enrolled person to a section via the assign button; this replaces their current section.
+- Remove a person from a section (unassign), or delete the entire section (clears all members' section field).
+- Section membership is reflected as a read-only badge on each person's People card.
 
 ---
 
@@ -494,7 +524,7 @@ All analytics (and history) endpoints accept an optional `?branch=<name>` query 
 Returns the full name lists behind the Present and Absent tiles. Called lazily on tile click rather than on page load.
 
 - `present` — known persons with at least one visit on the given day (branch-filtered when `?branch=` is provided), sorted alphabetically.
-- `absent` — persons who have visited this branch at least once historically but had no visit that day, sorted alphabetically. Without a branch filter, falls back to all enrolled known `faces/` folders with no visit that day.
+- `absent` — persons assigned to this branch in the `people` table with no visit that day, sorted alphabetically. Without a branch filter, falls back to all enrolled known `faces/` folders with no visit that day.
 
 The Present and Absent tiles have a hover border effect (emerald / rose) and open a modal with the name list and count on click. The modal closes on backdrop click or Escape.
 
@@ -506,7 +536,7 @@ A single endpoint that returns three KPIs for a given day, loaded in one request
 |-------|-------------|
 | `peak_hour` | Local-time hour bucket with the most distinct people spotted, e.g. `"09:00 – 10:00"`. `null` if no visits that day. |
 | `present_today` | Count of distinct known persons (non-`unknown_N`) with at least one visit today (branch-filtered). |
-| `absent_today` | Count of persons who have visited this branch at least once historically but had no visit today. Without a branch filter, counts all enrolled known folders minus present. |
+| `absent_today` | Count of persons assigned to this branch in the `people` table with no visit today. Without a branch filter, counts all enrolled known folders minus present. |
 | `unknowns_today` | Count of `unknown_N` folders currently in `faces/` — total unresolved auto-captured persons in the system, regardless of when they were last seen. |
 
 ### Earliest / Latest Arrivals (`/api/analytics/earliest`)

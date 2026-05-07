@@ -15,6 +15,8 @@
         if (typeof renderPeople === "function") renderPeople();
         const camSection = document.getElementById("section-camera");
         if (camSection && !camSection.classList.contains("hidden") && typeof loadIpCameras === "function") loadIpCameras();
+        const secSection = document.getElementById("section-sections");
+        if (secSection && !secSection.classList.contains("hidden") && typeof loadSections === "function") loadSections();
       });
     }
     document.addEventListener("DOMContentLoaded", () => applyLang(window._lang));
@@ -96,6 +98,10 @@
               >
                 Camera
               </button>
+              <button class="section-btn w-full text-start rounded-lg px-3 py-2 text-sm font-medium text-slate-300 hover:bg-slate-800"
+                data-section="sections" data-i18n="nav_sections">Sections</button>
+              <button class="section-btn w-full text-start rounded-lg px-3 py-2 text-sm font-medium text-slate-300 hover:bg-slate-800"
+                data-section="email" data-i18n="nav_email">Email</button>
             </nav>
           </aside>
 
@@ -197,6 +203,26 @@
               <div class="text-slate-400 text-sm" id="statsText">Loading...</div>
             </div>
 
+            <!-- People filters -->
+            <div class="flex flex-wrap gap-2 mb-4">
+              <select id="filterType" onchange="renderPeople()"
+                class="px-3 py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-xs text-slate-300 focus:outline-none focus:border-emerald-500">
+                <option value="all">All people</option>
+                <option value="known">Known only</option>
+                <option value="unknown">Unknown only</option>
+              </select>
+              <select id="filterBranch" onchange="renderPeople()"
+                class="px-3 py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-xs text-slate-300 focus:outline-none focus:border-emerald-500">
+                <option value="">All branches</option>
+                <option value="Riyadh" data-i18n-opt="branch_riyadh">Riyadh</option>
+                <option value="Egypt" data-i18n-opt="branch_egypt">Egypt</option>
+              </select>
+              <select id="filterSection" onchange="renderPeople()"
+                class="px-3 py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-xs text-slate-300 focus:outline-none focus:border-emerald-500">
+                <option value="">All sections</option>
+              </select>
+            </div>
+
             <div id="mergeBar" class="hidden flex flex-wrap items-center gap-2 mb-4 p-3 rounded-lg border border-slate-800 bg-slate-900 text-sm">
               <span id="mergeSelCount" class="text-slate-300">0 selected</span>
               <span class="flex-1"></span>
@@ -216,6 +242,46 @@
             <div id="emptyState" class="hidden text-center py-20">
               <div class="text-slate-500 text-lg" data-i18n="no_people">No people enrolled yet</div>
               <div class="text-slate-600 text-sm mt-2" data-i18n="no_people_sub">Use the form above to upload face images</div>
+            </div>
+          </div>
+
+          <!-- ================= SECTIONS SECTION ================= -->
+          <div id="section-sections" class="section-content hidden">
+            <div class="flex items-center justify-between mb-4">
+              <div class="text-lg font-semibold" data-i18n="nav_sections">Sections</div>
+            </div>
+            <div class="rounded-xl border border-slate-800 bg-slate-900 p-4 mb-4">
+              <div class="flex gap-2">
+                <input id="newSectionInput" type="text" placeholder="Section name"
+                  class="flex-1 px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:border-emerald-500"
+                  onkeydown="if(event.key==='Enter') createSection()" />
+                <button onclick="createSection()"
+                  class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium">+ Add</button>
+              </div>
+            </div>
+            <div id="sectionsGrid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4"></div>
+          </div>
+
+          <!-- ================= EMAIL SECTION ================= -->
+          <div id="section-email" class="section-content hidden">
+            <div class="flex items-center justify-between mb-4">
+              <div class="text-lg font-semibold" data-i18n="nav_email">Email</div>
+            </div>
+            <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-hidden">
+              <table class="w-full text-sm">
+                <thead>
+                  <tr class="text-xs text-slate-500 uppercase tracking-wide border-b border-slate-800">
+                    <th class="px-4 py-3 text-left" data-i18n="col_person">Name</th>
+                    <th class="px-4 py-3 text-left" data-i18n="label_section">Section</th>
+                    <th class="px-4 py-3 text-left" data-i18n="label_location">Branch</th>
+                    <th class="px-4 py-3 text-left">Email</th>
+                    <th class="px-4 py-3"></th>
+                  </tr>
+                </thead>
+                <tbody id="emailTableBody">
+                  <tr><td colspan="5" class="px-4 py-8 text-center text-slate-500">Loading…</td></tr>
+                </tbody>
+              </table>
             </div>
           </div>
 
@@ -431,8 +497,63 @@
       </div>
     </div>
 
+    <!-- Section Members Modal -->
+    <div id="sectionModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+      <div class="bg-slate-900 rounded-xl border border-slate-700 shadow-2xl w-full max-w-lg mx-4 flex flex-col max-h-[80vh]">
+        <div class="flex items-center justify-between px-5 py-4 border-b border-slate-800">
+          <span id="secModalTitle" class="text-lg font-semibold text-slate-100"></span>
+          <div class="flex items-center gap-3">
+            <button onclick="secModalDelete()" class="text-xs text-red-400 hover:text-red-300 px-2 py-1 rounded hover:bg-red-900/30" data-i18n="btn_delete">Delete</button>
+            <button onclick="closeSectionModal()" class="text-slate-400 hover:text-white text-xl font-bold leading-none">&times;</button>
+          </div>
+        </div>
+        <div class="overflow-y-auto flex-1">
+          <table class="w-full text-sm">
+            <thead>
+              <tr class="text-xs text-slate-500 uppercase tracking-wide">
+                <th class="px-3 py-2 w-8"></th>
+                <th class="px-4 py-2 text-left" data-i18n="col_person">Person</th>
+                <th class="px-4 py-2 text-left" data-i18n="label_location">Branch</th>
+                <th class="px-4 py-2"></th>
+              </tr>
+            </thead>
+            <tbody id="secModalTbody"></tbody>
+          </table>
+        </div>
+        <div class="flex gap-2 px-5 py-4 border-t border-slate-800">
+          <select id="secAssignSelect" class="flex-1 px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 text-sm text-slate-300 focus:outline-none focus:border-emerald-500"></select>
+          <button onclick="secModalAssign()" class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium text-white" data-i18n="btn_assign">Assign</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Toast container -->
     <div id="toastContainer" class="fixed top-4 right-4 z-50 space-y-2"></div>
+
+    <!-- Generic confirm dialog (replaces window.confirm to avoid browser blocking) -->
+    <div id="confirmDialog" class="hidden fixed inset-0 z-[70] flex items-center justify-center bg-black/60">
+      <div class="bg-slate-900 rounded-xl border border-slate-700 shadow-2xl w-full max-w-sm mx-4 p-5">
+        <p id="confirmMsg" class="text-sm text-slate-200 mb-5 leading-relaxed"></p>
+        <div class="flex gap-3 justify-end">
+          <button id="confirmCancel" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm">Cancel</button>
+          <button id="confirmOk" class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium">Confirm</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Generic prompt dialog (replaces window.prompt to avoid browser blocking) -->
+    <div id="promptDialog" class="hidden fixed inset-0 z-[70] flex items-center justify-center bg-black/60">
+      <div class="bg-slate-900 rounded-xl border border-slate-700 shadow-2xl w-full max-w-sm mx-4 p-5">
+        <p id="promptMsg" class="text-sm text-slate-200 mb-3 leading-relaxed"></p>
+        <input id="promptInput" type="text"
+          class="w-full px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 text-sm text-slate-200 focus:outline-none focus:border-emerald-500 mb-4" />
+        <p id="promptError" class="text-xs text-red-400 mb-3 hidden"></p>
+        <div class="flex gap-3 justify-end">
+          <button id="promptCancel" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm">Cancel</button>
+          <button id="promptOk" class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium">OK</button>
+        </div>
+      </div>
+    </div>
 
     <!-- Camera Capture Modal -->
     <div id="captureModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
@@ -477,8 +598,79 @@
           if (btn.dataset.section === "camera" && typeof loadIpCameras === "function") {
             loadIpCameras();
           }
+          // Load sections when Sections tab is opened
+          if (btn.dataset.section === "sections" && typeof loadSections === "function") {
+            loadSections();
+          }
+          // Load email tab when Email tab is opened
+          if (btn.dataset.section === "email" && typeof renderEmailTable === "function") {
+            renderEmailTable();
+          }
         });
       });
+
+      /* ===================== Shared helpers ===================== */
+      const fmt = n => String(n).replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+
+      function showConfirm(msg) {
+        return new Promise(resolve => {
+          document.getElementById("confirmMsg").textContent = msg;
+          const dlg = document.getElementById("confirmDialog");
+          dlg.classList.remove("hidden");
+          const ok     = document.getElementById("confirmOk");
+          const cancel = document.getElementById("confirmCancel");
+          function cleanup(val) {
+            dlg.classList.add("hidden");
+            ok.replaceWith(ok.cloneNode(true));
+            cancel.replaceWith(cancel.cloneNode(true));
+            resolve(val);
+          }
+          document.getElementById("confirmOk").addEventListener("click",     () => cleanup(true),  {once: true});
+          document.getElementById("confirmCancel").addEventListener("click", () => cleanup(false), {once: true});
+        });
+      }
+
+      function showPrompt(msg, defaultVal = "", required = false, errorMsg = "This field is required.") {
+        return new Promise(resolve => {
+          document.getElementById("promptMsg").textContent = msg;
+          const input = document.getElementById("promptInput");
+          const errEl = document.getElementById("promptError");
+          input.value = defaultVal;
+          input.type  = "email";
+          errEl.classList.add("hidden");
+          const dlg = document.getElementById("promptDialog");
+          dlg.classList.remove("hidden");
+          setTimeout(() => input.focus(), 50);
+          const ok     = document.getElementById("promptOk");
+          const cancel = document.getElementById("promptCancel");
+          function cleanup(val) {
+            dlg.classList.add("hidden");
+            ok.replaceWith(ok.cloneNode(true));
+            cancel.replaceWith(cancel.cloneNode(true));
+            resolve(val);
+          }
+          function tryOk() {
+            const val = input.value.trim();
+            if (required && !val) {
+              errEl.textContent = errorMsg;
+              errEl.classList.remove("hidden");
+              return;
+            }
+            if (val && !val.endsWith("@pureminds.com.sa")) {
+              errEl.textContent = "Email must be a @pureminds.com.sa address.";
+              errEl.classList.remove("hidden");
+              return;
+            }
+            cleanup(val);
+          }
+          document.getElementById("promptOk").addEventListener("click",     tryOk,               {once: false});
+          document.getElementById("promptCancel").addEventListener("click", () => cleanup(null),  {once: true});
+          input.addEventListener("keydown", function handler(e) {
+            if (e.key === "Enter")  { tryOk(); }
+            if (e.key === "Escape") { input.removeEventListener("keydown", handler); cleanup(null); }
+          });
+        });
+      }
 
       /* ===================== PEOPLE ===================== */
       let _people = [];
@@ -506,7 +698,7 @@
           const existingSelect = document.getElementById("existingName");
           if (existingSelect) {
             existingSelect.innerHTML = _people.length
-              ? _people.map((p) => `<option value="${p.name}">${p.name} (${p.count})</option>`).join("")
+              ? _people.map((p) => `<option value="${p.name}">${fmt(p.name)} (${p.count})</option>`).join("")
               : `<option value="">(no people yet)</option>`;
           }
 
@@ -542,7 +734,7 @@
         sel.innerHTML = _people.length
           ? _people.map(p => {
               const tag = _selectedPeople.has(p.name) ? " — keep" : "";
-              return `<option value="${p.name}">${p.name} (${p.count})${tag}</option>`;
+              return `<option value="${p.name}">${fmt(p.name)} (${p.count})${tag}</option>`;
             }).join("")
           : `<option value="" disabled>(no people yet — use "or new" field)</option>`;
       }
@@ -572,10 +764,21 @@
         } catch (e) { alert("Network error"); }
       }
 
+      function _rebuildSectionFilter() {
+        const sel = document.getElementById("filterSection");
+        if (!sel) return;
+        const current = sel.value;
+        const names = [...new Set(_people.map(p => p.section).filter(Boolean))].sort();
+        sel.innerHTML = `<option value="">All sections</option>` +
+          names.map(n => `<option value="${n}"${n === current ? ' selected' : ''}>${n}</option>`).join("");
+      }
+
       function renderPeople() {
         const grid = document.getElementById("peopleGrid");
         const empty = document.getElementById("emptyState");
         const stats = document.getElementById("statsText");
+
+        _rebuildSectionFilter();
 
         if (_people.length === 0) {
           grid.classList.add("hidden");
@@ -584,18 +787,48 @@
           return;
         }
 
+        const filterType    = (document.getElementById("filterType")?.value)    || "all";
+        const filterBranch  = (document.getElementById("filterBranch")?.value)  || "";
+        const filterSection = (document.getElementById("filterSection")?.value) || "";
+
+        const isUnknownName = n => /^unknown_\d+$/.test(n);
+
+        let visible = _people.filter(p => {
+          if (filterType === "known"   &&  isUnknownName(p.name)) return false;
+          if (filterType === "unknown" && !isUnknownName(p.name)) return false;
+          if (filterBranch  && (p.branch  || "Riyadh") !== filterBranch)  return false;
+          if (filterSection && (p.section || "")       !== filterSection) return false;
+          return true;
+        });
+
+        // When showing all types, unknowns float to the top
+        if (filterType === "all") {
+          visible = [
+            ...visible.filter(p =>  isUnknownName(p.name)),
+            ...visible.filter(p => !isUnknownName(p.name)),
+          ];
+        }
+
         grid.classList.remove("hidden");
         empty.classList.add("hidden");
 
-        const unknowns = _people.filter(p => p.name.match(/^unknown_\d+$/)).length;
+        const unknowns = _people.filter(p => isUnknownName(p.name)).length;
         const known = _people.length - unknowns;
         let statsStr = `${_people.length} ${t("people_enrolled")}`;
         if (unknowns > 0) {
           statsStr += ` (${known} ${t("people_known")}, ${unknowns} ${t("people_auto")})`;
         }
+        if (visible.length !== _people.length) {
+          statsStr += ` — showing ${visible.length}`;
+        }
         stats.textContent = statsStr;
 
-        grid.innerHTML = _people.map(p => {
+        if (visible.length === 0) {
+          grid.innerHTML = `<div class="col-span-full text-center py-12 text-slate-500 text-sm">No people match the selected filters</div>`;
+          return;
+        }
+
+        grid.innerHTML = visible.map(p => {
           const isUnknown = /^unknown_\d+$/.test(p.name);
           const borderColor = isUnknown ? "border-amber-500/50" : "border-slate-700";
           const badge = isUnknown
@@ -618,10 +851,26 @@
               <div class="p-3">
                 <div class="flex items-center justify-between mb-2">
                   <div class="flex items-center">
-                    <span class="font-mono text-sm font-medium truncate max-w-[140px]" title="${p.name}">${p.name}</span>
+                    <span class="font-mono text-sm font-medium truncate max-w-[140px]" title="${p.name}">${fmt(p.name)}</span>
                     ${badge}
                   </div>
                   <span class="text-xs text-slate-500">${p.count} ${p.count !== 1 ? t("card_images") : t("card_image")}</span>
+                </div>
+                <div class="flex flex-col gap-1.5 mb-2">
+                  ${(() => {
+                    if (!p.section) return `<span class="inline-block px-2 py-0.5 rounded bg-slate-800 text-xs text-slate-500">${t('no_section')}</span>`;
+                    const isManager = _sections.some(s => s.name === p.section && s.manager === p.name);
+                    return isManager
+                      ? `<span class="inline-block px-2 py-0.5 rounded bg-slate-700 text-xs text-yellow-400">${p.section} <span class="font-semibold">(MANAGER)</span></span>`
+                      : `<span class="inline-block px-2 py-0.5 rounded bg-slate-700 text-xs text-slate-300">${p.section}</span>`;
+                  })()}
+                  <select
+                    class="w-full px-2 py-1 rounded bg-slate-800 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-emerald-500"
+                    onchange="savePersonMeta('${p.name}', null, this.value)"
+                  >
+                    <option value="Riyadh" ${(p.branch||'Riyadh')==='Riyadh'?'selected':''}>${t('branch_riyadh')}</option>
+                    <option value="Egypt" ${(p.branch||'Riyadh')==='Egypt'?'selected':''}>${t('branch_egypt')}</option>
+                  </select>
                 </div>
                 <div class="flex gap-2">
                   <button
@@ -643,9 +892,323 @@
         }).join("");
       }
 
+      async function savePersonMeta(name, section, branch) {
+        const body = {};
+        if (section !== null) body.section = section;
+        if (branch  !== null) body.branch  = branch;
+        await fetch(`/api/person/${encodeURIComponent(name)}/meta`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        // Update local cache so re-render doesn't revert the value
+        const p = _people.find(x => x.name === name);
+        if (p) {
+          if (section !== null) p.section = section;
+          if (branch  !== null) p.branch  = branch;
+        }
+      }
+
+      /* ===================== SECTIONS ===================== */
+      let _sections = [];
+
+      async function loadSections() {
+        const r = await fetch("/api/sections");
+        const j = await r.json();
+        _sections = j.sections || [];
+        renderSections();
+      }
+
+      function renderSections() {
+        const grid = document.getElementById("sectionsGrid");
+        if (!grid) return;
+        if (_sections.length === 0) {
+          grid.innerHTML = `<div class="text-slate-500 text-sm text-center py-8">${t('no_sections')}</div>`;
+          return;
+        }
+        const esc = v => String(v).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+        grid.innerHTML = _sections.map(s => `
+          <div class="bg-slate-900 border border-slate-700 rounded-xl px-5 py-4 flex items-center justify-between cursor-pointer hover:border-emerald-600 transition-colors open-sec-btn"
+               data-sec="${esc(s.name)}">
+            <span class="font-medium text-slate-200">${esc(s.name)}</span>
+            <span class="text-xs text-slate-500">${s.members.length} ${t('people_label').toLowerCase()}</span>
+          </div>
+        `).join("");
+
+        grid.querySelectorAll(".open-sec-btn").forEach(card => {
+          card.addEventListener("click", () => openSectionModal(card.dataset.sec));
+        });
+      }
+
+      let _activeSectionName = null;
+
+      function openSectionModal(name) {
+        _activeSectionName = name;
+        const sec = _sections.find(s => s.name === name);
+        if (!sec) return;
+        document.getElementById("secModalTitle").textContent = name;
+        renderSectionModalTable(sec);
+        renderSectionAssignSelect(sec);
+        document.getElementById("sectionModal").classList.remove("hidden");
+      }
+
+      // Delegated handlers — attached once to the tbody, survive innerHTML re-renders
+      (function () {
+        const tbody = document.getElementById("secModalTbody");
+        if (!tbody) return;
+        tbody.addEventListener("click", async (e) => {
+          const starBtn    = e.target.closest(".sec-star-btn");
+          const removeBtn  = e.target.closest(".sec-unassign-btn");
+          if (!starBtn && !removeBtn) return;
+          const person = (starBtn || removeBtn).dataset.person;
+
+          if (removeBtn) {
+            if (!await showConfirm(`Remove ${fmt(person)} from "${_activeSectionName}"?`)) return;
+            await fetch(`/api/sections/${encodeURIComponent(_activeSectionName)}/unassign`, {
+              method: "POST", headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({person}),
+            });
+            await loadSections();
+            await loadPeople();
+            const updated = _sections.find(s => s.name === _activeSectionName);
+            if (updated) { renderSectionModalTable(updated); renderSectionAssignSelect(updated); }
+            return;
+          }
+
+          // Star button — set / change / remove manager
+          const sec = _sections.find(s => s.name === _activeSectionName);
+          const isCurrentManager = sec && sec.manager === person;
+          const newManager = isCurrentManager ? "" : person;
+          const confirmMsg = isCurrentManager
+            ? `Remove ${fmt(person)} as manager of "${_activeSectionName}"?`
+            : (sec && sec.manager
+                ? `Replace ${fmt(sec.manager)} with ${fmt(person)} as manager of "${_activeSectionName}"?`
+                : `Set ${fmt(person)} as manager of "${_activeSectionName}"?`);
+          if (!await showConfirm(confirmMsg)) return;
+
+          await fetch(`/api/sections/${encodeURIComponent(_activeSectionName)}/manager`, {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({person: newManager}),
+          });
+
+          if (newManager) {
+            const personData = _people.find(p => p.name === newManager);
+            const currentEmail = personData ? (personData.email || "") : "";
+            const email = await showPrompt(
+              `Email address for ${fmt(newManager)}:`, currentEmail, true, "Email is required to assign a manager."
+            );
+            if (email === null) {
+              // Cancelled — roll back
+              await fetch(`/api/sections/${encodeURIComponent(_activeSectionName)}/manager`, {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({person: sec ? (sec.manager || "") : ""}),
+              });
+              await loadSections();
+              const reverted = _sections.find(s => s.name === _activeSectionName);
+              if (reverted) renderSectionModalTable(reverted);
+              return;
+            }
+            await fetch(`/api/person/${encodeURIComponent(newManager)}/meta`, {
+              method: "POST",
+              headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({email}),
+            });
+          }
+
+          await loadSections();
+          await loadPeople();
+          const updated = _sections.find(s => s.name === _activeSectionName);
+          if (updated) renderSectionModalTable(updated);
+        });
+      })();
+
+      function renderSectionModalTable(sec) {
+        const esc = v => String(v).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+        const tbody = document.getElementById("secModalTbody");
+        const manager = sec.manager || "";
+        if (sec.members.length === 0) {
+          tbody.innerHTML = `<tr><td colspan="4" class="px-4 py-6 text-center text-slate-500 text-sm">${t('no_members')}</td></tr>`;
+          return;
+        }
+        const sorted = [...sec.members].sort((a, b) => {
+          if (a === manager) return -1;
+          if (b === manager) return 1;
+          return a.localeCompare(b);
+        });
+        tbody.innerHTML = sorted.map(m => {
+          const person = _people.find(p => p.name === m);
+          const branch = person ? (person.branch || "Riyadh") : "—";
+          const isManager = m === manager;
+          const starClass = isManager
+            ? "sec-star-btn text-yellow-400 hover:text-slate-400"
+            : "sec-star-btn text-slate-600 hover:text-yellow-400";
+          const starSvg = isManager
+            ? `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-4 h-4"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>`
+            : `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-4 h-4"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>`;
+          return `<tr class="border-t border-slate-800 hover:bg-slate-800/40${isManager ? ' bg-slate-800/20' : ''}">
+            <td class="px-3 py-2.5 text-center">
+              <button data-person="${esc(m)}" class="${starClass}" title="Set as manager">${starSvg}</button>
+            </td>
+            <td class="px-4 py-2.5 text-sm text-slate-200">${esc(fmt(m))}</td>
+            <td class="px-4 py-2.5 text-sm text-slate-400">${esc(branch)}</td>
+            <td class="px-4 py-2.5 text-right">
+              <button data-person="${esc(m)}" class="sec-unassign-btn text-xs text-red-400 hover:text-red-300 px-2 py-1 rounded hover:bg-red-900/30">Remove</button>
+            </td>
+          </tr>`;
+        }).join("");
+      }
+
+      function renderSectionAssignSelect(sec) {
+        const esc = v => String(v).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+        const sel = document.getElementById("secAssignSelect");
+        // Only show people with no section assigned at all
+        const available = _people.filter(p => !p.section);
+        sel.innerHTML = `<option value="">${t('select_placeholder')}</option>` +
+          available.map(p => `<option value="${esc(p.name)}">${esc(fmt(p.name))}</option>`).join("");
+      }
+
+      function closeSectionModal() {
+        document.getElementById("sectionModal").classList.add("hidden");
+        _activeSectionName = null;
+      }
+
+      async function secModalAssign() {
+        const sel = document.getElementById("secAssignSelect");
+        const person = sel.value;
+        if (!person || !_activeSectionName) return;
+        await assignPersonDirect(_activeSectionName, person);
+        const sec = _sections.find(s => s.name === _activeSectionName);
+        if (sec) { renderSectionModalTable(sec); renderSectionAssignSelect(sec); }
+      }
+
+      async function secModalDelete() {
+        if (!_activeSectionName) return;
+        if (!await showConfirm(`Delete section "${_activeSectionName}"? This will unassign all members.`)) return;
+        await fetch(`/api/sections/${encodeURIComponent(_activeSectionName)}`, {method: "DELETE"});
+        closeSectionModal();
+        loadSections();
+        loadPeople();
+      }
+
+      async function assignPersonDirect(sectionName, person) {
+        await fetch(`/api/sections/${encodeURIComponent(sectionName)}/assign`, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({person}),
+        });
+        await loadSections();
+        loadPeople();
+      }
+
+      async function createSection() {
+        const input = document.getElementById("newSectionInput");
+        const name = (input.value || "").trim();
+        if (!name) return;
+        const r = await fetch("/api/sections", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({name}),
+        });
+        const j = await r.json();
+        if (j.ok) { input.value = ""; loadSections(); }
+        else alert(j.error || "Failed");
+      }
+
+      async function deleteSection(name) {
+        if (!confirm(`Delete section "${name}"?`)) return;
+        await fetch(`/api/sections/${encodeURIComponent(name)}`, {method: "DELETE"});
+        loadSections();
+        loadPeople();
+      }
+
+      async function unassignPerson(sectionName, person) {
+        await fetch(`/api/sections/${encodeURIComponent(sectionName)}/unassign`, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({person}),
+        });
+        await loadSections();
+        loadPeople();
+      }
+
+      /* ===================== EMAIL TAB ===================== */
+      function renderEmailTable() {
+        const tbody = document.getElementById("emailTableBody");
+        if (!tbody) return;
+        const esc = v => String(v).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+        const rows = _sections
+          .filter(s => s.manager)
+          .sort((a, b) => a.name.localeCompare(b.name))
+          .map(s => ({ section: s, person: _people.find(p => p.name === s.manager) }));
+        if (rows.length === 0) {
+          tbody.innerHTML = `<tr><td colspan="5" class="px-4 py-8 text-center text-slate-500 text-sm">No managers assigned yet</td></tr>`;
+          return;
+        }
+        tbody.innerHTML = rows.map(({ section: s, person: p }) => {
+          const name = s.manager;
+          const branch = p ? (p.branch || 'Riyadh') : '—';
+          const email = p ? (p.email || '') : '';
+          return `<tr class="border-t border-slate-800 hover:bg-slate-800/30">
+            <td class="px-4 py-2.5 text-sm text-slate-200">${esc(fmt(name))}</td>
+            <td class="px-4 py-2.5 text-sm text-slate-400">${esc(s.name)}</td>
+            <td class="px-4 py-2.5 text-sm text-slate-400">${esc(branch)}</td>
+            <td class="px-4 py-2.5">
+              <input type="email" value="${esc(email)}"
+                class="email-input w-full px-2 py-1 rounded bg-slate-800 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-emerald-500"
+                placeholder="email@pureminds.com.sa"
+                data-person="${esc(name)}"
+                data-original="${esc(email)}" />
+            </td>
+            <td class="px-4 py-2.5 text-right">
+              <button data-person="${esc(name)}" class="email-save-btn hidden text-xs text-emerald-400 hover:text-emerald-300 px-2 py-1 rounded hover:bg-emerald-900/30">Save</button>
+            </td>
+          </tr>`;
+        }).join("");
+
+        tbody.querySelectorAll(".email-input").forEach(input => {
+          input.addEventListener("input", () => {
+            const saveBtn = tbody.querySelector(`.email-save-btn[data-person="${input.dataset.person}"]`);
+            if (saveBtn) saveBtn.classList.toggle("hidden", input.value === input.dataset.original);
+          });
+          input.addEventListener("keydown", async (e) => {
+            if (e.key === "Enter") await saveEmail(input);
+            if (e.key === "Escape") { input.value = input.dataset.original; input.dispatchEvent(new Event("input")); }
+          });
+        });
+
+        tbody.querySelectorAll(".email-save-btn").forEach(btn => {
+          btn.addEventListener("click", async () => {
+            const input = tbody.querySelector(`.email-input[data-person="${btn.dataset.person}"]`);
+            if (input) await saveEmail(input);
+          });
+        });
+      }
+
+      async function saveEmail(input) {
+        const person = input.dataset.person;
+        const email = input.value.trim();
+        if (email && !email.endsWith("@pureminds.com.sa")) {
+          input.setCustomValidity("Email must be a @pureminds.com.sa address.");
+          input.reportValidity();
+          return;
+        }
+        input.setCustomValidity("");
+        await fetch(`/api/person/${encodeURIComponent(person)}/meta`, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({email}),
+        });
+        input.dataset.original = email;
+        input.dispatchEvent(new Event("input")); // hide save button
+        const p = _people.find(x => x.name === person);
+        if (p) p.email = email;
+      }
+
       function openRenameModal(name) {
         _renameTarget = name;
-        document.getElementById("renameOldName").textContent = name;
+        document.getElementById("renameOldName").textContent = fmt(name);
         document.getElementById("renameNewName").value = "";
         document.getElementById("renameError").classList.add("hidden");
         document.getElementById("renameModal").classList.remove("hidden");
@@ -670,7 +1233,7 @@
 
         const isMerge = _knownPeopleNames && _knownPeopleNames.includes(newName.toLowerCase()) && newName !== _renameTarget;
         if (isMerge) {
-          const ok = confirm(`"${newName}" already exists. Merge "${_renameTarget}" into "${newName}"?\n\nAll photos and visit history will be combined. This cannot be undone.`);
+          const ok = confirm(`"${fmt(newName)}" already exists. Merge "${fmt(_renameTarget)}" into "${fmt(newName)}"?\n\nAll photos and visit history will be combined. This cannot be undone.`);
           if (!ok) return;
         }
 
@@ -704,7 +1267,7 @@
 
       function openDeleteModal(name) {
         _deleteTarget = name;
-        document.getElementById("deletePersonName").textContent = name;
+        document.getElementById("deletePersonName").textContent = fmt(name);
         document.getElementById("deleteModal").classList.remove("hidden");
       }
 
@@ -834,7 +1397,7 @@
       async function bulkDeleteImages() {
         if (!_galleryPerson || _gallerySelected.size === 0) return;
         const filenames = Array.from(_gallerySelected);
-        if (!confirm(`Delete ${filenames.length} image(s) from ${_galleryPerson}?`)) return;
+        if (!confirm(`Delete ${filenames.length} image(s) from ${fmt(_galleryPerson)}?`)) return;
         try {
           const res = await fetch(`/api/person/${encodeURIComponent(_galleryPerson)}/images/bulk_delete`, {
             method: "POST",
@@ -864,7 +1427,7 @@
         const select = document.getElementById("transferTarget");
         const others = _people.filter(p => p.name !== _galleryPerson);
         select.innerHTML = others.length
-          ? others.map(p => `<option value="${p.name}">${p.name} (${p.count} images)</option>`).join("")
+          ? others.map(p => `<option value="${p.name}">${fmt(p.name)} (${p.count} images)</option>`).join("")
           : `<option value="" disabled>No other people</option>`;
 
         document.getElementById("transferModal").classList.remove("hidden");
@@ -876,7 +1439,7 @@
       }
 
       async function deleteImage(person, filename) {
-        if (!confirm(`Delete ${filename} from ${person}?`)) return;
+        if (!confirm(`Delete ${filename} from ${fmt(person)}?`)) return;
 
         try {
           const res = await fetch(
@@ -913,7 +1476,7 @@
         const select = document.getElementById("transferTarget");
         const others = _people.filter(p => p.name !== person);
         select.innerHTML = others.length
-          ? others.map(p => `<option value="${p.name}">${p.name} (${p.count} images)</option>`).join("")
+          ? others.map(p => `<option value="${p.name}">${fmt(p.name)} (${p.count} images)</option>`).join("")
           : `<option value="" disabled>No other people</option>`;
 
         document.getElementById("transferModal").classList.remove("hidden");
@@ -985,10 +1548,14 @@
       /* ===================== Keyboard shortcuts ===================== */
       document.addEventListener("keydown", (e) => {
         if (e.key === "Escape") {
-          if (_transferSource) { closeTransferModal(); return; }
-          closeRenameModal();
-          closeDeleteModal();
-          closeGalleryModal();
+          // Close the topmost visible modal (highest z-index first)
+          if (!document.getElementById("transferModal").classList.contains("hidden")) { closeTransferModal(); return; }
+          if (!document.getElementById("sectionModal").classList.contains("hidden")) { closeSectionModal(); return; }
+          if (!document.getElementById("captureModal").classList.contains("hidden")) { closeCaptureModal(); return; }
+          if (!document.getElementById("addCameraModal").classList.contains("hidden")) { closeAddCameraModal(); return; }
+          if (!document.getElementById("galleryModal").classList.contains("hidden")) { closeGalleryModal(); return; }
+          if (!document.getElementById("deleteModal").classList.contains("hidden")) { closeDeleteModal(); return; }
+          if (!document.getElementById("renameModal").classList.contains("hidden")) { closeRenameModal(); return; }
         }
         if (e.key === "Enter" && _renameTarget && !document.getElementById("renameModal").classList.contains("hidden")) {
           submitRename();
@@ -996,11 +1563,12 @@
       });
 
       /* ===================== Init ===================== */
-      loadPeople();
+      // Load sections first so manager badges are available when people render
+      loadSections().then(() => loadPeople());
       // Poll every 30s as a safety net — explicit mutations (upload, rename,
       // delete, move, merge) already call loadPeople() directly. The cache
       // in /api/people makes unchanged polls cheap.
-      setInterval(loadPeople, 30000);
+      setInterval(() => loadSections().then(() => loadPeople()), 30000);
 
       /* ===================== Toast ===================== */
       const toastContainer = document.getElementById("toastContainer");
@@ -1447,6 +2015,8 @@
           </td>
           <td class="px-2 py-1 text-right whitespace-nowrap">
             ${_saveIndicator(`cam:${c.id}`)}
+            <button type="button" data-cam-action="reconnect"
+              class="ml-1 px-2 py-1 rounded bg-slate-800 hover:bg-amber-600 text-xs font-medium" title="Force reconnect (bypasses 2-min backoff)">↻</button>
             <button type="button" data-cam-action="test"
               class="ml-1 px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-medium">${t("btn_test")}</button>
             <button type="button" data-cam-action="delete"
@@ -1647,6 +2217,36 @@
               } catch (_) {
                 _ipCamMsg("Network error", "error");
               }
+            } else if (action === "reconnect") {
+              const resolvedUrl = tr.getAttribute("data-resolved") || "";
+              const indicatorKey = `cam:${camId}`;
+              if (!resolvedUrl) {
+                _setSaveIndicator(indicatorKey, "No URL", "error");
+                return;
+              }
+              cAction.disabled = true;
+              const origText = cAction.textContent;
+              cAction.textContent = "…";
+              try {
+                const r = await fetch("/api/camera/reconnect", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ source: resolvedUrl }),
+                });
+                const j = await r.json();
+                if (j.ok) {
+                  _setSaveIndicator(indicatorKey, "Reconnecting…", "success");
+                  setTimeout(() => _setSaveIndicator(indicatorKey, ""), 4000);
+                } else {
+                  _setSaveIndicator(indicatorKey, j.error || "Not in grid", "error");
+                  setTimeout(() => _setSaveIndicator(indicatorKey, ""), 5000);
+                }
+              } catch (_) {
+                _setSaveIndicator(indicatorKey, "Network error", "error");
+              } finally {
+                cAction.disabled = false;
+                cAction.textContent = origText;
+              }
             } else if (action === "test") {
               const url = tr.getAttribute("data-resolved") || "";
               const indicatorKey = `cam:${camId}`;
@@ -1799,7 +2399,6 @@
       document.addEventListener("keydown", (e) => {
         const modal = document.getElementById("addCameraModal");
         if (!modal || modal.classList.contains("hidden")) return;
-        if (e.key === "Escape") { closeAddCameraModal(); }
         if (e.key === "Enter") { submitAddCamera(); }
       });
 
