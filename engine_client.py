@@ -97,9 +97,18 @@ class EngineClient:
     def clear_visit_activity(self, vid):
         return self._call("clear_visit_activity", vid)
 
+    # ---------- viewer ping / engine config ----------
+    def ping_viewer(self):
+        """Notify the engine a viewer is active (keeps render FPS high)."""
+        self._call("ping_viewer")
+
+    def get_config(self): return self._call("get_config")
+    def set_config(self, d): return self._call("set_config", d)
+
     # ---------- frames / tracks ----------
     def is_running(self): return bool(self._state.get("running", False))
     def get_jpeg(self): return self._state.get("jpeg")
+    def get_camera_jpeg(self, source): return (self._state.get("camera_jpegs") or {}).get(str(source))
     def get_tracks(self): return list(self._state.get("tracks", []))
     def get_qr_state(self):
         v = self._state.get("qr_state")

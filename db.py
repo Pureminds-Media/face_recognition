@@ -74,7 +74,9 @@ CREATE TABLE IF NOT EXISTS people (
     name        TEXT PRIMARY KEY,
     section     TEXT NOT NULL DEFAULT '',
     branch      TEXT NOT NULL DEFAULT 'Riyadh',
-    email       TEXT NOT NULL DEFAULT ''
+    email       TEXT NOT NULL DEFAULT '',
+    arabic_name TEXT NOT NULL DEFAULT '',
+    shift       TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS sections (
@@ -82,6 +84,34 @@ CREATE TABLE IF NOT EXISTS sections (
     name    TEXT NOT NULL UNIQUE,
     manager TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS daily_reports (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_date     TEXT NOT NULL,
+    generated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    arrival_camera  TEXT NOT NULL DEFAULT '',
+    exit_camera     TEXT NOT NULL DEFAULT '',
+    work_start      TEXT NOT NULL DEFAULT '08:00',
+    late_threshold  INTEGER NOT NULL DEFAULT 15,
+    total_people    INTEGER NOT NULL DEFAULT 0,
+    late_arrivals   INTEGER NOT NULL DEFAULT 0,
+    late_exits      INTEGER NOT NULL DEFAULT 0,
+    records_json    TEXT NOT NULL DEFAULT '[]',
+    sent_email      INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_reports_date ON daily_reports (report_date);
+
+CREATE TABLE IF NOT EXISTS gate_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_name     TEXT NOT NULL,
+    event_date      TEXT NOT NULL,
+    exit_time       TEXT NOT NULL,
+    entry_time      TEXT,
+    duration_minutes REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gate_events_person_date ON gate_events (person_name, event_date);
 """
 
 _PG_SCHEMA = """
@@ -124,7 +154,9 @@ CREATE TABLE IF NOT EXISTS people (
     name        TEXT PRIMARY KEY,
     section     TEXT NOT NULL DEFAULT '',
     branch      TEXT NOT NULL DEFAULT 'Riyadh',
-    email       TEXT NOT NULL DEFAULT ''
+    email       TEXT NOT NULL DEFAULT '',
+    arabic_name TEXT NOT NULL DEFAULT '',
+    shift       TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS sections (
@@ -132,6 +164,34 @@ CREATE TABLE IF NOT EXISTS sections (
     name    TEXT NOT NULL UNIQUE,
     manager TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS daily_reports (
+    id              SERIAL PRIMARY KEY,
+    report_date     TEXT NOT NULL,
+    generated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    arrival_camera  TEXT NOT NULL DEFAULT '',
+    exit_camera     TEXT NOT NULL DEFAULT '',
+    work_start      TEXT NOT NULL DEFAULT '08:00',
+    late_threshold  INTEGER NOT NULL DEFAULT 15,
+    total_people    INTEGER NOT NULL DEFAULT 0,
+    late_arrivals   INTEGER NOT NULL DEFAULT 0,
+    late_exits      INTEGER NOT NULL DEFAULT 0,
+    records_json    TEXT NOT NULL DEFAULT '[]',
+    sent_email      BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_reports_date ON daily_reports (report_date);
+
+CREATE TABLE IF NOT EXISTS gate_events (
+    id              SERIAL PRIMARY KEY,
+    person_name     TEXT NOT NULL,
+    event_date      TEXT NOT NULL,
+    exit_time       TIMESTAMPTZ NOT NULL,
+    entry_time      TIMESTAMPTZ,
+    duration_minutes REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gate_events_person_date ON gate_events (person_name, event_date);
 """
 
 
@@ -205,6 +265,63 @@ def init_db(dsn=None):
                     cur.execute("ALTER TABLE sections ADD COLUMN manager TEXT NOT NULL DEFAULT ''")
                 except Exception:
                     pass
+                try:
+                    cur.execute("ALTER TABLE people ADD COLUMN arabic_name TEXT NOT NULL DEFAULT ''")
+                except Exception:
+                    pass
+                try:
+                    cur.execute("ALTER TABLE people ADD COLUMN shift TEXT NOT NULL DEFAULT ''")
+                except Exception:
+                    pass
+                try:
+                    cur.execute("""CREATE TABLE IF NOT EXISTS daily_reports (
+                        id SERIAL PRIMARY KEY,
+                        report_date TEXT NOT NULL,
+                        generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        arrival_camera TEXT NOT NULL DEFAULT '',
+                        exit_camera TEXT NOT NULL DEFAULT '',
+                        work_start TEXT NOT NULL DEFAULT '08:00',
+                        late_threshold INTEGER NOT NULL DEFAULT 15,
+                        total_people INTEGER NOT NULL DEFAULT 0,
+                        late_arrivals INTEGER NOT NULL DEFAULT 0,
+                        late_exits INTEGER NOT NULL DEFAULT 0,
+                        records_json TEXT NOT NULL DEFAULT '[]',
+                        sent_email BOOLEAN NOT NULL DEFAULT FALSE
+                    )""")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_daily_reports_date ON daily_reports (report_date)")
+                except Exception:
+                    pass
+                try:
+                    cur.execute("""CREATE TABLE IF NOT EXISTS gate_events (
+                        id SERIAL PRIMARY KEY,
+                        person_name TEXT NOT NULL,
+                        event_date TEXT NOT NULL,
+                        exit_time TIMESTAMPTZ NOT NULL,
+                        entry_time TIMESTAMPTZ,
+                        duration_minutes REAL
+                    )""")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_gate_events_person_date ON gate_events (person_name, event_date)")
+                except Exception:
+                    pass
+                try:
+                    cur.execute("""CREATE TABLE IF NOT EXISTS zones (
+                        id SERIAL PRIMARY KEY,
+                        name TEXT NOT NULL UNIQUE,
+                        description TEXT NOT NULL DEFAULT '',
+                        branch TEXT NOT NULL DEFAULT 'Riyadh',
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )""")
+                    cur.execute("""CREATE TABLE IF NOT EXISTS zone_cameras (
+                        zone_id INTEGER NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
+                        location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+                        PRIMARY KEY (zone_id, location_id)
+                    )""")
+                except Exception:
+                    pass
+                try:
+                    cur.execute("ALTER TABLE people ADD COLUMN home_zone_id INTEGER REFERENCES zones(id)")
+                except Exception:
+                    pass
             _backend = "postgres"
             log.info("Database initialised (PostgreSQL)")
             return
@@ -269,6 +386,75 @@ def init_db(dsn=None):
             pass
         try:
             conn.execute("ALTER TABLE sections ADD COLUMN manager TEXT NOT NULL DEFAULT ''")
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE people ADD COLUMN arabic_name TEXT NOT NULL DEFAULT ''")
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE people ADD COLUMN shift TEXT NOT NULL DEFAULT ''")
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS daily_reports (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    report_date     TEXT NOT NULL,
+                    generated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                    arrival_camera  TEXT NOT NULL DEFAULT '',
+                    exit_camera     TEXT NOT NULL DEFAULT '',
+                    work_start      TEXT NOT NULL DEFAULT '08:00',
+                    late_threshold  INTEGER NOT NULL DEFAULT 15,
+                    total_people    INTEGER NOT NULL DEFAULT 0,
+                    late_arrivals   INTEGER NOT NULL DEFAULT 0,
+                    late_exits      INTEGER NOT NULL DEFAULT 0,
+                    records_json    TEXT NOT NULL DEFAULT '[]',
+                    sent_email      INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_daily_reports_date ON daily_reports (report_date);
+            """)
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS gate_events (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    person_name     TEXT NOT NULL,
+                    event_date      TEXT NOT NULL,
+                    exit_time       TEXT NOT NULL,
+                    entry_time      TEXT,
+                    duration_minutes REAL
+                );
+                CREATE INDEX IF NOT EXISTS idx_gate_events_person_date ON gate_events (person_name, event_date);
+            """)
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS zones (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name        TEXT NOT NULL UNIQUE,
+                    description TEXT NOT NULL DEFAULT '',
+                    branch      TEXT NOT NULL DEFAULT 'Riyadh',
+                    created_at  TEXT DEFAULT (datetime('now'))
+                );
+                CREATE TABLE IF NOT EXISTS zone_cameras (
+                    zone_id     INTEGER NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
+                    location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+                    PRIMARY KEY (zone_id, location_id)
+                );
+            """)
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE people ADD COLUMN home_zone_id INTEGER REFERENCES zones(id)")
             conn.commit()
         except Exception:
             pass
@@ -786,26 +972,28 @@ def clear_all_data():
 # ---------------------------------------------------------------------------
 
 def get_person_meta(name):
-    """Return {name, section, branch} for a person, or None if not found."""
+    """Return {name, section, branch, email, arabic_name, shift} for a person, or None if not found."""
     ph = "?" if _backend == "sqlite" else "%s"
     with _cursor() as cur:
-        cur.execute(f"SELECT name, section, branch FROM people WHERE name = {ph}", (name,))
+        cur.execute(f"SELECT name, section, branch, email, arabic_name, shift FROM people WHERE name = {ph}", (name,))
         row = cur.fetchone()
     return _row_to_dict(row) if row else None
 
 
-def upsert_person_meta(name, section=None, branch=None, email=None):
-    """Insert or update section/branch/email for a person."""
+def upsert_person_meta(name, section=None, branch=None, email=None, arabic_name=None, shift=None):
+    """Insert or update section/branch/email/arabic_name/shift for a person."""
     ph = "?" if _backend == "sqlite" else "%s"
     existing = get_person_meta(name)
     if existing is None:
         section = section if section is not None else ""
         branch = branch if branch is not None else "Riyadh"
         email = email if email is not None else ""
+        arabic_name = arabic_name if arabic_name is not None else ""
+        shift = shift if shift is not None else ""
         with _cursor(commit=True) as cur:
             cur.execute(
-                f"INSERT INTO people (name, section, branch, email) VALUES ({ph},{ph},{ph},{ph})",
-                (name, section, branch, email),
+                f"INSERT INTO people (name, section, branch, email, arabic_name, shift) VALUES ({ph},{ph},{ph},{ph},{ph},{ph})",
+                (name, section, branch, email, arabic_name, shift),
             )
     else:
         updates, params = [], []
@@ -815,6 +1003,10 @@ def upsert_person_meta(name, section=None, branch=None, email=None):
             updates.append(f"branch = {ph}"); params.append(branch)
         if email is not None:
             updates.append(f"email = {ph}"); params.append(email)
+        if arabic_name is not None:
+            updates.append(f"arabic_name = {ph}"); params.append(arabic_name)
+        if shift is not None:
+            updates.append(f"shift = {ph}"); params.append(shift)
         if updates:
             params.append(name)
             with _cursor(commit=True) as cur:
@@ -836,9 +1028,9 @@ def delete_person_meta(name):
 
 
 def get_all_people_meta():
-    """Return list of {name, section, branch, email} for all people with metadata."""
+    """Return list of {name, section, branch, email, arabic_name, shift, home_zone_id} for all people with metadata."""
     with _cursor() as cur:
-        cur.execute("SELECT name, section, branch, email FROM people ORDER BY name")
+        cur.execute("SELECT name, section, branch, email, arabic_name, shift, home_zone_id FROM people ORDER BY name")
         return _rows_to_dicts(cur.fetchall())
 
 
@@ -885,6 +1077,14 @@ def create_section(name):
         return {"id": new_id, "name": name}
 
 
+def rename_section(old_name, new_name):
+    """Rename a section and update all people assigned to it."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    with _cursor(commit=True) as cur:
+        cur.execute(f"UPDATE sections SET name = {ph} WHERE name = {ph}", (new_name, old_name))
+        cur.execute(f"UPDATE people SET section = {ph} WHERE section = {ph}", (new_name, old_name))
+
+
 def delete_section(name):
     """Delete a section and clear people.section for anyone in it."""
     ph = "?" if _backend == "sqlite" else "%s"
@@ -924,3 +1124,419 @@ def remove_person_section(person_name):
     ph = "?" if _backend == "sqlite" else "%s"
     with _cursor(commit=True) as cur:
         cur.execute(f"UPDATE people SET section = '' WHERE name = {ph}", (person_name,))
+
+
+# ---------------------------------------------------------------------------
+# Daily reports
+# ---------------------------------------------------------------------------
+
+def save_daily_report(report_date, arrival_camera, exit_camera, work_start,
+                      late_threshold, records, sent_email=False):
+    """Insert or replace today's report snapshot. Returns the row id."""
+    import json as _json
+    ph = "?" if _backend == "sqlite" else "%s"
+    records_json = _json.dumps(records, ensure_ascii=False, default=str)
+    total = len(records)
+    late_arr = sum(1 for r in records if r.get("arrived_late"))
+    late_ext = sum(1 for r in records if r.get("late_exits_count", 0) > 0)
+    sent = 1 if sent_email else 0
+    now_str = datetime.now(timezone.utc).isoformat()
+
+    # Upsert: replace existing row for the same date if present
+    with _cursor(commit=True) as cur:
+        if _backend == "sqlite":
+            cur.execute("""
+                INSERT INTO daily_reports
+                    (report_date, generated_at, arrival_camera, exit_camera,
+                     work_start, late_threshold, total_people, late_arrivals,
+                     late_exits, records_json, sent_email)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT DO NOTHING
+            """, (report_date, now_str, arrival_camera, exit_camera,
+                  work_start, late_threshold, total, late_arr, late_ext,
+                  records_json, sent))
+            # Always update so re-running overwrites with fresh data
+            cur.execute("""
+                UPDATE daily_reports SET
+                    generated_at=?, arrival_camera=?, exit_camera=?,
+                    work_start=?, late_threshold=?, total_people=?,
+                    late_arrivals=?, late_exits=?, records_json=?, sent_email=?
+                WHERE report_date=?
+            """, (now_str, arrival_camera, exit_camera, work_start,
+                  late_threshold, total, late_arr, late_ext,
+                  records_json, sent, report_date))
+        else:
+            cur.execute(f"""
+                INSERT INTO daily_reports
+                    (report_date, generated_at, arrival_camera, exit_camera,
+                     work_start, late_threshold, total_people, late_arrivals,
+                     late_exits, records_json, sent_email)
+                VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph})
+                ON CONFLICT (report_date) DO UPDATE SET
+                    generated_at=EXCLUDED.generated_at,
+                    arrival_camera=EXCLUDED.arrival_camera,
+                    exit_camera=EXCLUDED.exit_camera,
+                    work_start=EXCLUDED.work_start,
+                    late_threshold=EXCLUDED.late_threshold,
+                    total_people=EXCLUDED.total_people,
+                    late_arrivals=EXCLUDED.late_arrivals,
+                    late_exits=EXCLUDED.late_exits,
+                    records_json=EXCLUDED.records_json,
+                    sent_email=EXCLUDED.sent_email
+            """, (report_date, now_str, arrival_camera, exit_camera,
+                  work_start, late_threshold, total, late_arr, late_ext,
+                  records_json, sent))
+
+
+def get_daily_report(report_date):
+    """Return a single saved report row or None."""
+    import json as _json
+    ph = "?" if _backend == "sqlite" else "%s"
+    with _cursor() as cur:
+        cur.execute(
+            f"SELECT * FROM daily_reports WHERE report_date = {ph}", (report_date,)
+        )
+        row = _row_to_dict(cur.fetchone())
+    if row and row.get("records_json"):
+        try:
+            row["records"] = _json.loads(row["records_json"])
+        except Exception:
+            row["records"] = []
+    return row
+
+
+def list_daily_reports(limit=60):
+    """Return most recent saved report summaries (no records_json)."""
+    with _cursor() as cur:
+        cur.execute("""
+            SELECT id, report_date, generated_at, arrival_camera, exit_camera,
+                   work_start, late_threshold, total_people, late_arrivals,
+                   late_exits, sent_email
+            FROM daily_reports
+            ORDER BY report_date DESC
+            LIMIT ?
+        """ if _backend == "sqlite" else """
+            SELECT id, report_date, generated_at, arrival_camera, exit_camera,
+                   work_start, late_threshold, total_people, late_arrivals,
+                   late_exits, sent_email
+            FROM daily_reports
+            ORDER BY report_date DESC
+            LIMIT %s
+        """, (limit,))
+        return _rows_to_dicts(cur.fetchall())
+
+
+# ---------------------------------------------------------------------------
+# Gate events (real-time exit/entry tracking)
+# ---------------------------------------------------------------------------
+
+def open_gate_exit(person_name, exit_dt):
+    """Open a new gate event row when person is seen on exit camera."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    event_date = exit_dt.astimezone().strftime("%Y-%m-%d")
+    exit_str = exit_dt.isoformat() if _backend == "sqlite" else exit_dt
+    with _cursor(commit=True) as cur:
+        cur.execute(
+            f"INSERT INTO gate_events (person_name, event_date, exit_time) VALUES ({ph},{ph},{ph})",
+            (person_name, event_date, exit_str),
+        )
+        if _backend == "sqlite":
+            return cur.lastrowid
+        cur.execute("SELECT lastval()")
+        return cur.fetchone()[0]
+
+
+def close_gate_entry(person_name, entry_dt):
+    """Close the most recent open gate event for person when seen on entry camera."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    entry_str = entry_dt.isoformat() if _backend == "sqlite" else entry_dt
+    with _cursor(commit=True) as cur:
+        # Find the newest open row (entry_time IS NULL)
+        cur.execute(
+            f"SELECT id, exit_time FROM gate_events WHERE person_name = {ph} AND entry_time IS NULL ORDER BY exit_time DESC LIMIT 1",
+            (person_name,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        row_id = row[0]
+        exit_str_raw = row[1]
+        try:
+            if isinstance(exit_str_raw, str):
+                from datetime import datetime as _dt, timezone as _tz
+                exit_dt_stored = _dt.fromisoformat(exit_str_raw)
+                if exit_dt_stored.tzinfo is None:
+                    exit_dt_stored = exit_dt_stored.replace(tzinfo=_tz.utc)
+            else:
+                exit_dt_stored = exit_str_raw
+            duration = round((entry_dt - exit_dt_stored).total_seconds() / 60, 1)
+        except Exception:
+            duration = None
+        cur.execute(
+            f"UPDATE gate_events SET entry_time={ph}, duration_minutes={ph} WHERE id={ph}",
+            (entry_str, duration, row_id),
+        )
+        return row_id
+
+
+def get_gate_events(date_str, person_name=None):
+    """Return gate_events rows for a date, optionally filtered by person."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    if person_name:
+        sql = f"SELECT * FROM gate_events WHERE event_date = {ph} AND person_name = {ph} ORDER BY exit_time"
+        params = (date_str, person_name)
+    else:
+        sql = f"SELECT * FROM gate_events WHERE event_date = {ph} ORDER BY person_name, exit_time"
+        params = (date_str,)
+    with _cursor() as cur:
+        cur.execute(sql, params)
+        return _rows_to_dicts(cur.fetchall())
+
+
+def get_gate_events_range(date_from_str, date_to_str):
+    """Return gate_events rows between two dates (inclusive)."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    with _cursor() as cur:
+        cur.execute(
+            f"SELECT * FROM gate_events WHERE event_date >= {ph} AND event_date <= {ph} ORDER BY person_name, event_date, exit_time",
+            (date_from_str, date_to_str),
+        )
+        return _rows_to_dicts(cur.fetchall())
+
+
+# ---------------------------------------------------------------------------
+# Zones
+# ---------------------------------------------------------------------------
+
+def get_zones(branch=None):
+    ph = "?" if _backend == "sqlite" else "%s"
+    with _cursor() as cur:
+        if branch:
+            cur.execute(f"SELECT * FROM zones WHERE branch = {ph} ORDER BY name", (branch,))
+        else:
+            cur.execute("SELECT * FROM zones ORDER BY name")
+        return _rows_to_dicts(cur.fetchall())
+
+
+def get_zone(zone_id):
+    ph = "?" if _backend == "sqlite" else "%s"
+    with _cursor() as cur:
+        cur.execute(f"SELECT * FROM zones WHERE id = {ph}", (zone_id,))
+        rows = _rows_to_dicts(cur.fetchall())
+        return rows[0] if rows else None
+
+
+def create_zone(name, description='', branch='Riyadh'):
+    ph = "?" if _backend == "sqlite" else "%s"
+    with _cursor(commit=True) as cur:
+        cur.execute(
+            f"INSERT INTO zones (name, description, branch) VALUES ({ph},{ph},{ph})",
+            (name, description, branch),
+        )
+        if _backend == "sqlite":
+            cur.execute("SELECT last_insert_rowid()")
+        else:
+            cur.execute("SELECT lastval()")
+        return cur.fetchone()[0]
+
+
+def update_zone(zone_id, name=None, description=None, branch=None):
+    ph = "?" if _backend == "sqlite" else "%s"
+    fields, params = [], []
+    if name is not None:
+        fields.append(f"name = {ph}"); params.append(name)
+    if description is not None:
+        fields.append(f"description = {ph}"); params.append(description)
+    if branch is not None:
+        fields.append(f"branch = {ph}"); params.append(branch)
+    if not fields:
+        return
+    params.append(zone_id)
+    with _cursor(commit=True) as cur:
+        cur.execute(f"UPDATE zones SET {', '.join(fields)} WHERE id = {ph}", params)
+
+
+def delete_zone(zone_id):
+    ph = "?" if _backend == "sqlite" else "%s"
+    with _cursor(commit=True) as cur:
+        cur.execute(f"DELETE FROM zones WHERE id = {ph}", (zone_id,))
+
+
+def get_zone_cameras(zone_id):
+    ph = "?" if _backend == "sqlite" else "%s"
+    with _cursor() as cur:
+        cur.execute(
+            f"SELECT l.id, l.name, l.camera_source FROM zone_cameras zc JOIN locations l ON l.id = zc.location_id WHERE zc.zone_id = {ph} ORDER BY l.name",
+            (zone_id,),
+        )
+        return _rows_to_dicts(cur.fetchall())
+
+
+def set_zone_cameras(zone_id, location_ids):
+    ph = "?" if _backend == "sqlite" else "%s"
+    with _cursor(commit=True) as cur:
+        cur.execute(f"DELETE FROM zone_cameras WHERE zone_id = {ph}", (zone_id,))
+        for loc_id in location_ids:
+            cur.execute(f"INSERT INTO zone_cameras (zone_id, location_id) VALUES ({ph},{ph})", (zone_id, loc_id))
+
+
+def get_zone_members(zone_id):
+    ph = "?" if _backend == "sqlite" else "%s"
+    with _cursor() as cur:
+        cur.execute(f"SELECT name FROM people WHERE home_zone_id = {ph} ORDER BY name", (zone_id,))
+        return [r["name"] for r in _rows_to_dicts(cur.fetchall())]
+
+
+def set_person_home_zone(person_name, zone_id_or_null):
+    ph = "?" if _backend == "sqlite" else "%s"
+    with _cursor(commit=True) as cur:
+        cur.execute(
+            f"UPDATE people SET home_zone_id = {ph} WHERE name = {ph}",
+            (zone_id_or_null, person_name),
+        )
+
+
+def get_zone_status_snapshot(away_threshold_minutes=30):
+    """Return zone status for every person with a home zone assigned."""
+    from datetime import datetime, timezone
+
+    if _backend == "sqlite":
+        sql = """
+        WITH open_visits AS (
+            SELECT v.person_name, v.location_id, v.last_seen, l.name AS location_name
+            FROM visits v JOIN locations l ON l.id = v.location_id
+            WHERE NOT v.ended
+        ),
+        open_gate_exits AS (
+            SELECT person_name FROM gate_events
+            WHERE event_date = date('now','localtime') AND entry_time IS NULL
+        ),
+        people_with_zone AS (
+            SELECT p.name, p.home_zone_id, z.name AS home_zone_name, z.branch
+            FROM people p JOIN zones z ON z.id = p.home_zone_id
+            WHERE p.home_zone_id IS NOT NULL
+        )
+        SELECT
+            pw.name,
+            pw.home_zone_id,
+            pw.home_zone_name,
+            pw.branch,
+            ov.location_id AS current_location_id,
+            ov.location_name AS current_location_name,
+            zc.zone_id AS current_zone_id,
+            ov.last_seen AS last_seen_utc,
+            CASE
+                WHEN oge.person_name IS NOT NULL THEN 'out_of_building'
+                WHEN ov.person_name IS NULL      THEN 'away'
+                WHEN zc.zone_id = pw.home_zone_id THEN 'in_zone'
+                ELSE 'out_of_zone'
+            END AS status
+        FROM people_with_zone pw
+        LEFT JOIN open_visits ov ON ov.person_name = pw.name
+        LEFT JOIN open_gate_exits oge ON oge.person_name = pw.name
+        LEFT JOIN zone_cameras zc ON zc.location_id = ov.location_id
+        ORDER BY pw.home_zone_name, pw.name
+        """
+    else:
+        sql = """
+        WITH open_visits AS (
+            SELECT v.person_name, v.location_id, v.last_seen, l.name AS location_name
+            FROM visits v JOIN locations l ON l.id = v.location_id
+            WHERE NOT v.ended
+        ),
+        open_gate_exits AS (
+            SELECT person_name FROM gate_events
+            WHERE event_date = CURRENT_DATE AND entry_time IS NULL
+        ),
+        people_with_zone AS (
+            SELECT p.name, p.home_zone_id, z.name AS home_zone_name, z.branch
+            FROM people p JOIN zones z ON z.id = p.home_zone_id
+            WHERE p.home_zone_id IS NOT NULL
+        )
+        SELECT
+            pw.name,
+            pw.home_zone_id,
+            pw.home_zone_name,
+            pw.branch,
+            ov.location_id AS current_location_id,
+            ov.location_name AS current_location_name,
+            zc.zone_id AS current_zone_id,
+            ov.last_seen AS last_seen_utc,
+            CASE
+                WHEN oge.person_name IS NOT NULL THEN 'out_of_building'
+                WHEN ov.person_name IS NULL      THEN 'away'
+                WHEN zc.zone_id = pw.home_zone_id THEN 'in_zone'
+                ELSE 'out_of_zone'
+            END AS status
+        FROM people_with_zone pw
+        LEFT JOIN open_visits ov ON ov.person_name = pw.name
+        LEFT JOIN open_gate_exits oge ON oge.person_name = pw.name
+        LEFT JOIN zone_cameras zc ON zc.location_id = ov.location_id
+        ORDER BY pw.home_zone_name, pw.name
+        """
+
+    with _cursor() as cur:
+        cur.execute(sql)
+        rows = _rows_to_dicts(cur.fetchall())
+
+    # Post-process: recently-seen person whose visit just closed → treat as in_zone
+    now_utc = datetime.now(timezone.utc)
+    for row in rows:
+        if row['status'] == 'away' and row.get('last_seen_utc'):
+            try:
+                ls = row['last_seen_utc']
+                if isinstance(ls, str):
+                    ls = datetime.fromisoformat(ls.replace('Z', '+00:00'))
+                if ls.tzinfo is None:
+                    ls = ls.replace(tzinfo=timezone.utc)
+                elapsed = (now_utc - ls).total_seconds() / 60
+                if elapsed < away_threshold_minutes:
+                    row['status'] = 'in_zone'
+            except Exception:
+                pass
+    return rows
+
+
+def get_zone_compliance_report(date_from, date_to, branch=None):
+    """Return per-person per-day zone compliance stats between date_from and date_to (YYYY-MM-DD)."""
+    ph = "?" if _backend == "sqlite" else "%s"
+
+    if _backend == "sqlite":
+        duration_in = f"(julianday(v.last_seen) - julianday(v.first_seen)) * 1440"
+        day_expr = "date(v.first_seen, 'localtime')"
+    else:
+        duration_in = "EXTRACT(EPOCH FROM (v.last_seen::timestamptz - v.first_seen::timestamptz)) / 60.0"
+        day_expr = "DATE(v.first_seen AT TIME ZONE 'localtime')"
+
+    branch_filter = f" AND z.branch = {ph}" if branch else ""
+    params = [date_from, date_to + " 23:59:59"]
+    if branch:
+        params.append(branch)
+
+    sql = f"""
+        SELECT
+            v.person_name,
+            z.name AS home_zone_name,
+            z.id AS home_zone_id,
+            {day_expr} AS day,
+            SUM(CASE WHEN zc.zone_id = p.home_zone_id
+                     THEN {duration_in} ELSE 0 END) AS minutes_in_zone,
+            SUM(CASE WHEN zc.zone_id IS NULL OR zc.zone_id != p.home_zone_id
+                     THEN {duration_in} ELSE 0 END) AS minutes_out_of_zone,
+            COUNT(CASE WHEN zc.zone_id IS NULL OR zc.zone_id != p.home_zone_id THEN 1 END) AS out_of_zone_events
+        FROM visits v
+        JOIN people p ON p.name = v.person_name
+        JOIN zones z ON z.id = p.home_zone_id
+        LEFT JOIN zone_cameras zc ON zc.location_id = v.location_id
+        WHERE v.first_seen >= {ph}
+          AND v.first_seen <= {ph}
+          AND v.person_name NOT LIKE 'unknown_%'
+          AND p.home_zone_id IS NOT NULL
+          {branch_filter}
+        GROUP BY v.person_name, z.name, z.id, {day_expr}
+        ORDER BY z.name, v.person_name, day
+    """
+
+    with _cursor() as cur:
+        cur.execute(sql, params)
+        return _rows_to_dicts(cur.fetchall())

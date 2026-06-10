@@ -173,6 +173,87 @@ def create_tracker(tracker_type: str):
     return tr
 
 
+class RtspConnectionPool:
+    """Manages a bounded number of concurrent RTSP connections.
+
+    Tracks which camera sources are active and enforces an LRU eviction
+    policy when the pool is full.  The pool does *not* own the capture
+    objects — it only notifies the engine via *on_evict* so the engine
+    can detach the capture from its worker cleanly.
+    """
+
+    def __init__(self, max_connections: int = 3, on_evict=None):
+        self._max = max(1, max_connections)
+        self._on_evict = on_evict
+        self._lock = threading.Lock()
+        self._active: set = set()     # source keys currently holding a slot
+        self._lru: list = []          # sources ordered LRU-first
+
+    @property
+    def active_sources(self) -> list:
+        with self._lock:
+            return list(self._lru)
+
+    @property
+    def active_count(self) -> int:
+        with self._lock:
+            return len(self._active)
+
+    def acquire(self, source: str) -> bool:
+        """Request a slot for *source*.  Returns True if the source was
+        *not* previously active (i.e. the caller should open a connection).
+        Returns False when the source already holds a slot — nothing to do.
+        May trigger an LRU eviction; *on_evict* is called for each
+        evicted source *outside* the pool lock."""
+        evicted = []
+        with self._lock:
+            if source in self._active:
+                self._touch_locked(source)
+                return False
+            while len(self._active) >= self._max and self._lru:
+                evict = self._lru.pop(0)
+                self._active.discard(evict)
+                evicted.append(evict)
+            self._active.add(source)
+            self._lru.append(source)
+        for e in evicted:
+            if self._on_evict:
+                try:
+                    self._on_evict(e)
+                except Exception:
+                    pass
+        return True
+
+    def release(self, source: str) -> None:
+        """Explicitly release the slot held by *source*."""
+        with self._lock:
+            self._active.discard(source)
+            if source in self._lru:
+                self._lru.remove(source)
+
+    def contains(self, source: str) -> bool:
+        with self._lock:
+            return source in self._active
+
+    def release_all(self) -> None:
+        """Release every active slot (calls *on_evict* for each)."""
+        evicted = []
+        with self._lock:
+            evicted = list(self._active)
+            self._active.clear()
+            self._lru.clear()
+        for e in evicted:
+            if self._on_evict:
+                try:
+                    self._on_evict(e)
+                except Exception:
+                    pass
+
+    def _touch_locked(self, source: str) -> None:
+        self._lru.remove(source)
+        self._lru.append(source)
+
+
 class FaceEngine:
     def __init__(
         self,
@@ -187,8 +268,12 @@ class FaceEngine:
         width=1920,
         height=1080,
         out_fps=15,
-        jpeg_quality=80,
+        jpeg_quality=100,
+        viewer_jpeg_quality=85,
+        motion_gate=True,
+        motion_thresh=1000,
         live_annotations=True,
+        min_face_size=10,
     ):
         self.known_dir = known_dir
         self.detector = detector
@@ -202,6 +287,12 @@ class FaceEngine:
         self.height = height
         self.out_fps = out_fps
         self.jpeg_quality = jpeg_quality
+        self.viewer_jpeg_quality = viewer_jpeg_quality
+        self.motion_gate = bool(motion_gate)
+        self.motion_thresh = int(motion_thresh)
+        self.min_face_size = int(min_face_size)
+        self.high_priority_sources = set()  # always full-res, no motion gate
+        self._last_viewer_req_t = 0.0
         # Whether to render bounding boxes + name labels onto the live
         # MJPEG stream. Footage and screenshots are always annotated.
         self.live_annotations = bool(live_annotations)
@@ -229,6 +320,16 @@ class FaceEngine:
         self._grid_workers = {}
         self._grid_workers_lock = threading.Lock()
         self._grid_sources = []
+        # Bounded RTSP connection pool — only this many cameras will have
+        # a live RTSP stream open at any time.  The rest sit in a
+        # "disconnected" state and connect on demand when the user views
+        # them.  The number is configurable via the environment so it can
+        # be tuned to each deployment's NVR / camera stream-slot budget.
+        _pool_max = int(os.environ.get("MAX_CONCURRENT_RTSP", "3"))
+        self._rtsp_pool = RtspConnectionPool(
+            max_connections=_pool_max,
+            on_evict=self._on_rtsp_evicted,
+        )
         # Optional friendly-name lookup for grid tile labels:
         # { "<source-string>": "<friendly name>" }
         # Set by callers (e.g. app.py) before/after start(). Falls back to
@@ -263,7 +364,7 @@ class FaceEngine:
         self._latest_tracks = []
         self._running = False
         self._qr_detector = cv2.QRCodeDetector()
-        self.qr_scan_every = 0.5  # seconds (2 scans/sec). Increase if CPU is high.
+        self.qr_scan_every = 1.5  # seconds; QR codes persist and CPU decode is heavy
         self._last_qr_scan_t = 0.0
         self._latest_qr = None  # last decoded QR string
         self._latest_qr_t = 0.0 # monotonic time of last decoded QR
@@ -272,7 +373,7 @@ class FaceEngine:
         # Consumed by app.py when opening a new visit.
         # Rolling frame ring buffer per camera source.
         # Key: str(camera_source)  Value: deque of numpy_frame
-        self.FOOTAGE_RING_SECS = 1.0  # 1 second per camera — reduced for multi-camera RAM
+        self.FOOTAGE_RING_SECS = 0.5  # 0.5 second per camera — reduces RAM for multi-camera
         self._frame_ring = {}  # camera_source -> deque
         self._frame_ring_lock = threading.Lock()
         self._ring_frame_counts = {}  # camera_source -> (start_mono, frame_count)
@@ -457,7 +558,7 @@ class FaceEngine:
     def _janitor_loop(self):
         """Periodically prune unbounded in-memory state."""
         ACTIVITY_RESULT_TTL = 30.0
-        ORPHAN_WRITER_TTL = 300.0
+        ORPHAN_WRITER_TTL = 60.0
         EXTRA_CAPTURE_TTL = 1800.0  # _last_extra_capture_at entries older than 30 min
         UNKNOWN_PENDING_TTL = 120.0  # pending capture entries with no update for 2 min
         TICK = 30.0
@@ -519,8 +620,10 @@ class FaceEngine:
                             self._writer_last_fed.pop(vid, None)
 
                 # 5) Dead-thread detection: respawn capture/detect threads
-                #    that haven't ticked their heartbeat in 30 seconds.
+                #    that have died. Also detect stuck threads via stale
+                #    heartbeat timestamps and force a reconnect to unblock.
                 THREAD_STALE_SECS = 30.0
+                _now = time.monotonic()
                 with self._grid_workers_lock:
                     _gw_snap = list(self._grid_workers.items())
                 for src, worker in _gw_snap:
@@ -528,6 +631,7 @@ class FaceEngine:
                         continue
                     try:
                         ct = worker.get("capture_thread")
+                        cap_hb = float(worker.get("capture_heartbeat_t", 0.0))
                         if ct is not None and not ct.is_alive():
                             import logging as _log2
                             _log2.getLogger("face_engine").warning(
@@ -539,7 +643,16 @@ class FaceEngine:
                             )
                             worker["capture_thread"] = tw
                             tw.start()
+                        elif ct is not None and cap_hb > 0 and (_now - cap_hb) > THREAD_STALE_SECS:
+                            import logging as _log2
+                            _log2.getLogger("face_engine").warning(
+                                "janitor: capture thread STUCK for %.0fs on %s — forcing reconnect",
+                                _now - cap_hb, src,
+                            )
+                            with worker["lock"]:
+                                worker["_force_reconnect"] = True
                         dt = worker.get("detect_thread")
+                        det_hb = float(worker.get("detect_heartbeat_t", 0.0))
                         if dt is not None and not dt.is_alive():
                             import logging as _log2
                             _log2.getLogger("face_engine").warning(
@@ -551,6 +664,12 @@ class FaceEngine:
                             )
                             worker["detect_thread"] = tw
                             tw.start()
+                        elif dt is not None and det_hb > 0 and (_now - det_hb) > THREAD_STALE_SECS:
+                            import logging as _log2
+                            _log2.getLogger("face_engine").warning(
+                                "janitor: detect thread STUCK for %.0fs on %s",
+                                _now - det_hb, src,
+                            )
                     except Exception:
                         pass
             except Exception:
@@ -787,6 +906,65 @@ class FaceEngine:
                 return self._latest_single_jpeg
             return self._latest_jpeg
 
+    def get_camera_jpeg(self, source: str):
+        """Return a freshly encoded JPEG for a specific camera source, or None.
+
+        Prefers pre-encoded JPEG bytes from the render loop (``latest_jpeg_bytes``)
+        so the mirror loop does not re-encode every camera every tick.  Falls back
+        to on-demand encoding when the pre-encoded bytes are not available (e.g.
+        before the first grid render iteration).
+        """
+        with self._grid_workers_lock:
+            w = self._grid_workers.get(str(source))
+        if w is None:
+            return None
+        with w["lock"]:
+            jpeg_bytes = w.get("latest_jpeg_bytes")
+            if jpeg_bytes is not None:
+                return jpeg_bytes
+            if self.live_annotations:
+                frame = w.get("latest_annotated_frame") or w.get("latest_frame")
+            else:
+                frame = w.get("latest_frame")
+        if frame is None:
+            return None
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.viewer_jpeg_quality])
+        return bytes(buf) if ok else None
+
+    def ping_viewer(self):
+        """Record that a viewer is actively requesting frames."""
+        self._last_viewer_req_t = time.monotonic()
+
+    def get_config(self):
+        return {
+            "detect_every": self.detect_every,
+            "out_fps": self.out_fps,
+            "jpeg_quality": self.jpeg_quality,
+            "viewer_jpeg_quality": self.viewer_jpeg_quality,
+            "motion_gate": self.motion_gate,
+            "motion_thresh": self.motion_thresh,
+            "min_face_size": self.min_face_size,
+            "high_priority_sources": list(self.high_priority_sources),
+        }
+
+    def set_config(self, d):
+        if "detect_every" in d:
+            self.detect_every = max(0.25, float(d["detect_every"]))
+        if "out_fps" in d:
+            self.out_fps = max(1, int(d["out_fps"]))
+        if "jpeg_quality" in d:
+            self.jpeg_quality = max(1, min(100, int(d["jpeg_quality"])))
+        if "viewer_jpeg_quality" in d:
+            self.viewer_jpeg_quality = max(1, min(100, int(d["viewer_jpeg_quality"])))
+        if "motion_gate" in d:
+            self.motion_gate = bool(d["motion_gate"])
+        if "motion_thresh" in d:
+            self.motion_thresh = max(1, int(d["motion_thresh"]))
+        if "min_face_size" in d:
+            self.min_face_size = max(1, int(d["min_face_size"]))
+        if "high_priority_sources" in d:
+            self.high_priority_sources = set(str(s) for s in (d["high_priority_sources"] or []))
+
     def set_viewer(self, mode=None, source=None, grid_offset=None):
         """Update viewer state. Cheap operation — does not touch the
         analysis pool. Cameras keep running regardless. We do NOT clear
@@ -799,6 +977,87 @@ class FaceEngine:
             self.viewer_source = str(source)
         if grid_offset is not None:
             self.viewer_grid_offset = max(0, int(grid_offset))
+
+        # When the viewer selects a new camera ensure the RTSP pool
+        # gives it a connection slot (evicting LRU if the pool is
+        # full).  No-op if the grid isn't running yet.
+        if source is not None and self._grid_workers:
+            self._ensure_connected(str(source))
+
+    def _on_rtsp_evicted(self, source: str) -> None:
+        """Callback invoked by ``_rtsp_pool`` when a camera is evicted (LRU).
+
+        Sets the worker's ``cap`` to ``None`` so the capture loop goes
+        to sleep, and clears all frame/track state so the render loop
+        shows "No Signal" instead of stale data.
+
+        The old capture handle is NOT released here — the capture loop
+        picks up the ``cap = None`` on its next iteration and releases
+        the handle itself, avoiding a use-after-free if the loop is
+        inside ``cap.read()``.
+        """
+        with self._grid_workers_lock:
+            w = self._grid_workers.get(str(source))
+        if w is None:
+            return
+        with w["lock"]:
+            w["cap"] = None
+            w["latest_frame"] = None
+            w["latest_raw_frame"] = None
+            w["latest_annotated_frame"] = None
+            w["latest_jpeg_bytes"] = None
+            w["latest_frame_t"] = 0.0
+            w["last_good_frame_t"] = 0.0
+            w["tracks"] = []
+            w["latest_tracks"] = []
+
+    def _ensure_connected(self, source: str) -> None:
+        """Make sure *source* has a live RTSP connection.
+
+        Acquires a pool slot (evicting LRU if at capacity) and opens
+        the camera if the worker does not already have a ``cap``.
+        """
+        src_key = str(source)
+        with self._grid_workers_lock:
+            w = self._grid_workers.get(src_key)
+        if w is None:
+            return
+
+        newly = self._rtsp_pool.acquire(src_key)
+        if not newly and w.get("cap") is not None:
+            return  # already connected
+
+        import logging as _log
+        try:
+            from hw_capture import open_capture as _hw_open
+            cap = _hw_open(src_key)
+        except Exception as _exc:
+            _log.getLogger("face_engine").warning(
+                "Failed to connect camera %s: %s", src_key, _exc,
+            )
+            self._rtsp_pool.release(src_key)
+            return
+
+        # Double-check the pool still holds a slot for us — another thread
+        # may have evicted us while we were opening the cap.
+        if not self._rtsp_pool.contains(src_key):
+            _log.getLogger("face_engine").warning(
+                "Slot for %s was revoked while connecting — discarding cap", src_key,
+            )
+            try:
+                cap.release()
+            except Exception:
+                pass
+            return
+
+        with w["lock"]:
+            old = w.get("cap")
+            w["cap"] = cap
+        if old is not None and old is not cap:
+            try:
+                old.release()
+            except Exception:
+                pass
 
     def grid_page_count(self):
         """How many pages of cameras the current grid layout has."""
@@ -905,6 +1164,12 @@ class FaceEngine:
         fname = fname_webm
         fourcc = cv2.VideoWriter_fourcc(*"VP80")
         writer = cv2.VideoWriter(fpath, fourcc, fps, (w, h))
+        _fbitrate = int(os.getenv("FOOTAGE_BITRATE", "0"))
+        if _fbitrate > 0:
+            try:
+                writer.set(cv2.VIDEOWRITER_PROP_BITRATE, _fbitrate)
+            except Exception:
+                pass
         if not writer.isOpened():
             writer.release()
             return False, fname
@@ -2002,7 +2267,7 @@ class FaceEngine:
                 except Exception as _e:
                     _log.warning("reload_faces: could not wipe visits for %r: %s", name, _e)
 
-    def _detect_and_match_faces(self, frame_full, min_face_size=30, keep_unembedded_unknown=False):
+    def _detect_and_match_faces(self, frame_full, min_face_size=30, keep_unembedded_unknown=False, force_full_res=False):
         H, W = frame_full.shape[:2]
         results = []
 
@@ -2010,7 +2275,7 @@ class FaceEngine:
             return results
 
         try:
-            used_scale = self.detect_scale
+            used_scale = 1.0 if force_full_res else self.detect_scale
             if used_scale != 1.0:
                 small = cv2.resize(frame_full, None, fx=used_scale, fy=used_scale)
             else:
@@ -2218,7 +2483,8 @@ class FaceEngine:
         -------
         dict | None
             ``{"layout": (rows, cols), "slots": {str: dict|None}, "cam_index": str}``
-            or ``None`` if the file does not exist or is invalid.
+            or ``None`` if the file does not exist, is invalid, or contains a
+            corrupted/truncated camera URL list.
         """
         path = path or GRID_CONFIG_PATH
         if not os.path.isfile(path):
@@ -2239,6 +2505,15 @@ class FaceEngine:
 
             # Build cam_index string from slots
             cam_index = FaceEngine.build_grid_cam_index(slots)
+            # Reject corrupted/truncated configs: must have at least 2 real sources
+            parsed = FaceEngine._parse_grid_sources(cam_index)
+            real_count = sum(1 for s in parsed if s is not None)
+            if real_count < 2:
+                import logging as _cfg_log
+                _cfg_log.getLogger("face_engine").warning(
+                    "grid config has only %d camera(s) — treating as corrupted", real_count,
+                )
+                return None
             return {"layout": layout, "slots": slots, "cam_index": cam_index}
         except Exception:
             return None
@@ -2310,22 +2585,13 @@ class FaceEngine:
         else:
             tile_w = cell_w
             tile_h = max(1, int(tile_w / target_ratio))
-        workers = {}
-        # Ordered list with None entries preserved so each slot index
-        # maps directly to a grid position. Workers are created for ALL
-        # configured sources (not just those visible in the current grid
-        # layout) so face recognition and visit tracking run on every
-        # camera regardless of what the viewer is looking at.
-        ordered_sources = []
+
         self._grid_stop_evt.clear()
         self._grid_qr_rr_idx = 0
 
         total_sources = len([s for s in sources if s is not None])
         self._loading_total = total_sources
         self._loading_opened = 0
-
-        from hw_capture import open_capture as _hw_open
-        import concurrent.futures as _cf
 
         # Deduplicate sources while preserving slot order.
         unique_sources = []
@@ -2341,47 +2607,22 @@ class FaceEngine:
                 seen_srcs.add(src_key)
                 unique_sources.append(source)
 
-        # Open all cameras in parallel so startup doesn't block the command
-        # loop for 30+ seconds (sequential opens at ~1.5s each with 23 cams).
         real_sources = [(i, s) for i, s in enumerate(unique_sources) if s is not None]
-        cap_results = {}  # src_key -> cap or None
-
-        def _open_one(idx_src):
-            idx, src = idx_src
-            cap = _hw_open(src)
-            if not cap.isOpened():
-                try: cap.release()
-                except Exception: pass
-                return str(src), None
-            if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
-                try: cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                except Exception: pass
-            return str(src), cap
-
-        with _cf.ThreadPoolExecutor(max_workers=min(len(real_sources), 16)) as _ex:
-            for src_key, cap in _ex.map(_open_one, real_sources):
-                cap_results[src_key] = cap
-                self._loading_opened += 1  # count every attempt, success or failure
-
         _detect_period = max(0.25, float(self.detect_every))
-        for source in unique_sources:
-            if source is None:
-                ordered_sources.append(None)
-                continue
-            src_key = str(source)
-            cap = cap_results.get(src_key)
-            if cap is None:
-                ordered_sources.append(None)
-                continue
+        _pool_size = max(1, len(self._face_app_pool))
 
-            # Phase-stagger per worker so N grid workers don't all hit
-            # the inference lock at the same moment.
-            _worker_idx = len(workers)
-            _phase_offset = (_detect_period * _worker_idx / max(1, len(real_sources))) - _detect_period
-
+        # Create ALL workers in the disconnected state (cap=None).  The
+        # RTSP connection pool opens cameras on demand when the user
+        # views them.  This respects per-NVR stream-slot budgets while
+        # keeping every camera known to the engine for face recognition.
+        workers = {}
+        for _worker_idx, (_, src) in enumerate(real_sources):
+            src_key = str(src)
+            self._loading_opened += 1
+            _phase_offset = (_worker_idx % _pool_size) * (_detect_period / _pool_size) - _detect_period
             worker = {
-                "source": source,
-                "cap": cap,
+                "source": src,
+                "cap": None,  # lazy — pool assigns on view
                 "lock": threading.Lock(),
                 "stop_evt": threading.Event(),
                 "frame_q": Queue(maxsize=1),
@@ -2414,7 +2655,26 @@ class FaceEngine:
                 daemon=True,
             )
             workers[src_key] = worker
-            ordered_sources.append(src_key)
+            worker["capture_thread"].start()
+            worker["detect_thread"].start()
+
+        ordered_sources = []
+        for source in unique_sources:
+            if source is None:
+                ordered_sources.append(None)
+                continue
+            src_key = str(source)
+            ordered_sources.append(src_key if src_key in workers else None)
+
+        with self._grid_workers_lock:
+            self._grid_workers = dict(workers)
+        self._grid_sources = ordered_sources
+
+        # Start the render thread so the viewer shows immediately.
+        self._grid_render_t = threading.Thread(
+            target=self._grid_render_loop, daemon=True,
+        )
+        self._grid_render_t.start()
 
         if not workers:
             import logging
@@ -2422,21 +2682,16 @@ class FaceEngine:
                 "Grid mode: no cameras opened — all tiles will show 'No Signal'. "
                 "Check that at least one configured camera is connected."
             )
+            return
 
-        with self._grid_workers_lock:
-            self._grid_workers = workers
-        self._grid_sources = ordered_sources
-
-        for source in self._grid_sources:
-            if source is None:
-                continue
-            w = self._grid_workers.get(source)
-            if w is not None:
-                w["capture_thread"].start()
-                w["detect_thread"].start()
-
-        self._grid_render_t = threading.Thread(target=self._grid_render_loop, daemon=True)
-        self._grid_render_t.start()
+        # Connect every camera immediately so all grid tiles show live video.
+        for s in ordered_sources:
+            if s is not None:
+                threading.Thread(
+                    target=self._ensure_connected,
+                    args=(s,),
+                    daemon=True,
+                ).start()
 
     def get_camera_statuses(self) -> dict:
         """Return a dict of {source: {"alive": bool, "reconnecting": bool, "attempts": int}}."""
@@ -2461,13 +2716,24 @@ class FaceEngine:
         Sets a flag the capture loop checks so it resets its backoff state
         and triggers a reconnect as if it were the first attempt.  Returns
         True if the worker was found, False if *source* is not in the grid.
+        If the worker has no active connection (cap is None), this ensures
+        the pool re-acquires a slot for it.
         """
         with self._grid_workers_lock:
             w = self._grid_workers.get(source)
         if w is None:
             return False
         with w["lock"]:
-            w["_force_reconnect"] = True
+            cap = w.get("cap")
+            if cap is None:
+                # Worker is disconnected — ask the pool to re-acquire a slot.
+                threading.Thread(
+                    target=self._ensure_connected,
+                    args=(source,),
+                    daemon=True,
+                ).start()
+            else:
+                w["_force_reconnect"] = True
         return True
 
     def _cleanup_grid_mode(self):
@@ -2522,6 +2788,10 @@ class FaceEngine:
             if self._grid_render_t.is_alive():
                 _log.warning("_cleanup_grid: render_thread zombie")
             self._grid_render_t = None
+
+        # Release all RTSP pool connections (calls on_evict for each,
+        # which clears per-worker state — safe because threads are joined).
+        self._rtsp_pool.release_all()
 
         with self._grid_workers_lock:
             self._grid_workers = {}
@@ -2583,17 +2853,42 @@ class FaceEngine:
         _last_reconnect_t = 0.0  # monotonic time of last reconnect trigger
         _stable_since = None    # monotonic time camera first became stable after reconnect
         _STABLE_RESET_SECS = 30.0  # must be alive this long before backoff resets
+        _CAPTURE_INTERVAL = 0.2  # max 5 fps per camera to reduce decode/memory load
+        _last_capture_t = 0.0    # monotonic time of last pushed frame
 
         while not self._grid_stop_evt.is_set() and not worker["stop_evt"].is_set():
-            # Pick up replacement cap if reconnect thread swapped it.
+            # Pick up replacement cap if the pool assigned/evicted one
+            # or the reconnect thread swapped it.
             with worker["lock"]:
                 current_cap = worker.get("cap", cap)
             if current_cap is not cap:
+                # If the old cap was replaced (pool eviction), release it.
+                if cap is not None and current_cap is not cap:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
                 cap = current_cap
-            ok, frame = cap.read()
+                _no_frame_since = None
+
+            if cap is None:
+                # Pool has not assigned a connection for this camera
+                # (or evicted it).  Sleep and retry.
+                time.sleep(0.1)
+                continue
+
+            try:
+                ok, frame = cap.read()
+            except Exception as _read_err:
+                import logging as _rlog
+                _rlog.getLogger("face_engine").warning(
+                    "capture read failed for %s: %s", worker.get("source", "?"), _read_err,
+                )
+                ok, frame = False, None
             now = time.monotonic()
             if not ok or frame is None:
                 with worker["lock"]:
+                    worker["capture_heartbeat_t"] = time.monotonic()
                     if (now - float(worker.get("last_good_frame_t", 0.0))) > 1.0:
                         worker["latest_frame"] = None
                 if _no_frame_since is None:
@@ -2710,6 +3005,14 @@ class FaceEngine:
                 (now, frame),
             )
 
+            # Throttle capture to max ~10 fps so 17 simultaneous cameras
+            # don't saturate memory bandwidth with NVDEC decoded frames.
+            _elapsed = now - _last_capture_t
+            if _elapsed < _CAPTURE_INTERVAL:
+                time.sleep(_CAPTURE_INTERVAL - _elapsed)
+                now = time.monotonic()
+                _last_capture_t = now
+
     def _grid_detect_loop(self, worker):
         # How many consecutive "unknown" detections before a previously
         # named track (unknown_N) is demoted back to "unknown". A single-
@@ -2719,18 +3022,25 @@ class FaceEngine:
         # 12 frames × 0.3 s detect_every ≈ 3.6 s of patience.
         UNKNOWN_TO_FORGET = 12
         detect_period = max(0.25, float(self.detect_every))
+        _prev_motion_gray = None
         while not self._grid_stop_evt.is_set() and not worker["stop_evt"].is_set():
             try:
                 _frame_t, tile_frame = worker["frame_q"].get(timeout=0.1)
             except Empty:
+                with worker["lock"]:
+                    worker["detect_heartbeat_t"] = time.monotonic()
                 continue
             except (TypeError, ValueError):
+                with worker["lock"]:
+                    worker["detect_heartbeat_t"] = time.monotonic()
                 continue
 
             now = time.monotonic()
             with worker["lock"]:
                 last_det_t = float(worker.get("last_det_t", 0.0))
             if (now - last_det_t) < detect_period:
+                with worker["lock"]:
+                    worker["detect_heartbeat_t"] = time.monotonic()
                 continue
 
             # Grab the raw frame from the worker dict (avoids copying it into
@@ -2741,14 +3051,44 @@ class FaceEngine:
             if raw_frame is None:
                 continue
 
-            # Run face detection on the FULL-resolution camera frame so
-            # small faces are still found, then scale results into the
-            # tile coordinate system the tracker + renderer expect.
+            # Adaptive backoff: if frames are queuing up, detection is slower
+            # than capture — back off to reduce GPU contention.
+            q_depth = worker["frame_q"].qsize()
+            if q_depth > 3:
+                detect_period = min(self.detect_every * 4, detect_period * 1.5)
+            else:
+                detect_period = max(0.25, float(self.detect_every))
+
+            # High-priority sources (gate cameras) bypass motion gate and
+            # always run at full resolution for maximum accuracy.
+            _is_high_priority = str(worker.get("source", "")) in self.high_priority_sources
+
+            # Motion gate: skip GPU inference on static scenes.
+            if self.motion_gate and not _is_high_priority:
+                _curr_gray = cv2.cvtColor(
+                    cv2.resize(raw_frame, (160, 90)), cv2.COLOR_BGR2GRAY
+                )
+                if _prev_motion_gray is not None:
+                    _diff_score = int(np.count_nonzero(
+                        cv2.absdiff(_prev_motion_gray, _curr_gray) > 15
+                    ))
+                    _has_motion = _diff_score > self.motion_thresh
+                else:
+                    _has_motion = True
+                _prev_motion_gray = _curr_gray
+                if not _has_motion:
+                    with worker["lock"]:
+                        worker["last_det_t"] = time.monotonic()
+                    continue
+
+            # Run face detection. High-priority cameras always use full
+            # resolution (detect_scale=1.0) — no downscaled pre-pass.
             try:
                 dets_raw = self._detect_and_match_faces(
                     raw_frame,
-                    min_face_size=20,
+                    min_face_size=self.min_face_size,
                     keep_unembedded_unknown=True,
+                    force_full_res=_is_high_priority,
                 )
                 dets_raw = self._dedupe_detections(dets_raw)
             except Exception as _det_err:
@@ -3077,9 +3417,13 @@ class FaceEngine:
         unknown_reconfirm_secs = min(max(3.0, _detection_cycle * 2.0), 20.0)
         known_reconfirm_secs = min(max(5.0, _detection_cycle * 2.5), 30.0)
 
-        frame_interval = 1.0 / max(1, self.out_fps)
         while not self._grid_stop_evt.is_set():
             loop_start = time.monotonic()
+
+            # Drop to 2 FPS when no viewer has requested frames in the last 5s.
+            _viewer_idle = (loop_start - self._last_viewer_req_t) > 5.0
+            _effective_fps = 2 if _viewer_idle else max(1, self.out_fps)
+            frame_interval = 1.0 / _effective_fps
 
             # Skip the entire render iteration if we're not due for a new
             # frame yet. This keeps the loop sleeping most of the time
@@ -3238,13 +3582,25 @@ class FaceEngine:
                 cv2.putText(
                     tile,
                     tile_label,
-                    (8, tile_h - 10),
+                    (8, 24),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.55,
                     (255, 255, 255),
                     2,
                 )
                 cv2.rectangle(tile, (0, 0), (tile_w - 1, tile_h - 1), (80, 80, 80), 1)
+
+                # Store the fully-annotated tile so get_camera_jpeg() can serve it.
+                with worker["lock"]:
+                    worker["latest_annotated_frame"] = tile
+                    # Pre-encode the tile to JPEG so the mirror loop doesn't
+                    # re-encode every camera every tick — it just copies bytes.
+                    _ok_j, _jpeg_bytes = cv2.imencode(
+                        ".jpg", tile,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), int(self.viewer_jpeg_quality)],
+                    )
+                    if _ok_j:
+                        worker["latest_jpeg_bytes"] = _jpeg_bytes.tobytes()
 
                 # Build annotated raw frame for footage (native camera resolution)
                 # Only do the expensive copy + annotation when footage is actually recording.
@@ -3329,7 +3685,7 @@ class FaceEngine:
                         encode_src = stream_src
                     ok_s, buf_s = cv2.imencode(
                         ".jpg", encode_src,
-                        [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)],
+                        [int(cv2.IMWRITE_JPEG_QUALITY), int(self.viewer_jpeg_quality)],
                     )
                     if ok_s:
                         with self._lock:

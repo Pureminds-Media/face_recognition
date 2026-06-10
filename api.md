@@ -160,6 +160,7 @@ development only.
 | ------ | ------------------------------------------- | ----------------------------------------------------------- |
 | GET    | `/api/people`                               | List of `{name, count, thumbnail_url, section, branch}`.    |
 | POST   | `/api/upload_face`                          | Upload one face image. `multipart/form-data`: `file`, `name` (existing or new). |
+| POST   | `/api/bulk_upload_faces`                    | Bulk upload face images. `multipart/form-data`: `bulk_mode` (`"single_person"` or `"name_from_file"`), `files[]`. In `single_person` mode also pass `existing_name`/`new_name`/`mode` (same as `upload_face`). |
 | POST   | `/api/rename_person`                        | Body: `{old_name, new_name}`. Renames folder and DB visits. |
 | DELETE | `/api/person/<name>`                        | Delete a person and all their images.                       |
 | GET    | `/api/person/<name>/images`                 | List `{filename, url}` for that person.                     |
@@ -169,8 +170,8 @@ development only.
 | POST   | `/api/person/<name>/images/bulk_transfer`   | Body: `{target, filenames: [...]}`. Bulk move.              |
 | POST   | `/api/people/merge`                         | Body: `{sources: [...], target}`. Merge folders + DB visits. |
 | POST   | `/api/reload_faces`                         | Force a synchronous embedding rebuild.                      |
-| GET    | `/api/person/<name>/meta`                   | Returns `{name, section, branch}` for a person.            |
-| POST   | `/api/person/<name>/meta`                   | Body: `{section?, branch?}`. Update section and/or branch. Auto-creates the row if missing. |
+| GET    | `/api/person/<name>/meta`                   | Returns `{name, section, branch, arabic_name, shift, home_zone_id}` for a person. |
+| POST   | `/api/person/<name>/meta`                   | Body: `{section?, branch?, arabic_name?, shift?, home_zone_id?}`. Update fields. Auto-creates the row if missing. |
 
 ### 4.2.1 Sections
 
@@ -181,8 +182,28 @@ Sections are named groups (e.g. "IT", "HR") that people are assigned to. Managed
 | GET    | `/api/sections`                             | List all sections. Returns `{sections: [{name, members: [...names]}]}`. |
 | POST   | `/api/sections`                             | Body: `{name}`. Create a new section. Returns `{ok: true}`. |
 | DELETE | `/api/sections/<name>`                      | Delete a section. Does NOT delete the assigned people; it clears their `section` field. |
+| POST   | `/api/sections/<name>/rename`               | Body: `{new_name}`. Rename a section and update all members' `people.section` values atomically. Returns `{ok: true, new_name}`. |
 | POST   | `/api/sections/<name>/assign`               | Body: `{person}`. Assign a person to this section (replaces any existing section). Returns `{ok: true}`. |
 | POST   | `/api/sections/<name>/unassign`             | Body: `{person}`. Remove a person from this section (clears their section field). Returns `{ok: true}`. |
+| POST   | `/api/sections/<name>/manager`              | Body: `{person}`. Set (or clear, if `person` is empty) the manager for this section. Returns `{ok: true}`. |
+
+### 4.2.2 Zones
+
+Zones are named camera zones (e.g. "Floor 1", "Server Room") with an optional branch. People can be assigned a *home zone*; the zone status endpoint shows who is currently inside vs. away from their zone.
+
+| Method | Path                                        | Description                                                 |
+| ------ | ------------------------------------------- | ----------------------------------------------------------- |
+| GET    | `/api/zones`                                | List zones. Accepts `?branch=<name>` filter. Returns `{zones: [{id, name, description, branch, created_at}]}`. |
+| POST   | `/api/zones`                                | Body: `{name, description?, branch?}`. Create a zone. Returns `{ok: true, id}`. |
+| PUT    | `/api/zones/<zone_id>`                      | Body: `{name?, description?, branch?}`. Update a zone. |
+| DELETE | `/api/zones/<zone_id>`                      | Delete a zone. Clears `people.home_zone_id` for all members. |
+| GET    | `/api/zones/<zone_id>/cameras`              | List `{location_id, camera_source, name}` for cameras assigned to this zone. |
+| POST   | `/api/zones/<zone_id>/cameras`              | Body: `{location_ids: [...]}`. Replace the full camera assignment for this zone. |
+| GET    | `/api/zones/<zone_id>/members`              | List people with `home_zone_id` set to this zone. Returns `{members: [{name, …}]}`. |
+| POST   | `/api/zones/<zone_id>/assign`               | Body: `{person_name}`. Set a person's home zone. Returns `{ok: true}`. |
+| POST   | `/api/zones/<zone_id>/unassign`             | Body: `{person_name}`. Clear a person's home zone. Returns `{ok: true}`. |
+| GET    | `/api/zones/status`                         | Live zone presence snapshot. Returns `{status: [{zone_id, zone_name, branch, members: [{name, status: "present"\|"away", last_seen, …}]}]}`. Status is derived from the `zone_away_threshold_minutes` setting in `reports_config.json`. Accepts `?branch=<name>` filter. |
+| GET    | `/api/zones/report`                         | Zone compliance report. Requires `?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD`. Accepts `?branch=<name>`. Returns `{rows: [{person_name, zone_name, days_present, days_absent, …}]}`. |
 
 ### 4.3 Cameras
 
@@ -191,6 +212,8 @@ Sections are named groups (e.g. "IT", "HR") that people are assigned to. Managed
 | GET    | `/api/camera`                                 | List devices + current viewer state. The `devices` list still includes `grid_RxC` layout entries; the in-tree UI now hides them since it operates in single-camera viewer mode only, but the layouts work via direct API calls. |
 | POST   | `/api/camera`                                 | Body: `{source}`. Switch viewer to a camera URL/index, or to a `grid_RxC` layout (e.g. `"grid_2x2"`). Also accepts `{grid_offset: int}` to page through cameras when in grid mode. **Note:** the analysis pool always covers every configured camera regardless of viewer mode — switching viewer mode never starts/stops detection on any camera. |
 | POST   | `/api/camera/reload`                          | Re-probe devices.                                           |
+| GET    | `/api/camera/statuses`                        | Returns live/dead status for all cameras in the active grid. Map of `{source: {ok, last_frame_age_secs, …}}`. |
+| POST   | `/api/camera/reconnect`                       | Body: `{source}`. Bypass the 2-minute reconnect backoff and immediately retry the given camera. |
 | GET    | `/api/ip_cameras`                             | Configured IP-camera groups + cameras.                      |
 | POST   | `/api/ip_cameras/groups`                      | Body: `{name, base_url?}`. Create group.                    |
 | PUT    | `/api/ip_cameras/groups/<group_id>`           | Body: `{name?, base_url?}`. Update group.                   |
@@ -199,6 +222,7 @@ Sections are named groups (e.g. "IT", "HR") that people are assigned to. Managed
 | PUT    | `/api/ip_cameras/cameras/<camera_id>`         | Body: `{name?, channel?, url?}`.                            |
 | DELETE | `/api/ip_cameras/cameras/<camera_id>`         | Delete one IP camera.                                       |
 | POST   | `/api/ip_cameras/cameras/<camera_id>/test`    | Probe RTSP and return resolution / error.                   |
+| POST   | `/api/ip_cameras/groups/<group_id>/reorder`   | Body: `{order: ["cam_id", ...]}`. Reorder cameras within a group. Cameras not in the list keep their relative order after those that are. |
 | GET    | `/api/grid/config`                            | Saved grid layout + slot assignments.                       |
 | POST   | `/api/grid/config`                            | Body: `{layout: [rows, cols], slots: {…}}`. Save and apply. |
 
@@ -230,10 +254,34 @@ All analytics endpoints accept an optional `?branch=<name>` query parameter. Whe
 | ------ | ---- | ----------- |
 | GET | `/api/analytics/present_absent?date=YYYY-MM-DD` | Returns `{present: [...names], absent: [...names]}` for a given day. `present` = known persons with at least one visit on that day (filtered by `?branch=` if provided). `absent` = persons assigned to this branch in the `people` table with no visit that day. Without a branch filter, `absent` falls back to all enrolled known folders (`faces/`) with no visit that day. Used by the Present/Absent tile modals. |
 | GET | `/api/analytics/summary?date=YYYY-MM-DD` | Single-request summary tiles for a given day (default today). Returns `{peak_hour, present_today, absent_today, unknowns_today}`. `peak_hour` is the local-time hour bucket with the most distinct people spotted (e.g. `"09:00 – 10:00"`), or `null` if no data. `present_today` is the count of distinct known persons with at least one visit today (branch-filtered). `absent_today` is the count of persons who have visited this branch historically but had no visit today; without a branch filter, counts all enrolled known folders minus present. `unknowns_today` is the count of `unknown_N` folders in `faces/` — unresolved auto-captured persons regardless of when they were last seen. |
-| GET | `/api/analytics/earliest?date=YYYY-MM-DD` | Top 10 employees with the earliest first arrival on a given day (default today). Add `&order=latest` to get the 10 latest arrivals instead. Add `&shift=morning` (04:00–16:00 local) or `&shift=night` (16:00–04:00 local) to restrict to a shift window. Night-shift results automatically exclude anyone who already appeared in the morning window (each person in at most one shift). Returns `{person_name, arrival_time}` rows. Excludes `unknown_N` names. The in-tree UI fetches both earliest and latest in parallel on load and caches them; the Earliest/Latest toggle switches between views without a new request. |
+| GET | `/api/analytics/earliest?date=YYYY-MM-DD` | Top 10 employees with the earliest first arrival on a given day (default today). Add `&order=latest` to get the 10 latest arrivals instead. Add `&shift=morning` (`work_start - 1h` → `work_end` local) or `&shift=night` (`night_work_start - 1h` → `night_work_end` next day local) to restrict to a shift window. Shift boundaries are configurable from **Settings → Advanced**. Night-shift results automatically exclude anyone who already appeared in the morning window (each person in at most one shift). Returns `{person_name, arrival_time}` rows. Excludes `unknown_N` names. The in-tree UI fetches both earliest and latest in parallel on load and caches them; the Earliest/Latest toggle switches between views without a new request. |
 | GET | `/api/analytics/longest?period=day\|week\|month\|year` | Top 10 employees with the longest total on-camera duration for the period (calendar-aligned: week = Sun–Sat, month = 1st–last, year = Jan–Dec). Uses `visible_duration` when recorded, falls back to `last_seen − first_seen`. Returns `{person_name, total_secs, duration_fmt}` sorted descending. The in-tree UI renders this as an interactive horizontal bar chart (Chart.js). |
 | GET | `/api/analytics/headcount?from=YYYY-MM-DD&to=YYYY-MM-DD` | Distinct people present per day over a date range (default: current month). Returns `{rows: [{date, count}]}` ordered by date ascending. Excludes `unknown_N`. |
 | GET | `/api/analytics/heatmap?from=YYYY-MM-DD&to=YYYY-MM-DD` | Presence heatmap over a date range (default: current month). Returns `{dates, persons, present: {person: {date: true}}}`. The in-tree UI renders this as a scrollable employee × day grid with green cells for present days. |
+
+### 4.5.1 Engine config
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| GET | `/api/engine/config` | Returns current engine tuning: `{detect_every, motion_gate, motion_thresh, viewer_jpeg_quality, out_fps, high_priority_sources}`. |
+| POST | `/api/engine/config` | Body: any subset of the above keys. Updates live without restart. `high_priority_sources` is an array of RTSP URL strings. |
+
+### 4.5.2 Settings — Advanced (Shift Times)
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| GET | `/api/advanced/config` | Returns shift time configuration from `reports_config.json`. Response: `{config: {work_start, work_end, late_threshold_minutes, night_shift_enabled, night_work_start, night_work_end, night_late_threshold_minutes}}`. |
+| POST | `/api/advanced/config` | Body: any subset of the shift keys above. Saves to `reports_config.json`. |
+
+### 4.5.3 Reports
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| GET | `/api/reports/generate?date=YYYY-MM-DD` | Generate the gate report for a date. Returns `{rows: [{name, arrival, exits, status}]}`. `exits` is a list of `{exit_time, entry_time, duration_minutes}`. |
+| GET | `/api/reports/history` | List saved daily reports. Returns `{dates: ["YYYY-MM-DD", …]}`. |
+| GET | `/api/reports/history/<date>` | Retrieve a saved report for a specific date. |
+| POST | `/api/reports/history/<date>/save` | Manually save the report for a date to the `daily_reports` table. |
+| GET | `/api/reports/history/<date>/export` | Download the report as a CSV file. |
 
 ### 4.6 Attendance
 

@@ -60,6 +60,12 @@
         [HTMLImageElement, HTMLVideoElement, HTMLSourceElement].forEach(c => { if (c) patchSrc(c.prototype); });
       })();
     </script>
+    <style>
+      @keyframes toast-in { from { transform: translateX(120%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+      @keyframes toast-out { from { transform: translateX(0); opacity: 1; } to { transform: translateX(120%); opacity: 0; } }
+      .toast-animate { animation: toast-in 0.3s ease-out; }
+      .toast-hide { animation: toast-out 0.25s ease-in forwards; }
+    </style>
   </head>
 
   <body class="bg-slate-950 text-slate-100">
@@ -91,6 +97,10 @@
               >
                 People
               </button>
+              <button class="section-btn w-full text-start rounded-lg px-3 py-2 text-sm font-medium text-slate-300 hover:bg-slate-800"
+                data-section="sections" data-i18n="nav_sections">Sections</button>
+              <button class="section-btn w-full text-start rounded-lg px-3 py-2 text-sm font-medium text-slate-300 hover:bg-slate-800"
+                data-section="email" data-i18n="nav_managers">Managers</button>
               <button
                 class="section-btn w-full text-start rounded-lg px-3 py-2 text-sm font-medium text-slate-300 hover:bg-slate-800"
                 data-section="camera"
@@ -99,9 +109,11 @@
                 Camera
               </button>
               <button class="section-btn w-full text-start rounded-lg px-3 py-2 text-sm font-medium text-slate-300 hover:bg-slate-800"
-                data-section="sections" data-i18n="nav_sections">Sections</button>
+                data-section="zones" data-i18n="nav_zones">Zones</button>
               <button class="section-btn w-full text-start rounded-lg px-3 py-2 text-sm font-medium text-slate-300 hover:bg-slate-800"
-                data-section="email" data-i18n="nav_email">Email</button>
+                data-section="reports" data-i18n="nav_reports">Reports</button>
+              <button class="section-btn w-full text-start rounded-lg px-3 py-2 text-sm font-medium text-slate-300 hover:bg-slate-800"
+                data-section="advanced">Advanced</button>
             </nav>
           </aside>
 
@@ -199,12 +211,82 @@
               </form>
             </div>
 
+            <!-- Bulk Upload -->
+            <div class="rounded-xl border border-slate-800 bg-slate-900 mb-6">
+              <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between cursor-pointer select-none" onclick="toggleBulkPanel()">
+                <div>
+                  <div class="font-medium">Bulk Upload</div>
+                  <div class="text-xs text-slate-400">Upload many images at once — to one person or named by filename</div>
+                </div>
+                <svg id="bulkPanelChevron" xmlns="http://www.w3.org/2000/svg" class="w-4 h-4 text-slate-400 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/>
+                </svg>
+              </div>
+              <div id="bulkPanel" class="hidden p-4 space-y-4">
+                <!-- Mode tabs -->
+                <div class="flex gap-2">
+                  <button type="button" id="bulkTabSingle" onclick="setBulkMode('single_person')"
+                    class="px-3 py-1.5 rounded-lg text-sm font-medium bg-emerald-600 text-white transition-colors">
+                    Single person
+                  </button>
+                  <button type="button" id="bulkTabName" onclick="setBulkMode('name_from_file')"
+                    class="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-800 text-slate-300 hover:bg-slate-700 transition-colors">
+                    Name from filename
+                  </button>
+                </div>
+
+                <!-- Single person controls -->
+                <div id="bulkSingleControls" class="space-y-2">
+                  <div class="text-xs text-slate-400">Select a person to receive all uploaded images.</div>
+                  <div class="flex items-center gap-3">
+                    <label class="flex items-center gap-2 text-sm">
+                      <input type="radio" name="bulk_mode_person" value="existing" checked class="accent-emerald-500" onchange="updateBulkPersonUI()" />
+                      <span>Existing</span>
+                    </label>
+                    <label class="flex items-center gap-2 text-sm">
+                      <input type="radio" name="bulk_mode_person" value="new" class="accent-emerald-500" onchange="updateBulkPersonUI()" />
+                      <span>New person</span>
+                    </label>
+                  </div>
+                  <select id="bulkExistingName" class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm"></select>
+                  <input id="bulkNewName" type="text" placeholder="Ahmed_AlQahtani"
+                    class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm hidden" />
+                </div>
+
+                <!-- Name from file info -->
+                <div id="bulkNameControls" class="hidden">
+                  <div class="text-xs text-slate-400">Each image's filename (without extension) becomes the person's name. Example: <code class="text-slate-300">John_Smith.jpg</code> → person <code class="text-slate-300">John_Smith</code>. Existing people get the image added; new people are created automatically.</div>
+                </div>
+
+                <!-- File picker + preview list -->
+                <div class="space-y-2">
+                  <input id="bulkFileInput" type="file" accept="image/*" multiple
+                    class="w-full text-sm text-slate-200 file:mr-3 file:rounded-lg file:border-0 file:bg-slate-800 file:px-3 file:py-2 file:text-sm file:text-slate-100 hover:file:bg-slate-700"
+                    onchange="renderBulkPreview()" />
+                  <div id="bulkPreview" class="hidden space-y-1 max-h-48 overflow-y-auto text-xs text-slate-400 border border-slate-800 rounded-lg p-2"></div>
+                </div>
+
+                <button type="button" id="bulkUploadBtn" onclick="submitBulkUpload()"
+                  class="w-full rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                  Upload all
+                </button>
+
+                <div id="bulkProgress" class="hidden space-y-1">
+                  <div class="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+                    <div id="bulkProgressBar" class="h-full rounded-full bg-emerald-500 transition-all duration-200" style="width: 0%"></div>
+                  </div>
+                  <div id="bulkProgressText" class="text-xs text-slate-400 text-center">0%</div>
+                </div>
+                <div id="bulkMsg" class="text-xs text-slate-300"></div>
+              </div>
+            </div>
+
             <div class="flex items-center justify-between mb-3">
               <div class="text-slate-400 text-sm" id="statsText">Loading...</div>
             </div>
 
             <!-- People filters -->
-            <div class="flex flex-wrap gap-2 mb-4">
+            <div class="flex flex-wrap items-center gap-2 mb-4">
               <select id="filterType" onchange="renderPeople()"
                 class="px-3 py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-xs text-slate-300 focus:outline-none focus:border-emerald-500">
                 <option value="all">All people</option>
@@ -221,6 +303,9 @@
                 class="px-3 py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-xs text-slate-300 focus:outline-none focus:border-emerald-500">
                 <option value="">All sections</option>
               </select>
+              <span class="flex-1"></span>
+              <input id="peopleSearch" type="text" oninput="renderPeople()" placeholder="🔍 Search…"
+                class="px-3 py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-xs text-slate-300 placeholder-slate-500 focus:outline-none focus:border-emerald-500 w-44" />
             </div>
 
             <div id="mergeBar" class="hidden flex flex-wrap items-center gap-2 mb-4 p-3 rounded-lg border border-slate-800 bg-slate-900 text-sm">
@@ -262,13 +347,63 @@
             <div id="sectionsGrid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4"></div>
           </div>
 
-          <!-- ================= EMAIL SECTION ================= -->
+          <!-- ================= ZONES SECTION ================= -->
+          <div id="section-zones" class="section-content hidden space-y-6">
+            <div class="flex items-center justify-between mb-4">
+              <div class="text-lg font-semibold" data-i18n="nav_zones">Zones</div>
+            </div>
+
+            <!-- Card 1: Create Zone -->
+            <div class="rounded-xl border border-slate-800 bg-slate-900 p-4 space-y-3">
+              <div class="text-sm font-semibold text-slate-300" data-i18n="zone_create_title">Create Zone</div>
+              <div class="flex flex-col sm:flex-row gap-2">
+                <input id="zoneNameInput" type="text" data-i18n-placeholder="zone_name_placeholder" placeholder="Zone name…"
+                  class="flex-1 px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:border-emerald-500" />
+                <input id="zoneDescInput" type="text" data-i18n-placeholder="zone_description_placeholder" placeholder="Description (optional)"
+                  class="flex-1 px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:border-emerald-500" />
+                <select id="zoneBranchSelect"
+                  class="px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 text-sm text-slate-200 focus:outline-none focus:border-emerald-500">
+                  <option value="Riyadh" data-i18n="branch_riyadh">Riyadh</option>
+                  <option value="Egypt" data-i18n="branch_egypt">Egypt</option>
+                </select>
+                <button onclick="createZone()"
+                  class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium whitespace-nowrap">+ Add</button>
+              </div>
+              <div id="zonesListContainer" class="space-y-2 mt-2"></div>
+            </div>
+
+            <!-- Card 2: Assign Cameras to Zone -->
+            <div class="rounded-xl border border-slate-800 bg-slate-900 p-4 space-y-3">
+              <div class="text-sm font-semibold text-slate-300" data-i18n="zone_cameras_title">Assign Cameras to Zone</div>
+              <select id="zoneCameraZoneSelect" onchange="loadZoneCameraCheckboxes()"
+                class="w-full px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 text-sm text-slate-200 focus:outline-none focus:border-emerald-500">
+                <option value="" data-i18n="zone_select_placeholder">Select a zone…</option>
+              </select>
+              <div id="zoneCameraList" class="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-60 overflow-y-auto"></div>
+              <button onclick="saveZoneCameras()"
+                class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium">Save Camera Assignments</button>
+            </div>
+
+            <!-- Card 3: Away Threshold -->
+            <div class="rounded-xl border border-slate-800 bg-slate-900 p-4 space-y-3">
+              <div class="text-sm font-semibold text-slate-300" data-i18n="zone_away_threshold">Mark as Away after (minutes)</div>
+              <div class="flex gap-2 items-center">
+                <input id="zoneAwayThresholdInput" type="number" min="1" max="480" value="30"
+                  class="w-24 px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 text-sm text-slate-200 focus:outline-none focus:border-emerald-500" />
+                <button onclick="saveZoneAwayThreshold()"
+                  class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium" data-i18n="zone_away_threshold_save">Save</button>
+                <span id="zoneThresholdMsg" class="text-xs text-emerald-400 hidden">Saved!</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- ================= MANAGERS SECTION ================= -->
           <div id="section-email" class="section-content hidden">
             <div class="flex items-center justify-between mb-4">
-              <div class="text-lg font-semibold" data-i18n="nav_email">Email</div>
+              <div class="text-lg font-semibold">Managers</div>
             </div>
-            <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-hidden">
-              <table class="w-full text-sm">
+            <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-x-auto overflow-y-hidden">
+              <table class="w-full text-sm whitespace-nowrap min-w-[500px]">
                 <thead>
                   <tr class="text-xs text-slate-500 uppercase tracking-wide border-b border-slate-800">
                     <th class="px-4 py-3 text-left" data-i18n="col_person">Name</th>
@@ -326,6 +461,259 @@
               </div>
             </div>
           </div>
+
+          <!-- ================= REPORTS SECTION ================= -->
+          <div id="section-reports" class="section-content hidden space-y-6">
+
+            <!-- Config card -->
+            <div class="rounded-xl border border-slate-800 bg-slate-900">
+              <div class="px-4 py-3 border-b border-slate-800">
+                <div class="font-medium" data-i18n="reports_config_title">Report Configuration</div>
+                <div class="text-xs text-slate-400" data-i18n="reports_config_sub">Configure the gate camera, manager email, and attendance thresholds</div>
+              </div>
+              <div class="p-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div class="space-y-1">
+                  <label class="text-xs text-slate-400" data-i18n="reports_arrival_camera">Arrival Camera (Entry — Cam 15)</label>
+                  <select id="reportArrivalCamera" class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm">
+                    <option value="">— select camera —</option>
+                  </select>
+                </div>
+                <div class="space-y-1">
+                  <label class="text-xs text-slate-400" data-i18n="reports_exit_camera">Exit Camera (Cam 16)</label>
+                  <select id="reportExitCamera" class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm">
+                    <option value="">— select camera —</option>
+                  </select>
+                </div>
+                <div class="space-y-1">
+                  <label class="text-xs text-slate-400" data-i18n="reports_manager_email">Manager Email</label>
+                  <input id="reportManagerEmail" type="email" placeholder="manager@example.com"
+                    class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm" />
+                </div>
+                <div class="space-y-1">
+                  <label class="text-xs text-slate-400">CC Emails <span class="text-slate-600">(comma or semicolon separated)</span></label>
+                  <input id="reportCcEmails" type="text" placeholder="cc1@example.com, cc2@example.com"
+                    class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm" />
+                </div>
+                <div class="space-y-1">
+                  <label class="text-xs text-slate-400" data-i18n="reports_daily_send_time">Daily Auto-Send Time</label>
+                  <input id="reportDailySendTime" type="time" value="17:00"
+                    class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm" />
+                </div>
+              </div>
+              <div class="px-4 pb-4 flex items-center gap-3">
+                <button onclick="saveReportsConfig()"
+                  class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium" data-i18n="btn_save">Save</button>
+                <span id="reportConfigMsg" class="text-xs text-slate-400"></span>
+              </div>
+            </div>
+
+            <!-- Actions card -->
+            <div class="rounded-xl border border-slate-800 bg-slate-900">
+              <div class="px-4 py-3 border-b border-slate-800">
+                <div class="font-medium" data-i18n="reports_generate_title">Generate &amp; Send Report</div>
+              </div>
+              <div class="p-4">
+                <div class="flex flex-wrap gap-3 mb-4">
+                  <div class="space-y-1">
+                    <label class="text-xs text-slate-400" data-i18n="reports_date">Date</label>
+                    <input id="reportDate" type="date"
+                      class="rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm" />
+                  </div>
+                  <div class="flex items-end">
+                    <button onclick="loadReport()"
+                      class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm font-medium" data-i18n="btn_generate">Generate</button>
+                  </div>
+                  <div class="flex items-end">
+                    <button onclick="saveReportToHistory()"
+                      class="px-4 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-sm font-medium">Save to History</button>
+                  </div>
+                  <div class="flex items-end gap-2">
+                    <button onclick="sendDailyReport('manager')"
+                      class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-sm font-medium">Send to Manager</button>
+                    <button onclick="sendDailyReport('all')"
+                      class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium">Send to All</button>
+                  </div>
+                </div>
+                <span id="reportActionMsg" class="text-xs"></span>
+              </div>
+            </div>
+
+            <!-- Export card -->
+            <div class="rounded-xl border border-slate-800 bg-slate-900">
+              <div class="px-4 py-3 border-b border-slate-800">
+                <div class="font-medium" data-i18n="reports_export_title">Export CSV</div>
+                <div class="text-xs text-slate-400" data-i18n="reports_export_sub">Download attendance report as CSV</div>
+              </div>
+              <div class="p-4 flex flex-wrap gap-3">
+                <button onclick="exportReport(1)" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm font-medium">1 Day</button>
+                <button onclick="exportReport(7)" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm font-medium">7 Days</button>
+                <button onclick="exportReport(14)" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm font-medium">14 Days</button>
+                <button onclick="exportReport(30)" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm font-medium">30 Days</button>
+              </div>
+            </div>
+
+            <!-- History card -->
+            <div class="rounded-xl border border-slate-800 bg-slate-900">
+              <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+                <div>
+                  <div class="font-medium">Report History</div>
+                  <div class="text-xs text-slate-400">Saved daily snapshots — auto-saved at your configured send time</div>
+                </div>
+                <button onclick="loadReportHistory()" class="px-3 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-600 text-xs font-medium">Refresh</button>
+              </div>
+              <div id="reportHistoryList" class="divide-y divide-slate-800">
+                <div class="px-4 py-6 text-center text-slate-500 text-sm">Click Refresh to load history</div>
+              </div>
+            </div>
+
+            <!-- Results card -->
+            <div id="reportResultsCard" class="rounded-xl border border-slate-800 bg-slate-900 hidden">
+              <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+                <div class="font-medium" id="reportResultsTitle">Daily Gate Report</div>
+                <div id="reportSummaryBadges" class="flex gap-2 text-xs"></div>
+              </div>
+              <!-- Filter row -->
+              <div class="px-4 pt-3 flex gap-2 items-center flex-wrap">
+                <span class="text-xs text-slate-400" data-i18n="reports_filter">Filter:</span>
+                <button id="filterAll" onclick="setReportFilter('all')"
+                  class="px-2 py-1 rounded text-xs bg-emerald-600 text-white">All</button>
+                <button id="filterPresent" onclick="setReportFilter('present')"
+                  class="px-2 py-1 rounded text-xs bg-slate-700 text-slate-300 hover:bg-slate-600">Present</button>
+                <button id="filterAbsent" onclick="setReportFilter('absent')"
+                  class="px-2 py-1 rounded text-xs bg-slate-700 text-slate-300 hover:bg-slate-600">Absent</button>
+                <button id="filterLate" onclick="setReportFilter('late')"
+                  class="px-2 py-1 rounded text-xs bg-slate-700 text-slate-300 hover:bg-slate-600">Late Only</button>
+                <button id="filterOntime" onclick="setReportFilter('ontime')"
+                  class="px-2 py-1 rounded text-xs bg-slate-700 text-slate-300 hover:bg-slate-600">On Time Only</button>
+                <select id="filterShift" onchange="_renderReportTable()"
+                  class="ml-auto px-2 py-1 rounded bg-slate-800 border border-slate-700 text-xs text-slate-300 focus:outline-none focus:border-emerald-500">
+                  <option value="">All Shifts</option>
+                  <option value="morning">🌅 Morning</option>
+                  <option value="night">🌙 Night</option>
+                </select>
+              </div>
+              <div class="overflow-x-auto overflow-y-hidden">
+                <table class="w-full text-sm mt-3 whitespace-nowrap">
+                  <thead>
+                    <tr class="text-xs text-slate-500 uppercase tracking-wide border-b border-slate-800">
+                      <th class="px-4 py-3 text-left" data-i18n="col_person">Person</th>
+                      <th class="px-4 py-3 text-left" data-i18n="reports_col_date">Date</th>
+                      <th class="px-4 py-3 text-left">Shift</th>
+                      <th class="px-4 py-3 text-left" data-i18n="reports_col_arrival">Arrival</th>
+                      <th class="px-4 py-3 text-left">Last Exit</th>
+                      <th class="px-4 py-3 text-left" data-i18n="reports_col_exits">Exits</th>
+                      <th class="px-4 py-3 text-left" data-i18n="reports_col_total_outside">Total Out</th>
+                      <th class="px-4 py-3 text-left" data-i18n="reports_col_status">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody id="reportTableBody">
+                    <tr><td colspan="8" class="px-4 py-8 text-center text-slate-500">No data</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <!-- Zone Compliance Report Card -->
+            <div class="rounded-xl border border-slate-800 bg-slate-900 p-4 space-y-4">
+              <div class="font-medium" data-i18n="zone_compliance_report">Zone Compliance Report</div>
+              <div class="flex flex-wrap gap-3 items-center">
+                <div class="flex items-center gap-2">
+                  <label class="text-xs text-slate-400" data-i18n="label_from">From:</label>
+                  <input id="zoneReportFrom" type="date" class="rounded-lg bg-slate-800 border border-slate-700 px-3 py-2 text-sm text-slate-200" />
+                </div>
+                <div class="flex items-center gap-2">
+                  <label class="text-xs text-slate-400" data-i18n="label_to">To:</label>
+                  <input id="zoneReportTo" type="date" class="rounded-lg bg-slate-800 border border-slate-700 px-3 py-2 text-sm text-slate-200" />
+                </div>
+                <select id="zoneReportBranch"
+                  class="rounded-lg bg-slate-800 border border-slate-700 px-3 py-2 text-sm text-slate-200">
+                  <option value="">All Branches</option>
+                  <option value="Riyadh" data-i18n="branch_riyadh">Riyadh</option>
+                  <option value="Egypt" data-i18n="branch_egypt">Egypt</option>
+                </select>
+                <button onclick="loadZoneComplianceReport()"
+                  class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium">Generate</button>
+              </div>
+              <div class="rounded-xl border border-slate-800 overflow-x-auto overflow-y-hidden">
+                <table class="w-full text-sm whitespace-nowrap min-w-[500px]">
+                  <thead>
+                    <tr class="border-b border-slate-800 text-slate-400 text-xs">
+                      <th class="px-4 py-3 text-left" data-i18n="col_person">Employee</th>
+                      <th class="px-4 py-3 text-left" data-i18n="nav_zones">Zone</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_date">Date</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_in_zone_minutes">In Zone (min)</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_out_of_zone_minutes">Out of Zone (min)</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_oos_events">OOZ Events</th>
+                    </tr>
+                  </thead>
+                  <tbody id="zoneReportTableBody">
+                    <tr><td colspan="6" class="px-4 py-8 text-center text-slate-500">Select date range and click Generate</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+          </div><!-- /section-reports -->
+
+          <!-- ================= ADVANCED SECTION ================= -->
+          <div id="section-advanced" class="section-content hidden space-y-6">
+
+            <!-- Shift Times Config -->
+            <div class="rounded-xl border border-slate-800 bg-slate-900">
+              <div class="px-4 py-3 border-b border-slate-800">
+                <div class="font-medium">Shift Times</div>
+                <div class="text-xs text-slate-400">Configure shift start times and late thresholds for analytics and attendance reports</div>
+              </div>
+              <div class="p-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div class="space-y-1">
+                  <label class="text-xs text-slate-400">Morning Shift Start</label>
+                  <input id="advWorkStart" type="time" value="08:00"
+                    class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm" />
+                </div>
+                <div class="space-y-1">
+                  <label class="text-xs text-slate-400">Morning Shift End</label>
+                  <input id="advWorkEnd" type="time" value="17:00"
+                    class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm" />
+                </div>
+                <div class="space-y-1">
+                  <label class="text-xs text-slate-400">Morning Late Threshold (minutes)</label>
+                  <input id="advLateThreshold" type="number" min="1" max="120" value="15"
+                    class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm" />
+                </div>
+                <div class="flex items-center gap-2 pt-1">
+                  <input id="advNightShiftEnabled" type="checkbox"
+                    class="rounded bg-slate-800 border-slate-600 text-emerald-500"
+                    onchange="document.getElementById('advNightShiftFields').classList.toggle('hidden', !this.checked)" />
+                  <label for="advNightShiftEnabled" class="text-xs text-slate-400">Enable Night Shift</label>
+                </div>
+                <div id="advNightShiftFields" class="hidden space-y-3 pl-2 border-l border-slate-700 col-span-1 md:col-span-2">
+                  <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="space-y-1">
+                      <label class="text-xs text-slate-400">Night Shift Start</label>
+                      <input id="advNightWorkStart" type="time" value="21:00"
+                        class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm" />
+                    </div>
+                    <div class="space-y-1">
+                      <label class="text-xs text-slate-400">Night Shift End</label>
+                      <input id="advNightWorkEnd" type="time" value="05:00"
+                        class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm" />
+                    </div>
+                    <div class="space-y-1">
+                      <label class="text-xs text-slate-400">Night Late Threshold (minutes)</label>
+                      <input id="advNightLateThreshold" type="number" min="1" max="120" value="15"
+                        class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm" />
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="px-4 pb-4 flex items-center gap-3">
+                <button onclick="saveAdvancedConfig()"
+                  class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium">Save</button>
+                <span id="advConfigMsg" class="text-xs text-slate-400"></span>
+              </div>
+            </div>
+
+          </div><!-- /section-advanced -->
 
         </div>
         </div>
@@ -501,14 +889,16 @@
     <div id="sectionModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60">
       <div class="bg-slate-900 rounded-xl border border-slate-700 shadow-2xl w-full max-w-lg mx-4 flex flex-col max-h-[80vh]">
         <div class="flex items-center justify-between px-5 py-4 border-b border-slate-800">
-          <span id="secModalTitle" class="text-lg font-semibold text-slate-100"></span>
+          <input id="secModalTitle" type="text"
+            class="text-lg font-semibold text-slate-100 bg-transparent border-b border-slate-600 focus:border-emerald-500 focus:outline-none w-48 truncate"
+            onblur="secModalRename(this.value)" onkeydown="if(event.key==='Enter')this.blur()" />
           <div class="flex items-center gap-3">
             <button onclick="secModalDelete()" class="text-xs text-red-400 hover:text-red-300 px-2 py-1 rounded hover:bg-red-900/30" data-i18n="btn_delete">Delete</button>
             <button onclick="closeSectionModal()" class="text-slate-400 hover:text-white text-xl font-bold leading-none">&times;</button>
           </div>
         </div>
-        <div class="overflow-y-auto flex-1">
-          <table class="w-full text-sm">
+        <div class="overflow-x-auto overflow-y-auto flex-1">
+          <table class="w-full text-sm whitespace-nowrap">
             <thead>
               <tr class="text-xs text-slate-500 uppercase tracking-wide">
                 <th class="px-3 py-2 w-8"></th>
@@ -606,11 +996,36 @@
           if (btn.dataset.section === "email" && typeof renderEmailTable === "function") {
             renderEmailTable();
           }
+          // Load reports tab when Reports tab is opened
+          if (btn.dataset.section === "reports" && typeof loadReportsTab === "function") {
+            loadReportsTab();
+          }
+          // Load zones tab when Zones tab is opened
+          if (btn.dataset.section === "zones" && typeof initZonesSection === "function") {
+            initZonesSection();
+          }
+          if (btn.dataset.section === "advanced" && typeof loadAdvancedTab === "function") {
+            loadAdvancedTab();
+          }
         });
       });
 
       /* ===================== Shared helpers ===================== */
-      const fmt = n => String(n).replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+      // _arabicNames is rebuilt whenever _people is refreshed.
+      let _arabicNames = {};
+      function _rebuildArabicNames() {
+        _arabicNames = {};
+        for (const p of (_people || [])) {
+          if (p.arabic_name) _arabicNames[p.name] = p.arabic_name;
+        }
+      }
+      // fmt: shows Arabic name when UI language is Arabic and one exists.
+      const fmtEn = n => String(n).replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+      function fmt(n) {
+        if (!n) return "";
+        if (window._lang === "ar" && _arabicNames[n]) return _arabicNames[n];
+        return fmtEn(n);
+      }
 
       function showConfirm(msg) {
         return new Promise(resolve => {
@@ -674,6 +1089,7 @@
 
       /* ===================== PEOPLE ===================== */
       let _people = [];
+      let _zones = [];
       let _renameTarget = null;
       let _deleteTarget = null;
       let _galleryPerson = null;
@@ -685,7 +1101,8 @@
         try {
           const res = await fetch("/api/people");
           const data = await res.json();
-          _people = data.people || [];
+          _people = (data.people || []).sort((a, b) => a.name.localeCompare(b.name));
+          _rebuildArabicNames();
           _knownPeopleNames = _people.map(p => p.name.toLowerCase());
           // Prune selections for people that no longer exist
           if (typeof _selectedPeople !== "undefined") {
@@ -698,6 +1115,14 @@
           const existingSelect = document.getElementById("existingName");
           if (existingSelect) {
             existingSelect.innerHTML = _people.length
+              ? _people.map((p) => `<option value="${p.name}">${fmt(p.name)} (${p.count})</option>`).join("")
+              : `<option value="">(no people yet)</option>`;
+          }
+
+          // Populate bulk upload existing-name dropdown
+          const bulkExistingSelect = document.getElementById("bulkExistingName");
+          if (bulkExistingSelect) {
+            bulkExistingSelect.innerHTML = _people.length
               ? _people.map((p) => `<option value="${p.name}">${fmt(p.name)} (${p.count})</option>`).join("")
               : `<option value="">(no people yet)</option>`;
           }
@@ -790,6 +1215,7 @@
         const filterType    = (document.getElementById("filterType")?.value)    || "all";
         const filterBranch  = (document.getElementById("filterBranch")?.value)  || "";
         const filterSection = (document.getElementById("filterSection")?.value) || "";
+        const filterSearch  = (document.getElementById("peopleSearch")?.value   || "").trim().toLowerCase();
 
         const isUnknownName = n => /^unknown_\d+$/.test(n);
 
@@ -798,15 +1224,23 @@
           if (filterType === "unknown" && !isUnknownName(p.name)) return false;
           if (filterBranch  && (p.branch  || "Riyadh") !== filterBranch)  return false;
           if (filterSection && (p.section || "")       !== filterSection) return false;
+          if (filterSearch) {
+            const inName    = (p.name         || "").toLowerCase().includes(filterSearch);
+            const inArabic  = (p.arabic_name  || "").toLowerCase().includes(filterSearch);
+            if (!inName && !inArabic) return false;
+          }
           return true;
         });
 
-        // When showing all types, unknowns float to the top
+        // Sort alphabetically within each group; unknowns float to the top when showing all
+        const alpha = (a, b) => a.name.localeCompare(b.name);
         if (filterType === "all") {
           visible = [
-            ...visible.filter(p =>  isUnknownName(p.name)),
-            ...visible.filter(p => !isUnknownName(p.name)),
+            ...visible.filter(p =>  isUnknownName(p.name)).sort(alpha),
+            ...visible.filter(p => !isUnknownName(p.name)).sort(alpha),
           ];
+        } else {
+          visible.sort(alpha);
         }
 
         grid.classList.remove("hidden");
@@ -866,11 +1300,34 @@
                   })()}
                   <select
                     class="w-full px-2 py-1 rounded bg-slate-800 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-emerald-500"
-                    onchange="savePersonMeta('${p.name}', null, this.value)"
+                    onchange="savePersonMeta('${p.name}', null, this.value, null, null)"
                   >
                     <option value="Riyadh" ${(p.branch||'Riyadh')==='Riyadh'?'selected':''}>${t('branch_riyadh')}</option>
                     <option value="Egypt" ${(p.branch||'Riyadh')==='Egypt'?'selected':''}>${t('branch_egypt')}</option>
                   </select>
+                  <select
+                    class="w-full px-2 py-1 rounded bg-slate-800 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-emerald-500"
+                    onchange="savePersonMeta('${p.name}', null, null, null, this.value)"
+                  >
+                    <option value="morning" ${(!p.shift||p.shift==='morning')?'selected':''}>🌅 Morning Shift</option>
+                    <option value="night" ${p.shift==='night'?'selected':''}>🌙 Night Shift</option>
+                  </select>
+                  <select
+                    class="w-full px-2 py-1 rounded bg-slate-800 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-emerald-500"
+                    onchange="savePersonHomeZone('${p.name}', this.value)"
+                    id="home-zone-select-${p.name.replace(/[^a-zA-Z0-9_-]/g,'_')}"
+                  >
+                    <option value="">${t('no_zone')}</option>
+                    ${(_zones||[]).map(z=>`<option value="${z.id}" ${p.home_zone_id==z.id?'selected':''}>${z.name}</option>`).join('')}
+                  </select>
+                  <input
+                    type="text"
+                    dir="rtl"
+                    placeholder="الاسم بالعربي"
+                    value="${(p.arabic_name||'').replace(/"/g,'&quot;')}"
+                    class="w-full px-2 py-1 rounded bg-slate-800 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-emerald-500 text-right"
+                    onblur="savePersonMeta('${p.name}', null, null, this.value, null)"
+                  />
                 </div>
                 <div class="flex gap-2">
                   <button
@@ -892,10 +1349,13 @@
         }).join("");
       }
 
-      async function savePersonMeta(name, section, branch) {
+      async function savePersonMeta(name, section, branch, arabic_name, shift) {
         const body = {};
-        if (section !== null) body.section = section;
-        if (branch  !== null) body.branch  = branch;
+        if (section      !== null && section      !== undefined) body.section      = section;
+        if (branch       !== null && branch       !== undefined) body.branch       = branch;
+        if (arabic_name  !== null && arabic_name  !== undefined) body.arabic_name  = arabic_name;
+        if (shift        !== null && shift        !== undefined) body.shift        = shift;
+        if (!Object.keys(body).length) return;
         await fetch(`/api/person/${encodeURIComponent(name)}/meta`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -904,8 +1364,10 @@
         // Update local cache so re-render doesn't revert the value
         const p = _people.find(x => x.name === name);
         if (p) {
-          if (section !== null) p.section = section;
-          if (branch  !== null) p.branch  = branch;
+          if (section     !== null && section     !== undefined) p.section     = section;
+          if (branch      !== null && branch      !== undefined) p.branch      = branch;
+          if (arabic_name !== null && arabic_name !== undefined) p.arabic_name = arabic_name;
+          if (shift       !== null && shift       !== undefined) p.shift       = shift;
         }
       }
 
@@ -942,11 +1404,32 @@
 
       let _activeSectionName = null;
 
+      async function secModalRename(newName) {
+        newName = (newName || "").trim();
+        if (!newName || newName === _activeSectionName) {
+          document.getElementById("secModalTitle").value = _activeSectionName;
+          return;
+        }
+        const r = await fetch(`/api/sections/${encodeURIComponent(_activeSectionName)}/rename`, {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({new_name: newName}),
+        });
+        const j = await r.json();
+        if (j.ok) {
+          _activeSectionName = newName;
+          await loadSections();
+          await loadPeople();
+        } else {
+          document.getElementById("secModalTitle").value = _activeSectionName;
+          showToast(j.error || "Rename failed", "error");
+        }
+      }
+
       function openSectionModal(name) {
         _activeSectionName = name;
         const sec = _sections.find(s => s.name === name);
         if (!sec) return;
-        document.getElementById("secModalTitle").textContent = name;
+        document.getElementById("secModalTitle").value = name;
         renderSectionModalTable(sec);
         renderSectionAssignSelect(sec);
         document.getElementById("sectionModal").classList.remove("hidden");
@@ -1131,6 +1614,183 @@
         });
         await loadSections();
         loadPeople();
+      }
+
+      /* ===================== ZONES ===================== */
+      let _allLocations = [];
+
+      async function loadZones() {
+        const r = await fetch("/api/zones");
+        const j = await r.json();
+        _zones = j.zones || [];
+        renderZonesList();
+        populateZoneCameraSelect();
+        // Re-render people cards so home-zone selects pick up new zones list
+        if (_people.length) renderPeople();
+      }
+
+      function renderZonesList() {
+        const container = document.getElementById("zonesListContainer");
+        if (!container) return;
+        if (!_zones.length) {
+          container.innerHTML = `<div class="text-xs text-slate-500 py-2" data-i18n="no_zones">${t('no_zones')}</div>`;
+          return;
+        }
+        container.innerHTML = _zones.map(z => `
+          <div class="flex items-center justify-between px-3 py-2 rounded-lg bg-slate-800 border border-slate-700">
+            <div>
+              <span class="text-sm text-slate-200 font-medium">${z.name}</span>
+              ${z.description ? `<span class="text-xs text-slate-500 ml-2">${z.description}</span>` : ''}
+              <span class="text-xs text-slate-600 ml-2">(${z.branch})</span>
+            </div>
+            <button onclick="deleteZone(${z.id})" class="text-red-400 hover:text-red-300 text-xs px-2">✕</button>
+          </div>
+        `).join('');
+      }
+
+      function populateZoneCameraSelect() {
+        const sel = document.getElementById("zoneCameraZoneSelect");
+        if (!sel) return;
+        const prev = sel.value;
+        sel.innerHTML = `<option value="">${t('zone_select_placeholder')}</option>` +
+          _zones.map(z => `<option value="${z.id}" ${z.id==prev?'selected':''}>${z.name}</option>`).join('');
+        if (prev) loadZoneCameraCheckboxes();
+      }
+
+      async function loadAllLocations() {
+        if (_allLocations.length) return;
+        const r = await fetch("/api/history/locations");
+        const j = await r.json();
+        _allLocations = j.locations || [];
+      }
+
+      async function loadZoneCameraCheckboxes() {
+        const sel = document.getElementById("zoneCameraZoneSelect");
+        const container = document.getElementById("zoneCameraList");
+        if (!sel || !container) return;
+        const zoneId = parseInt(sel.value);
+        if (!zoneId) { container.innerHTML = ''; return; }
+        await loadAllLocations();
+        const r = await fetch(`/api/zones/${zoneId}/cameras`);
+        const j = await r.json();
+        const assigned = new Set((j.cameras || []).map(c => c.id));
+        container.innerHTML = _allLocations.map(loc => `
+          <label class="flex items-center gap-2 px-2 py-1 rounded bg-slate-800 cursor-pointer hover:bg-slate-700">
+            <input type="checkbox" class="zone-cam-cb" value="${loc.id}" ${assigned.has(loc.id)?'checked':''} />
+            <span class="text-xs text-slate-300">${loc.display_name || loc.name || loc.camera_source}</span>
+          </label>
+        `).join('');
+      }
+
+      async function createZone() {
+        const name = document.getElementById("zoneNameInput").value.trim();
+        if (!name) return;
+        const description = document.getElementById("zoneDescInput").value.trim();
+        const branch = document.getElementById("zoneBranchSelect").value;
+        await fetch("/api/zones", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name, description, branch }),
+        });
+        document.getElementById("zoneNameInput").value = "";
+        document.getElementById("zoneDescInput").value = "";
+        await loadZones();
+      }
+
+      async function deleteZone(zoneId) {
+        if (!confirm("Delete this zone?")) return;
+        await fetch(`/api/zones/${zoneId}`, { method: "DELETE" });
+        await loadZones();
+      }
+
+      async function saveZoneCameras() {
+        const sel = document.getElementById("zoneCameraZoneSelect");
+        if (!sel || !sel.value) return;
+        const zoneId = parseInt(sel.value);
+        const cbs = document.querySelectorAll(".zone-cam-cb:checked");
+        const location_ids = Array.from(cbs).map(cb => parseInt(cb.value));
+        await fetch(`/api/zones/${zoneId}/cameras`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ location_ids }),
+        });
+        toast("Camera assignments saved", "success");
+      }
+
+      async function savePersonHomeZone(personName, zoneIdStr) {
+        const zoneId = zoneIdStr ? parseInt(zoneIdStr) : null;
+        if (zoneId) {
+          await fetch(`/api/zones/${zoneId}/assign`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ person_name: personName }),
+          });
+        } else {
+          // unassign from any zone by finding current zone
+          const p = _people.find(x => x.name === personName);
+          if (p && p.home_zone_id) {
+            await fetch(`/api/zones/${p.home_zone_id}/unassign`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ person_name: personName }),
+            });
+          }
+        }
+        const p = _people.find(x => x.name === personName);
+        if (p) p.home_zone_id = zoneId;
+      }
+
+      async function saveZoneAwayThreshold() {
+        const val = parseInt(document.getElementById("zoneAwayThresholdInput").value);
+        if (!val || val < 1) return;
+        await fetch("/api/reports/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ zone_away_threshold_minutes: val }),
+        });
+        const msg = document.getElementById("zoneThresholdMsg");
+        if (msg) { msg.classList.remove("hidden"); setTimeout(() => msg.classList.add("hidden"), 2000); }
+      }
+
+      async function initZonesSection() {
+        await loadAllLocations();
+        await loadZones();
+        // Load current threshold from config
+        const r = await fetch("/api/reports/config");
+        const j = await r.json();
+        const thresh = j.config && j.config.zone_away_threshold_minutes;
+        if (thresh) {
+          const inp = document.getElementById("zoneAwayThresholdInput");
+          if (inp) inp.value = thresh;
+        }
+      }
+
+      async function loadZoneComplianceReport() {
+        const dateFrom = document.getElementById("zoneReportFrom").value;
+        const dateTo   = document.getElementById("zoneReportTo").value;
+        if (!dateFrom || !dateTo) { toast("Select date range", "warn"); return; }
+        const branch = document.getElementById("zoneReportBranch").value;
+        const params = new URLSearchParams({ date_from: dateFrom, date_to: dateTo });
+        if (branch) params.set("branch", branch);
+        const r = await fetch("/api/zones/report?" + params.toString());
+        const j = await r.json();
+        const tbody = document.getElementById("zoneReportTableBody");
+        if (!tbody) return;
+        const rows = j.rows || [];
+        if (!rows.length) {
+          tbody.innerHTML = `<tr><td colspan="6" class="px-4 py-8 text-center text-slate-500">No data found</td></tr>`;
+          return;
+        }
+        tbody.innerHTML = rows.map(row => `
+          <tr class="border-b border-slate-800 hover:bg-slate-800/30">
+            <td class="px-4 py-2 text-sm text-slate-200">${row.person_name.replace(/_/g,' ')}</td>
+            <td class="px-4 py-2 text-xs text-slate-400">${row.home_zone_name}</td>
+            <td class="px-4 py-2 text-xs text-slate-400">${row.day}</td>
+            <td class="px-4 py-2 text-xs text-emerald-400">${Math.round(row.minutes_in_zone||0)}</td>
+            <td class="px-4 py-2 text-xs text-amber-400">${Math.round(row.minutes_out_of_zone||0)}</td>
+            <td class="px-4 py-2 text-xs text-slate-400">${row.out_of_zone_events||0}</td>
+          </tr>
+        `).join('');
       }
 
       /* ===================== EMAIL TAB ===================== */
@@ -1563,8 +2223,8 @@
       });
 
       /* ===================== Init ===================== */
-      // Load sections first so manager badges are available when people render
-      loadSections().then(() => loadPeople());
+      // Load sections and zones first so dropdowns are available when people render
+      Promise.all([loadSections(), loadZones()]).then(() => loadPeople());
       // Poll every 30s as a safety net — explicit mutations (upload, rename,
       // delete, move, merge) already call loadPeople() directly. The cache
       // in /api/people makes unchanged polls cheap.
@@ -1574,16 +2234,32 @@
       const toastContainer = document.getElementById("toastContainer");
       function toast(message, kind = "info") {
         if (!toastContainer) return;
+        while (toastContainer.children.length >= 5) {
+          const first = toastContainer.children[0];
+          first.classList.add("toast-hide");
+          setTimeout(() => first.remove(), 250);
+        }
         const el = document.createElement("div");
-        el.className = "rounded-lg border border-slate-700 bg-slate-900/95 px-3 py-2 text-sm shadow-lg";
+        el.className = "toast-animate rounded-lg border border-slate-700 bg-slate-900/95 pl-3 pr-8 py-2 text-sm shadow-lg relative";
         if (kind === "success") el.classList.add("border-emerald-700");
-        if (kind === "warn") el.classList.add("border-amber-700");
-        el.textContent = message;
+        if (kind === "warn")    el.classList.add("border-amber-700");
+        if (kind === "error")   el.classList.add("border-red-700");
+        const textSpan = document.createElement("span");
+        textSpan.textContent = message;
+        textSpan.className = "flex-1";
+        el.appendChild(textSpan);
+        const closeBtn = document.createElement("button");
+        closeBtn.innerHTML = "&times;";
+        closeBtn.className = "absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 hover:text-white text-lg leading-none";
+        closeBtn.onclick = () => { el.classList.add("toast-hide"); setTimeout(() => el.remove(), 250); };
+        el.appendChild(closeBtn);
         toastContainer.appendChild(el);
         setTimeout(() => {
-          el.classList.add("opacity-0");
-          setTimeout(() => el.remove(), 250);
-        }, 2500);
+          if (el.parentNode) {
+            el.classList.add("toast-hide");
+            setTimeout(() => el.remove(), 250);
+          }
+        }, 3500);
       }
 
       /* ===================== Upload form ===================== */
@@ -1724,6 +2400,157 @@
       }
 
       setModeUI();
+
+      /* ===================== Bulk upload ===================== */
+      let _bulkMode = "single_person";
+
+      function toggleBulkPanel() {
+        const panel = document.getElementById("bulkPanel");
+        const chevron = document.getElementById("bulkPanelChevron");
+        if (!panel) return;
+        const open = !panel.classList.contains("hidden");
+        panel.classList.toggle("hidden", open);
+        if (chevron) chevron.style.transform = open ? "" : "rotate(180deg)";
+      }
+
+      function setBulkMode(mode) {
+        _bulkMode = mode;
+        const single = document.getElementById("bulkSingleControls");
+        const named = document.getElementById("bulkNameControls");
+        const tabS = document.getElementById("bulkTabSingle");
+        const tabN = document.getElementById("bulkTabName");
+        if (mode === "single_person") {
+          single && single.classList.remove("hidden");
+          named && named.classList.add("hidden");
+          tabS && tabS.classList.replace("bg-slate-800", "bg-emerald-600");
+          tabS && tabS.classList.replace("text-slate-300", "text-white");
+          tabN && tabN.classList.replace("bg-emerald-600", "bg-slate-800");
+          tabN && tabN.classList.replace("text-white", "text-slate-300");
+        } else {
+          single && single.classList.add("hidden");
+          named && named.classList.remove("hidden");
+          tabN && tabN.classList.replace("bg-slate-800", "bg-emerald-600");
+          tabN && tabN.classList.replace("text-slate-300", "text-white");
+          tabS && tabS.classList.replace("bg-emerald-600", "bg-slate-800");
+          tabS && tabS.classList.replace("text-white", "text-slate-300");
+        }
+        renderBulkPreview();
+      }
+
+      function updateBulkPersonUI() {
+        const modeVal = document.querySelector('input[name="bulk_mode_person"]:checked')?.value || "existing";
+        const sel = document.getElementById("bulkExistingName");
+        const inp = document.getElementById("bulkNewName");
+        if (modeVal === "new") {
+          sel && sel.classList.add("hidden");
+          inp && inp.classList.remove("hidden");
+        } else {
+          sel && sel.classList.remove("hidden");
+          inp && inp.classList.add("hidden");
+        }
+      }
+
+      function sanitizeName(raw) {
+        return raw.trim().replace(/ /g, "_").replace(/[^A-Za-z0-9_\-]/g, "").slice(0, 64);
+      }
+
+      function renderBulkPreview() {
+        const input = document.getElementById("bulkFileInput");
+        const preview = document.getElementById("bulkPreview");
+        if (!input || !preview) return;
+        const files = Array.from(input.files || []);
+        if (files.length === 0) { preview.classList.add("hidden"); return; }
+        preview.classList.remove("hidden");
+        preview.innerHTML = files.map(f => {
+          let label = f.name;
+          if (_bulkMode === "name_from_file") {
+            const stem = f.name.replace(/\.[^.]+$/, "");
+            const person = sanitizeName(stem);
+            label = person
+              ? `<span class="text-slate-200">${person}</span> ← ${f.name}`
+              : `<span class="text-red-400">⚠ cannot derive name</span> ← ${f.name}`;
+          }
+          return `<div class="py-0.5">${label}</div>`;
+        }).join("");
+      }
+
+      async function submitBulkUpload() {
+        const input = document.getElementById("bulkFileInput");
+        const btn = document.getElementById("bulkUploadBtn");
+        const msgEl = document.getElementById("bulkMsg");
+        const prog = document.getElementById("bulkProgress");
+        const progBar = document.getElementById("bulkProgressBar");
+        const progText = document.getElementById("bulkProgressText");
+        if (!input || !input.files || input.files.length === 0) {
+          if (msgEl) { msgEl.textContent = "Select at least one image."; msgEl.className = "text-xs text-red-400"; }
+          return;
+        }
+        const fd = new FormData();
+        fd.set("bulk_mode", _bulkMode);
+        if (_bulkMode === "single_person") {
+          const modeVal = document.querySelector('input[name="bulk_mode_person"]:checked')?.value || "existing";
+          fd.set("mode", modeVal);
+          if (modeVal === "existing") {
+            const sel = document.getElementById("bulkExistingName");
+            fd.set("existing_name", sel?.value || "");
+          } else {
+            const inp = document.getElementById("bulkNewName");
+            fd.set("new_name", inp?.value || "");
+          }
+        }
+        for (const f of input.files) fd.append("files[]", f);
+
+        if (btn) { btn.disabled = true; btn.textContent = "Uploading…"; }
+        if (msgEl) { msgEl.textContent = ""; msgEl.className = "text-xs text-slate-300"; }
+        if (prog) prog.classList.remove("hidden");
+
+        const xhr = new XMLHttpRequest();
+        xhr.upload.addEventListener("progress", ev => {
+          if (ev.lengthComputable) {
+            const pct = Math.round((ev.loaded / ev.total) * 100);
+            if (progBar) progBar.style.width = pct + "%";
+            if (progText) progText.textContent = pct < 100 ? pct + "%" : "Processing…";
+          }
+        });
+        xhr.addEventListener("load", async () => {
+          if (prog) prog.classList.add("hidden");
+          if (btn) { btn.disabled = false; btn.textContent = "Upload all"; }
+          let j;
+          try { j = JSON.parse(xhr.responseText); } catch { j = {}; }
+          if (xhr.status < 200 || xhr.status >= 300 || !j.ok) {
+            if (msgEl) {
+              msgEl.textContent = "Error: " + (j.error || "upload failed");
+              msgEl.className = "text-xs text-red-400";
+            }
+            return;
+          }
+          const errCount = (j.errors || []).length;
+          let summary = `Uploaded ${j.uploaded} image${j.uploaded !== 1 ? "s" : ""}`;
+          if (errCount) summary += ` (${errCount} skipped)`;
+          if (msgEl) {
+            msgEl.innerHTML = `<span class="text-emerald-400">✓ ${summary}</span>`;
+            if (errCount) {
+              const errList = j.errors.map(e => `${e.file}: ${e.error}`).join("; ");
+              msgEl.innerHTML += `<div class="text-red-400 mt-1">${errList}</div>`;
+            }
+            msgEl.className = "text-xs";
+          }
+          toast(summary, "success");
+          input.value = "";
+          document.getElementById("bulkPreview")?.classList.add("hidden");
+          await loadPeople();
+          setTimeout(() => {
+            if (msgEl) { msgEl.textContent = ""; msgEl.className = "text-xs text-slate-300"; }
+          }, 6000);
+        });
+        xhr.addEventListener("error", () => {
+          if (prog) prog.classList.add("hidden");
+          if (btn) { btn.disabled = false; btn.textContent = "Upload all"; }
+          if (msgEl) { msgEl.textContent = "Network error."; msgEl.className = "text-xs text-red-400"; }
+        });
+        xhr.open("POST", "/api/bulk_upload_faces");
+        xhr.send(fd);
+      }
 
       /* ===================== Capture modal ===================== */
       let _captureStream = null;
@@ -1957,8 +2784,8 @@
                 ${t("btn_delete_group")}
               </button>
             </div>
-            <div class="p-3">
-              <table class="w-full text-sm">
+            <div class="p-3 overflow-x-auto">
+              <table class="w-full text-sm whitespace-nowrap">
                 <thead>
                   <tr class="border-b border-slate-800/50 text-slate-400 text-xs">
                     <th class="px-1 py-1 w-6"></th>
@@ -2425,5 +3252,386 @@
         });
       }
     </script>
+  <script>
+  /* ===================== Reports Tab ===================== */
+  let _reportRecords = [];
+  let _reportFilter = "all";
+
+  async function loadReportsTab() {
+    const saved = await _loadReportConfig();
+    await _loadReportCameraOptions(saved.arrival_camera, saved.exit_camera);
+    const today = new Date().toISOString().slice(0, 10);
+    document.getElementById("reportDate").value = today;
+    loadReportHistory();
+  }
+
+  async function _loadReportConfig() {
+    try {
+      const r = await fetch("/api/reports/config");
+      const j = await r.json();
+      if (!j.ok) return {};
+      const c = j.config;
+      document.getElementById("reportManagerEmail").value = c.manager_email || "";
+      document.getElementById("reportCcEmails").value = c.cc_emails || "";
+      document.getElementById("reportDailySendTime").value = c.daily_send_time || "17:00";
+      return { arrival_camera: c.arrival_camera || "", exit_camera: c.exit_camera || "" };
+    } catch(_) { return {}; }
+  }
+
+  async function _loadReportCameraOptions(savedArrival, savedExit) {
+    try {
+      const r = await fetch("/api/ip_cameras");
+      const j = await r.json();
+      const selA = document.getElementById("reportArrivalCamera");
+      const selE = document.getElementById("reportExitCamera");
+      for (const sel of [selA, selE]) while (sel.options.length > 1) sel.remove(1);
+
+      const addOpt = (sel, value, label) => {
+        const opt = document.createElement("option");
+        opt.value = value;
+        opt.textContent = label;
+        sel.appendChild(opt);
+      };
+
+      for (const grp of (j.groups || [])) {
+        for (const cam of (grp.cameras || [])) {
+          const v = cam.resolved_url || cam.url || cam.source || cam.id;
+          const label = `${grp.name} / ${cam.name}`;
+          addOpt(selA, v, label);
+          addOpt(selE, v, label);
+        }
+      }
+      const lr = await fetch("/api/history/locations");
+      const lj = await lr.json();
+      for (const loc of (lj.locations || [])) {
+        const v = loc.camera_source;
+        const label = loc.name || v;
+        if (!Array.from(selA.options).some(o => o.value === v)) addOpt(selA, v, label);
+        if (!Array.from(selE.options).some(o => o.value === v)) addOpt(selE, v, label);
+      }
+      if (savedArrival) selA.value = savedArrival;
+      if (savedExit) selE.value = savedExit;
+    } catch(_) {}
+  }
+
+  async function saveReportsConfig() {
+    const btn = event.target;
+    const msgEl = document.getElementById("reportConfigMsg");
+    btn.disabled = true;
+    msgEl.textContent = "Saving…";
+    msgEl.className = "text-xs text-slate-400";
+    try {
+      const r = await fetch("/api/reports/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          arrival_camera: document.getElementById("reportArrivalCamera").value,
+          exit_camera: document.getElementById("reportExitCamera").value,
+          manager_email: document.getElementById("reportManagerEmail").value,
+          cc_emails: document.getElementById("reportCcEmails").value,
+          daily_send_time: document.getElementById("reportDailySendTime").value,
+        }),
+      });
+      const j = await r.json();
+      if (j.ok) {
+        msgEl.textContent = "Saved ✓";
+        msgEl.className = "text-xs text-emerald-400";
+      } else {
+        msgEl.textContent = j.error || "Save failed";
+        msgEl.className = "text-xs text-red-400";
+      }
+    } catch(_) {
+      msgEl.textContent = "Network error";
+      msgEl.className = "text-xs text-red-400";
+    } finally {
+      btn.disabled = false;
+      setTimeout(() => { msgEl.textContent = ""; }, 3000);
+    }
+  }
+
+  async function loadReport() {
+    const msgEl = document.getElementById("reportActionMsg");
+    const date = document.getElementById("reportDate").value;
+    if (!date) { msgEl.textContent = "Select a date first"; msgEl.className = "text-xs text-red-400"; return; }
+    msgEl.textContent = "Generating…";
+    msgEl.className = "text-xs text-slate-400";
+    try {
+      const r = await fetch(`/api/reports/gate?date=${encodeURIComponent(date)}`);
+      const j = await r.json();
+      if (!j.ok) {
+        msgEl.textContent = j.error || "Failed";
+        msgEl.className = "text-xs text-red-400";
+        return;
+      }
+      msgEl.textContent = "";
+      _reportRecords = j.records || [];
+      _reportFilter = "all";
+      _updateFilterButtons();
+      document.getElementById("reportResultsTitle").textContent =
+        `Gate Report — ${date}`;
+      _renderReportSummary(j.summary);
+      _renderReportTable();
+      document.getElementById("reportResultsCard").classList.remove("hidden");
+    } catch(_) {
+      msgEl.textContent = "Network error";
+      msgEl.className = "text-xs text-red-400";
+    }
+  }
+
+  function _renderReportSummary(summary) {
+    const el = document.getElementById("reportSummaryBadges");
+    el.innerHTML = `
+      <span class="px-2 py-1 rounded bg-slate-700 text-slate-300">Total: ${summary.total}</span>
+      <span class="px-2 py-1 rounded ${summary.absent > 0 ? 'bg-slate-600 text-slate-300' : 'bg-slate-700 text-slate-500'}">Absent: ${summary.absent || 0}</span>
+      <span class="px-2 py-1 rounded ${summary.late_arrival > 0 ? 'bg-red-900 text-red-300' : 'bg-slate-700 text-slate-400'}">Late arrivals: ${summary.late_arrival}</span>
+      <span class="px-2 py-1 rounded ${summary.late_exits > 0 ? 'bg-amber-900 text-amber-300' : 'bg-slate-700 text-slate-400'}">Late exits: ${summary.late_exits}</span>
+    `;
+  }
+
+  function setReportFilter(f) {
+    _reportFilter = f;
+    _updateFilterButtons();
+    _renderReportTable();
+  }
+
+  function _updateFilterButtons() {
+    const btn = id => `px-2 py-1 rounded text-xs ${_reportFilter === id ? 'bg-emerald-600 text-white' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'}`;
+    document.getElementById("filterAll").className = btn('all');
+    document.getElementById("filterPresent").className = btn('present');
+    document.getElementById("filterAbsent").className = btn('absent');
+    document.getElementById("filterLate").className = btn('late');
+    document.getElementById("filterOntime").className = btn('ontime');
+  }
+
+  function _renderReportTable() {
+    const tbody = document.getElementById("reportTableBody");
+    const shiftFilter = (document.getElementById("filterShift")?.value) || "";
+    let rows = _reportRecords;
+    if (_reportFilter === "present") rows = rows.filter(r => !r.absent);
+    if (_reportFilter === "absent") rows = rows.filter(r => r.absent);
+    if (_reportFilter === "late") rows = rows.filter(r => !r.absent && (r.arrived_late || r.late_exits_count > 0));
+    if (_reportFilter === "ontime") rows = rows.filter(r => !r.absent && !r.arrived_late && r.late_exits_count === 0);
+    // Shift filter: absent people show in both shifts
+    if (shiftFilter) rows = rows.filter(r => r.absent || (r.shift || "morning") === shiftFilter);
+
+    if (rows.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="8" class="px-4 py-8 text-center text-slate-500">No records</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = rows.map(r => {
+      const hasIssue = r.arrived_late || r.late_exits_count > 0;
+      let status, statusCls;
+      if (r.absent) {
+        status = "غائب";
+        statusCls = "bg-slate-700 text-slate-400";
+      } else {
+        const statusParts = [];
+        if (r.arrived_late) statusParts.push(`متأخر +${r.late_arrival_minutes}د`);
+        if (r.late_exits_count) statusParts.push(`${r.late_exits_count} خروج متأخر`);
+        status = statusParts.join("، ") || "في الوقت";
+        statusCls = hasIssue ? "bg-red-900/60 text-red-300" : "bg-emerald-900/60 text-emerald-300";
+      }
+      const exitsHtml = r.exits && r.exits.length
+        ? r.exits.map(e => {
+            const durLabel = e.duration_minutes != null ? `${e.duration_minutes}د` : '...';
+            const cls = e.still_out ? 'bg-blue-900 text-blue-200' : e.late ? 'bg-red-900 text-red-200' : 'bg-slate-700 text-slate-300';
+            return `<span class="inline-flex items-center gap-1 mr-1 mb-1 px-1.5 py-0.5 rounded text-xs ${cls}">
+              ${e.out_at}→${e.back_at} (${durLabel}${e.late && !e.still_out ? ' ⚠' : ''}${e.still_out ? ' خارج' : ''})
+            </span>`;
+          }).join("")
+        : '<span class="text-slate-500">—</span>';
+      const shiftLabel = (r.shift === "night") ? "🌙 Night" : "🌅 Morning";
+      const shiftCls   = (r.shift === "night") ? "text-indigo-400" : "text-amber-400";
+      return `<tr class="border-b border-slate-800 hover:bg-slate-800/40 ${r.absent ? 'opacity-50' : ''}">
+        <td class="px-4 py-3 font-medium">${fmt(r.person)}</td>
+        <td class="px-4 py-3 text-slate-400 text-xs">${r.date}</td>
+        <td class="px-4 py-3 text-xs font-medium ${shiftCls}">${shiftLabel}</td>
+        <td class="px-4 py-3 text-xs font-medium">${r.arrival}</td>
+        <td class="px-4 py-3 text-xs text-slate-300">${r.last_exit || '—'}</td>
+        <td class="px-4 py-3 max-w-xs">${exitsHtml}</td>
+        <td class="px-4 py-3 text-xs font-medium ${r.total_outside_minutes > 0 ? 'text-amber-400' : 'text-slate-500'}">
+          ${r.total_outside_minutes > 0 ? r.total_outside_minutes + 'د' : '—'}
+        </td>
+        <td class="px-4 py-3">
+          <span class="px-2 py-0.5 rounded text-xs font-medium ${statusCls}">${status}</span>
+        </td>
+      </tr>`;
+    }).join("");
+  }
+
+  async function sendDailyReport(to) {
+    const msgEl = document.getElementById("reportActionMsg");
+    msgEl.textContent = "Sending…";
+    msgEl.className = "text-xs text-slate-400";
+    try {
+      const r = await fetch(`/api/reports/send?to=${to || 'manager'}`, { method: "POST" });
+      const j = await r.json();
+      if (j.ok) {
+        msgEl.textContent = `✓ Report sent to ${j.sent_to} (${j.records} records)`;
+        msgEl.className = "text-xs text-emerald-400";
+      } else {
+        msgEl.textContent = `Error: ${j.error}`;
+        msgEl.className = "text-xs text-red-400";
+      }
+    } catch(_) {
+      msgEl.textContent = "Network error";
+      msgEl.className = "text-xs text-red-400";
+    }
+    setTimeout(() => { msgEl.textContent = ""; }, 5000);
+  }
+
+  function exportReport(days) {
+    window.location.href = `/api/reports/export?days=${days}`;
+  }
+
+  async function saveReportToHistory() {
+    const msgEl = document.getElementById("reportActionMsg");
+    const date = document.getElementById("reportDate").value;
+    if (!date) { msgEl.textContent = "Select a date first"; msgEl.className = "text-xs text-red-400"; return; }
+    msgEl.textContent = "Saving…";
+    msgEl.className = "text-xs text-slate-400";
+    try {
+      const r = await fetch(`/api/reports/history/${date}/save`, { method: "POST" });
+      const j = await r.json();
+      if (j.ok) {
+        msgEl.textContent = `✓ Saved ${j.total} records for ${date}`;
+        msgEl.className = "text-xs text-emerald-400";
+        loadReportHistory();
+      } else {
+        msgEl.textContent = j.error || "Save failed";
+        msgEl.className = "text-xs text-red-400";
+      }
+    } catch(_) {
+      msgEl.textContent = "Network error";
+      msgEl.className = "text-xs text-red-400";
+    }
+    setTimeout(() => { msgEl.textContent = ""; }, 4000);
+  }
+
+  async function loadReportHistory() {
+    const el = document.getElementById("reportHistoryList");
+    el.innerHTML = '<div class="px-4 py-4 text-center text-slate-500 text-sm">Loading…</div>';
+    try {
+      const r = await fetch("/api/reports/history?limit=60");
+      const j = await r.json();
+      if (!j.ok || !j.reports.length) {
+        el.innerHTML = '<div class="px-4 py-6 text-center text-slate-500 text-sm">No saved reports yet</div>';
+        return;
+      }
+      el.innerHTML = j.reports.map(row => {
+        const hasIssue = row.late_arrivals > 0 || row.late_exits > 0;
+        return `<div class="px-4 py-3 flex items-center justify-between gap-4 hover:bg-slate-800/40">
+          <div class="flex items-center gap-3 min-w-0">
+            <div class="font-medium text-sm">${row.report_date}</div>
+            <div class="flex gap-1.5 text-xs flex-wrap">
+              <span class="px-1.5 py-0.5 rounded bg-slate-700 text-slate-300">${row.total_people} people</span>
+              ${row.late_arrivals > 0 ? `<span class="px-1.5 py-0.5 rounded bg-red-900 text-red-300">Late: ${row.late_arrivals}</span>` : ''}
+              ${row.late_exits > 0 ? `<span class="px-1.5 py-0.5 rounded bg-amber-900 text-amber-300">Exit issues: ${row.late_exits}</span>` : ''}
+              ${row.sent_email ? '<span class="px-1.5 py-0.5 rounded bg-blue-900 text-blue-300">✉ Sent</span>' : ''}
+            </div>
+            <div class="text-xs text-slate-500 hidden sm:block">${(row.generated_at||'').slice(0,16).replace('T',' ')}</div>
+          </div>
+          <div class="flex gap-2 shrink-0">
+            <button onclick="viewHistoryReport('${row.report_date}')"
+              class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-xs">View</button>
+            <a href="/api/reports/history/${row.report_date}/export"
+              class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-xs">Excel</a>
+          </div>
+        </div>`;
+      }).join('');
+    } catch(_) {
+      el.innerHTML = '<div class="px-4 py-4 text-center text-red-400 text-sm">Failed to load</div>';
+    }
+  }
+
+  async function viewHistoryReport(date) {
+    const msgEl = document.getElementById("reportActionMsg");
+    msgEl.textContent = "Loading…";
+    msgEl.className = "text-xs text-slate-400";
+    try {
+      const r = await fetch(`/api/reports/history/${date}`);
+      const j = await r.json();
+      if (!j.ok) { msgEl.textContent = j.error; msgEl.className = "text-xs text-red-400"; return; }
+      msgEl.textContent = "";
+      _reportRecords = j.report.records || [];
+      _reportFilter = "all";
+      _updateFilterButtons();
+      document.getElementById("reportResultsTitle").textContent = `Gate Report — ${date} (saved)`;
+      _renderReportSummary({
+        total: j.report.total_people,
+        late_arrival: j.report.late_arrivals,
+        late_exits: j.report.late_exits,
+      });
+      _renderReportTable();
+      document.getElementById("reportResultsCard").classList.remove("hidden");
+      document.getElementById("reportResultsCard").scrollIntoView({ behavior: "smooth" });
+    } catch(_) {
+      msgEl.textContent = "Network error";
+      msgEl.className = "text-xs text-red-400";
+    }
+  }
+
+  /* ===================== Advanced Tab ===================== */
+
+  async function loadAdvancedTab() {
+    await _loadAdvancedConfig();
+  }
+
+  async function _loadAdvancedConfig() {
+    try {
+      const r = await fetch("/api/advanced/config");
+      const j = await r.json();
+      if (!j.ok) return;
+      const c = j.config;
+      document.getElementById("advWorkStart").value = c.work_start || "08:00";
+      document.getElementById("advWorkEnd").value = c.work_end || "17:00";
+      document.getElementById("advLateThreshold").value = c.late_threshold_minutes ?? 15;
+      const nightEnabled = !!c.night_shift_enabled;
+      document.getElementById("advNightShiftEnabled").checked = nightEnabled;
+      document.getElementById("advNightShiftFields").classList.toggle("hidden", !nightEnabled);
+      document.getElementById("advNightWorkStart").value = c.night_work_start || "21:00";
+      document.getElementById("advNightWorkEnd").value = c.night_work_end || "05:00";
+      document.getElementById("advNightLateThreshold").value = c.night_late_threshold_minutes ?? 15;
+    } catch(_) {}
+  }
+
+  async function saveAdvancedConfig() {
+    const btn = event.target;
+    const msgEl = document.getElementById("advConfigMsg");
+    btn.disabled = true;
+    msgEl.textContent = "Saving…";
+    msgEl.className = "text-xs text-slate-400";
+    try {
+      const r = await fetch("/api/advanced/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          work_start: document.getElementById("advWorkStart").value,
+          work_end: document.getElementById("advWorkEnd").value,
+          late_threshold_minutes: parseInt(document.getElementById("advLateThreshold").value) || 15,
+          night_shift_enabled: document.getElementById("advNightShiftEnabled").checked,
+          night_work_start: document.getElementById("advNightWorkStart").value,
+          night_work_end: document.getElementById("advNightWorkEnd").value,
+          night_late_threshold_minutes: parseInt(document.getElementById("advNightLateThreshold").value) || 15,
+        }),
+      });
+      const j = await r.json();
+      if (j.ok) {
+        msgEl.textContent = "Saved ✓";
+        msgEl.className = "text-xs text-emerald-400";
+      } else {
+        msgEl.textContent = j.error || "Save failed";
+        msgEl.className = "text-xs text-red-400";
+      }
+    } catch(_) {
+      msgEl.textContent = "Network error";
+      msgEl.className = "text-xs text-red-400";
+    } finally {
+      btn.disabled = false;
+      setTimeout(() => { msgEl.textContent = ""; }, 3000);
+    }
+  }
+  </script>
   </body>
 </html>

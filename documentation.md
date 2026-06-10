@@ -20,7 +20,8 @@ A comprehensive reference for the Face Recognition Attendance System — archite
 12. [Configuration Reference](#12-configuration-reference)
 13. [File Layout](#13-file-layout)
 14. [Web UI Pages](#14-web-ui-pages)
-15. [Analytics & Reports](#15-analytics--reports)
+15. [Gate Events & Daily Reports](#15-gate-events--daily-reports)
+16. [Analytics & Reports](#16-analytics--reports)
 
 ---
 
@@ -98,6 +99,26 @@ The Flask server and the face-recognition engine run in **separate OS processes*
 - Each camera runs a **detect thread** that fires every `detect_every` seconds (default **1.0 s**, but the value passed from `app.py` is **5 s** for the shared pool).
 - Between detections, OpenCV **CSRT trackers** (one per active track) keep the bounding boxes alive at full frame rate.
 - Head detection (YOLOv8n) supplements face detection to sustain tracking when the face is not visible.
+
+### Motion gating
+
+Before calling InsightFace, each detect thread runs a fast CPU motion check: the current frame is downscaled to 160×90 grayscale and compared against the previous processed frame using `cv2.absdiff`. GPU inference is skipped if the number of changed pixels (diff > 15) is below `motion_thresh` (default **500**). Controlled by `motion_gate` (default **true**). Reduces GPU utilisation by 60–80% on static scenes.
+
+### High-priority cameras
+
+Cameras listed in `high_priority_sources` (a set of RTSP URLs) bypass the motion gate entirely and always run detection at full resolution (`detect_scale = 1.0`), regardless of the engine-wide `detect_scale` setting. The gate cameras (arrival + exit) are registered here at startup from `reports_config.json`.
+
+### Adaptive detect_every backoff
+
+If a camera's worker queue depth exceeds 3 frames, the effective `detect_every` for that camera is multiplied by 1.5 (capped at `detect_every × 4`). This prevents GPU queue pile-up under load.
+
+### Phase-offset stagger
+
+Camera detect threads are staggered by `(i % pool_size) * (detect_period / pool_size)` to spread GPU inference evenly across the InsightFace pool rather than firing all cameras simultaneously at t=0.
+
+### Idle render FPS
+
+The grid render thread tracks when the last MJPEG frame was requested (`_last_viewer_req_t`). If no viewer has polled for > 5 seconds, the render rate drops to 2 FPS. It snaps back to `out_fps` the moment a new request arrives. Configured via `ping_viewer()` called from the `/video` routes.
 
 ### Recognition matching
 
@@ -362,6 +383,10 @@ Stores per-person metadata. One row per enrolled person (created on first save; 
 | `name` | text PK | Matches `faces/<name>/` directory name |
 | `section` | text NOT NULL DEFAULT '' | Name of the section this person belongs to (read-only badge on the People card; managed from the Sections tab) |
 | `branch` | text NOT NULL DEFAULT 'Riyadh' | Home branch — determines which branch's absent list this person appears in |
+| `email` | text NOT NULL DEFAULT '' | Optional contact email |
+| `arabic_name` | text NOT NULL DEFAULT '' | Arabic display name |
+| `shift` | text NOT NULL DEFAULT '' | Shift assignment (`'morning'`, `'night'`); '' = unassigned |
+| `home_zone_id` | integer FK → `zones.id` (nullable) | The zone this person is expected to be present in |
 
 #### `sections`
 
@@ -371,8 +396,64 @@ Named groups that people can be assigned to (e.g. "IT", "HR"). Managed from Sett
 |--------|------|-------|
 | `id` | integer PK AUTOINCREMENT | Internal ID |
 | `name` | text NOT NULL UNIQUE | Section display name |
+| `manager` | text NOT NULL DEFAULT '' | Name of the section's manager person |
 
-The `people.section` column is kept in sync: assigning a person to a section sets `people.section = section_name`; unassigning or deleting a section clears it to `''`.
+The `people.section` column is kept in sync: assigning a person to a section sets `people.section = section_name`; unassigning or deleting a section clears it to `''`. Renaming a section (`POST /api/sections/<name>/rename`) updates both the `sections` row and all `people.section` values atomically.
+
+The `manager` column is a soft link to `people.name`; set via `POST /api/sections/<name>/manager`.
+
+#### `zones`
+
+Named camera zones. People can be assigned a home zone; the zone status API reports who is present vs. away from their expected zone.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | integer PK AUTOINCREMENT | |
+| `name` | text NOT NULL UNIQUE | Zone display name |
+| `description` | text NOT NULL DEFAULT '' | Optional description |
+| `branch` | text NOT NULL DEFAULT 'Riyadh' | Branch this zone belongs to |
+| `created_at` | text DEFAULT datetime('now') | |
+
+#### `zone_cameras`
+
+Many-to-many join between zones and locations (cameras). A zone can cover multiple cameras; a camera can belong to multiple zones.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `zone_id` | integer FK → `zones.id` ON DELETE CASCADE | |
+| `location_id` | integer FK → `locations.id` ON DELETE CASCADE | |
+
+Primary key: `(zone_id, location_id)`.
+
+#### `gate_events`
+
+Records exit/entry pairs through the designated gate cameras. One row per exit event; the entry timestamp is filled in when the same person returns.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | integer PK AUTOINCREMENT | |
+| `person_name` | text NOT NULL | |
+| `event_date` | text NOT NULL | Calendar date (`YYYY-MM-DD`) of the exit |
+| `exit_time` | text NOT NULL | ISO timestamp (UTC) when person hit the exit camera |
+| `entry_time` | text | ISO timestamp (UTC) when person returned to the arrival camera; NULL if still out |
+| `duration_minutes` | real | `entry_time − exit_time` in minutes; NULL until entry recorded |
+
+Rules:
+- A row is opened (`exit_time` set) each time a person is detected on the **exit camera**.
+- The most-recent open row for that person is closed (`entry_time` + `duration_minutes`) when they are next detected on the **arrival camera**.
+- If a person leaves again before returning, a new row is opened — multiple rows per person per day are normal.
+- Rows with `entry_time = NULL` indicate the person is currently out.
+
+#### `daily_reports`
+
+Auto-saved nightly snapshot of the gate report at 23:00.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | integer PK AUTOINCREMENT | |
+| `report_date` | text UNIQUE NOT NULL | `YYYY-MM-DD` |
+| `report_json` | text NOT NULL | Full serialised report (JSON string) |
+| `created_at` | text NOT NULL | ISO timestamp when saved |
 
 #### Indexes on `visits`
 
@@ -431,6 +512,31 @@ All settings are read from `.env` (loaded by `python-dotenv` on startup). Copy `
 | `threshold` | `0.5` | Cosine distance threshold for ArcFace matching |
 | `tracker_type` | `CSRT` | OpenCV tracker algorithm (`CSRT` or `KCF`) |
 | `INFERENCE_POOL_SIZE` | `6` | Number of parallel InsightFace instances (~300–400 MB VRAM each) |
+| `motion_gate` | `true` | Enable CPU motion check before GPU inference |
+| `motion_thresh` | `500` | Pixel-diff count threshold for motion gate |
+| `viewer_jpeg_quality` | `100` | JPEG quality for the MJPEG viewer stream (separate from detection) |
+
+These can also be changed at runtime without restart via `POST /api/engine/config`.
+
+### Reports config (`reports_config.json`)
+
+| Key | Description |
+|-----|-------------|
+| `arrival_camera` | Full RTSP URL of the entry/arrival gate camera (cam 15) |
+| `exit_camera` | Full RTSP URL of the exit gate camera (cam 16) |
+| `manager_email` | Email address for daily report delivery |
+| `work_start` | Morning shift start time in `HH:MM` format (e.g. `"09:00"`) |
+| `work_end` | Morning shift end time in `HH:MM` format (e.g. `"17:00"`) |
+| `late_threshold_minutes` | Minutes after shift start before an arrival is considered late |
+| `daily_send_time` | Time to email the daily report (e.g. `"17:00"`) |
+| `night_shift_enabled` | Boolean — enable night shift tracking |
+| `night_work_start` | Night shift start time in `HH:MM` format (e.g. `"21:00"`) |
+| `night_work_end` | Night shift end time in `HH:MM` format (e.g. `"05:00"` next day) |
+| `night_late_threshold_minutes` | Minutes after night shift start before a night arrival is late |
+
+Shift times are managed from **Settings → Advanced**. Analytics and gate reports both read from this shared config.
+
+Both `arrival_camera` and `exit_camera` are automatically registered as `high_priority_sources` at engine startup.
 
 ---
 
@@ -493,6 +599,20 @@ Four sub-views selectable by tab:
 
 All date pickers use `dd-mm-yyyy` display (Flatpickr with `altInput`).
 
+### `/settings` — Settings
+
+The settings page is organised into tabs:
+
+| Tab | Description |
+|-----|-------------|
+| **People** | Enrol new people, view/rename/delete enrolled persons, manage face images |
+| **Sections** | Create and manage named groups (e.g. "IT", "HR") with section managers |
+| **Managers** | Assign manager/contact email addresses to each person |
+| **Camera** | Configure IP camera groups, RTSP URLs, and channel numbers |
+| **Zones** | Define zones, assign cameras (shown by display name), set away thresholds |
+| **Reports** | Configure arrival/exit cameras, manager email, daily auto-send time; generate gate reports |
+| **Advanced** | Configure shift start/end times and late thresholds for analytics and reports |
+
 ### `/people` — People Management (Settings)
 
 - View all enrolled persons with face thumbnails and image count.
@@ -513,7 +633,30 @@ All date pickers use `dd-mm-yyyy` display (Flatpickr with `altInput`).
 
 ---
 
-## 15. Analytics & Reports
+## 15. Gate Events & Daily Reports
+
+### Gate event flow
+
+The `_handle_gate_event()` function in `app.py` is called from `_update_visit_for_person()` at two points:
+1. When a new visit is opened for a person (initial detection on any camera).
+2. When a person transitions from one camera to another.
+
+If the camera is the **exit camera**: `db.open_gate_exit()` writes a new `gate_events` row with `exit_time = now`.
+If the camera is the **arrival camera**: `db.close_gate_entry()` finds the most-recent open row for that person and fills in `entry_time` + `duration_minutes`.
+
+The gate camera URLs are cached for 60 seconds (`_gate_camera_cache`) to avoid re-reading `reports_config.json` on every visit transition.
+
+### Daily report
+
+`_daily_report_scheduler_loop()` runs as a background thread and saves the gate report at **23:00** local time every day. The report is persisted to the `daily_reports` table.
+
+### Gate report content
+
+`_generate_gate_report()` returns one row per enrolled person per day, including absent people. Columns: `name`, `arrival` (earliest visit on ANY camera), `exits` (list of exit/entry pairs from `gate_events`), `status` (on time / late / absent).
+
+---
+
+## 16. Analytics & Reports
 
 All analytics endpoints live under `/api/analytics/`. Dates use the server's **local timezone** for shift boundaries; stored timestamps are UTC and converted on query.
 
@@ -543,8 +686,8 @@ A single endpoint that returns three KPIs for a given day, loaded in one request
 
 - Returns top 10 persons by first arrival time on a given date.
 - `&order=latest` reverses to latest arrivals.
-- `&shift=morning` — window: 04:00–16:00 local time.
-- `&shift=night` — window: 16:00–04:00 local time (next day). Automatically excludes anyone who already appeared in the morning window, so each person is listed in at most one shift.
+- `&shift=morning` — window: `work_start - 1h` → `work_end` (local time). Both boundaries are configurable from **Settings → Advanced**.
+- `&shift=night` — window: `night_work_start - 1h` (today) → `night_work_end` (next day, local time). Automatically excludes anyone who already appeared in the morning window, so each person is listed in at most one shift.
 - The UI shows one table per shift. Both earliest and latest datasets are fetched in parallel on page load and cached in memory; the Earliest/Latest toggle switches between them instantly without a new request.
 
 ### Top 10 Longest Working (`/api/analytics/longest`)

@@ -16,6 +16,8 @@ os.environ.setdefault(
 # everything else is muted.
 os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "8")
 os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
+os.environ.setdefault("INFERENCE_POOL_SIZE", "3")
+os.environ.setdefault("MAX_CONCURRENT_RTSP", "20")
 import shutil
 import atexit
 import time
@@ -67,6 +69,7 @@ logging.getLogger("werkzeug").addFilter(
 )
 logging.getLogger("waitress").addFilter(
     lambda r: "Client disconnected" not in r.getMessage()
+        and "Task queue depth" not in r.getMessage()
 )
 log = logging.getLogger(__name__)
 
@@ -320,8 +323,8 @@ _ENGINE_KWARGS = dict(
     detector="retinaface",
     model="buffalo_l",
     threshold=0.55,
-    detect_every=5,
-    detect_scale=1,
+    detect_every=10,
+    detect_scale=0.5,
     tracker_type="CSRT",
     width=1280,
     height=720,
@@ -333,6 +336,7 @@ _ENGINE_KWARGS = dict(
     # become illegible. Footage recordings and per-visit screenshots
     # are always annotated regardless of this flag.
     live_annotations=_env_bool("LIVE_ANNOTATIONS_ENABLED", True),
+    min_face_size=int(os.getenv("MIN_FACE_SIZE", "10")),
 )
 
 # Module-level placeholder so route handlers (which only resolve `engine`
@@ -424,6 +428,17 @@ def _engine_watchdog():
                 try: _engine_proc.join(timeout=2)
                 except Exception: pass
 
+                # Clear stale grid config so the new process starts fresh
+                # instead of loading a potentially corrupted saved list.
+                try:
+                    _grid_cfg_path = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)), "grid_config.json",
+                    )
+                    if os.path.isfile(_grid_cfg_path):
+                        os.remove(_grid_cfg_path)
+                except Exception:
+                    pass
+
                 new_proc, new_conn = _spawn_engine_proc()
                 _engine_proc = new_proc
                 _engine_parent_conn = new_conn
@@ -456,9 +471,6 @@ def _engine_watchdog():
         except Exception:
             log.exception("engine watchdog error")
 
-# Engine stays stopped until user clicks Start in the UI
-# engine.start()
-# To allow starting/stopping of camera
 state_lock = threading.Lock()
 
 # Attendance state (in-memory, per server run)
@@ -507,6 +519,65 @@ def _bootstrap_post_engine():
         log.info("DB session started: %s", _current_session_id)
     threading.Thread(target=_attendance_loop, daemon=True).start()
     threading.Thread(target=_qr_loop, daemon=True).start()
+    threading.Thread(target=_daily_report_scheduler_loop, daemon=True, name="daily-report-scheduler").start()
+    try:
+        _rc = _load_reports_config()
+        _hp = [s for s in [_rc.get("arrival_camera", ""), _rc.get("exit_camera", "")] if s]
+        if _hp:
+            engine.set_config({"high_priority_sources": _hp})
+            log.info("High-priority gate cameras registered: %s", _hp)
+    except Exception as _e:
+        log.warning("Could not set high_priority_sources: %s", _e)
+
+    # Auto-start: cycle through all IP cameras every 3 minutes
+    try:
+        _all_camera_urls = sorted(set(
+            url for _, _, url in _expanded_cameras(_load_ip_cameras())
+        ))
+        if not _all_camera_urls:
+            pool = _build_analysis_pool_source()
+            if pool:
+                engine.cam_index = pool
+                _refresh_source_name_map()
+                engine.start()
+                log.info("engine auto-started with pool: %s", pool)
+        elif len(_all_camera_urls) == 1:
+            _refresh_source_name_map()
+            with state_lock:
+                engine.cam_index = _all_camera_urls[0]
+                engine.start()
+            log.info("engine auto-started with single camera: %s", _all_camera_urls[0])
+        else:
+            _refresh_source_name_map()
+            pool = "grid:" + ",".join(_all_camera_urls)
+            with state_lock:
+                engine.cam_index = pool
+                engine.set_grid_layout(2, 2)
+                engine.set_viewer(mode="grid", source="", grid_offset=0)
+                engine.start()
+            log.info("engine auto-started: grid of %d cameras (2x2 viewer, auto-page every 30s)",
+                     len(_all_camera_urls))
+
+            # Lightweight auto-pager — advances the viewport every 30s
+            # without stopping or restarting the engine.
+            def _auto_pager():
+                PAGE_INTERVAL = 30
+                while True:
+                    time.sleep(PAGE_INTERVAL)
+                    try:
+                        page_size = engine.grid_page_size()
+                        n_pages = engine.grid_page_count()
+                        if n_pages <= 1:
+                            continue
+                        cur_offset = int(getattr(engine, 'viewer_grid_offset', 0))
+                        next_page = ((cur_offset // page_size) + 1) % n_pages
+                        engine.set_viewer(grid_offset=next_page * page_size)
+                    except Exception as _e:
+                        log.warning("auto-pager error: %s", _e)
+
+            threading.Thread(target=_auto_pager, daemon=True, name="auto-pager").start()
+    except Exception as _e:
+        log.warning("auto-start failed: %s", _e)
 
 # In-memory visit tracking state: person_name -> {location_id, visit_id, camera_source}
 _active_visits = {}
@@ -524,23 +595,32 @@ _last_activity_write: dict = {}  # visit_id -> last update_visit_activity monoto
 
 
 def _db_writer_loop():
+    BATCH_SIZE = 10
     while True:
+        ops = []
         try:
-            op = _db_writer_q.get()
-        except Exception:
+            ops.append(_db_writer_q.get(timeout=0.1))
+        except Empty:
             continue
-        if op is None:
+        if ops[0] is None:
             return
-        try:
-            kind = op[0]
-            if kind == "seen":
-                _, vid, conf = op
-                db.update_visit_seen(vid, confidence=conf)
-            elif kind == "activity":
-                _, vid, label = op
-                db.update_visit_activity(vid, label)
-        except Exception as e:
-            log.debug("DB writer op failed: %s", e)
+        # Batch up to BATCH_SIZE ops without blocking for more than one.
+        while len(ops) < BATCH_SIZE:
+            try:
+                ops.append(_db_writer_q.get_nowait())
+            except Empty:
+                break
+        for op in ops:
+            try:
+                kind = op[0]
+                if kind == "seen":
+                    _, vid, conf = op
+                    db.update_visit_seen(vid, confidence=conf)
+                elif kind == "activity":
+                    _, vid, label = op
+                    db.update_visit_activity(vid, label)
+            except Exception as e:
+                log.debug("DB writer op failed: %s", e)
 
 
 threading.Thread(target=_db_writer_loop, daemon=True, name="db-writer").start()
@@ -847,6 +927,34 @@ def _stop_visit_footage(visit_id):
         log.debug("Failed to stop footage for visit %s: %s", visit_id, e)
 
 
+def _get_gate_cameras():
+    """Return (arrival_camera, exit_camera) from config. Cached for 60s."""
+    now = time.monotonic()
+    if now - _gate_camera_cache["t"] > 60:
+        cfg = _load_reports_config()
+        _gate_camera_cache["arrival"] = cfg.get("arrival_camera", "")
+        _gate_camera_cache["exit"] = cfg.get("exit_camera", "")
+        _gate_camera_cache["t"] = now
+    return _gate_camera_cache["arrival"], _gate_camera_cache["exit"]
+
+_gate_camera_cache = {"arrival": "", "exit": "", "t": 0.0}
+
+
+def _handle_gate_event(person_name, camera_source):
+    """Called on every new visit / camera transition. Writes to gate_events."""
+    if not db.is_available():
+        return
+    try:
+        arrival_cam, exit_cam = _get_gate_cameras()
+        now_dt = datetime.now(timezone.utc)
+        if exit_cam and camera_source == exit_cam:
+            db.open_gate_exit(person_name, now_dt)
+        elif arrival_cam and camera_source == arrival_cam:
+            db.close_gate_entry(person_name, now_dt)
+    except Exception as e:
+        log.debug("gate_event error for %s on %s: %s", person_name, camera_source, e)
+
+
 def _update_visit_for_person(name, camera_source, confidence=None, last_detect_t=0.0, last_head_t=0.0):
     """Open, update, or transition a visit for a person at a camera/location.
 
@@ -893,6 +1001,7 @@ def _update_visit_for_person(name, camera_source, confidence=None, last_detect_t
             "last_seen_mono": now_mono,
         }
         _start_visit_footage(vid, name, camera_source)
+        _handle_gate_event(name, camera_source)
     elif active["location_id"] == loc_id:
         # Same location — update last_seen in DB (throttled, off-thread)
         _enqueue_visit_seen(active["visit_id"], confidence=confidence)
@@ -926,6 +1035,7 @@ def _update_visit_for_person(name, camera_source, confidence=None, last_detect_t
                 "last_seen_mono": now_mono,
             }
             _start_visit_footage(vid, name, camera_source)
+            _handle_gate_event(name, camera_source)
 
 def _mark_all_absent():
     now_mono = time.monotonic()
@@ -1065,6 +1175,58 @@ def _qr_loop():
 
 # Threads now started from _bootstrap_post_engine() so they don't run
 # in the engine subprocess (which re-imports this module under spawn).
+
+def _daily_report_scheduler_loop():
+    """Background thread: save a report snapshot once per day at daily_send_time and email it."""
+    import time as _time
+    _last_saved_date = None
+    while True:
+        _time.sleep(30)
+        try:
+            if not db.is_available():
+                continue
+            cfg = _load_reports_config()
+            arrival_cam = cfg.get("arrival_camera", "")
+            exit_cam = cfg.get("exit_camera", "")
+            if not arrival_cam and not exit_cam:
+                continue
+
+            now_local = datetime.now()
+            today = now_local.strftime("%Y-%m-%d")
+            send_hour = int(cfg.get("daily_send_time", "19:00").split(":")[0])
+            due = now_local.hour >= send_hour
+
+            if due and _last_saved_date != today:
+                _last_saved_date = today
+                try:
+                    date_from = datetime.strptime(today, "%Y-%m-%d").astimezone(timezone.utc)
+                    date_to = date_from + timedelta(days=1)
+                    late_threshold = int(cfg.get("late_threshold_minutes", 15))
+                    work_start = cfg.get("work_start", "08:00")
+                    night_shift_enabled = bool(cfg.get("night_shift_enabled", False))
+                    night_work_start = cfg.get("night_work_start", "21:00")
+                    night_late_threshold = int(cfg.get("night_late_threshold_minutes", 15))
+                    records = _generate_gate_report(arrival_cam, exit_cam, date_from, date_to, late_threshold, work_start,
+                                                    night_shift_enabled, night_work_start, night_late_threshold)
+                    db.save_daily_report(
+                        today, arrival_cam, exit_cam, work_start,
+                        late_threshold, records, sent_email=False,
+                    )
+                    log.info("Daily report saved for %s (%d records)", today, len(records))
+                    # Send the email
+                    ok, msg = _send_report_email(records, cfg, today, send_cc=True)
+                    if ok:
+                        log.info("Daily report emailed for %s", today)
+                        db.save_daily_report(
+                            today, arrival_cam, exit_cam, work_start,
+                            late_threshold, records, sent_email=True,
+                        )
+                    else:
+                        log.warning("Daily report email failed for %s: %s", today, msg)
+                except Exception as e:
+                    log.warning("Daily report save failed: %s", e)
+        except Exception as e:
+            log.warning("Daily report scheduler error: %s", e)
 
 def safe_person_name(name: str) -> str:
     """
@@ -1331,11 +1493,107 @@ def people_page():
 def video():
     if not engine.is_running():
         return ("Camera stopped", 503)
-
+    try:
+        engine.ping_viewer()
+    except Exception:
+        pass
     return Response(
         mjpeg_generator(),
         mimetype="multipart/x-mixed-replace; boundary=frame",
     )
+
+@app.route("/video/<path:source>")
+def video_camera(source):
+    """Per-camera MJPEG stream. Loaded on-demand when the user navigates to a camera."""
+    if not engine.is_running():
+        return ("Camera stopped", 503)
+    try:
+        engine.ping_viewer()
+    except Exception:
+        pass
+
+    def _gen():
+        import numpy as _np
+        import cv2 as _cv2
+
+        def _make_no_signal_jpeg(label=""):
+            h, w = 360, 640
+            img = _np.zeros((h, w, 3), dtype=_np.uint8)
+            _cv2.putText(img, "No Signal", (w // 2 - 120, h // 2 - 10),
+                         _cv2.FONT_HERSHEY_SIMPLEX, 1.4, (80, 80, 80), 2)
+            if label:
+                short = label[-40:]
+                _cv2.putText(img, short, (20, h // 2 + 40),
+                             _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 60, 60), 1)
+            ok, buf = _cv2.imencode(".jpg", img, [_cv2.IMWRITE_JPEG_QUALITY, 60])
+            return bytes(buf) if ok else b""
+
+        NO_SIGNAL_TIMEOUT = 2.0  # seconds before yielding a placeholder frame
+        interval = 1.0 / max(1, getattr(engine, "out_fps", 15))
+        last_id = None
+        last_frame_t = time.monotonic()
+        no_signal_jpeg = None
+
+        while engine.is_running():
+            try:
+                engine.ping_viewer()
+            except Exception:
+                pass
+            frame = engine.get_camera_jpeg(source)
+            if frame is None:
+                # If no frame has arrived for NO_SIGNAL_TIMEOUT seconds, send a
+                # placeholder so the browser replaces the stale previous-camera image.
+                if time.monotonic() - last_frame_t > NO_SIGNAL_TIMEOUT:
+                    if no_signal_jpeg is None:
+                        no_signal_jpeg = _make_no_signal_jpeg(source)
+                    if no_signal_jpeg:
+                        try:
+                            yield (
+                                b"--frame\r\n"
+                                b"Content-Type: image/jpeg\r\n\r\n"
+                                + no_signal_jpeg
+                                + b"\r\n"
+                            )
+                        except (GeneratorExit, BrokenPipeError, ConnectionResetError):
+                            break
+                    time.sleep(1.0)  # re-send placeholder at ~1 fps
+                else:
+                    time.sleep(0.05)
+                continue
+            last_frame_t = time.monotonic()
+            no_signal_jpeg = None  # reset when real frames arrive again
+            fid = id(frame)
+            if fid == last_id:
+                time.sleep(0.005)
+                continue
+            last_id = fid
+            try:
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n"
+                    + frame
+                    + b"\r\n"
+                )
+            except (GeneratorExit, BrokenPipeError, ConnectionResetError):
+                break
+            time.sleep(interval)
+
+    return Response(
+        stream_with_context(_gen()),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+
+@app.route("/api/engine/config", methods=["GET", "POST"])
+def engine_config():
+    if not engine.is_running():
+        return jsonify({"error": "Engine not running"}), 503
+    if request.method == "POST":
+        try:
+            engine.set_config(request.json or {})
+            return jsonify({"ok": True})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+    return jsonify(engine.get_config())
 
 @app.route("/api/test/upload", methods=["POST"])
 def api_test_upload():
@@ -1434,9 +1692,11 @@ def api_people():
     meta_map = {p["name"]: p for p in db.get_all_people_meta()}
     for p in people:
         m = meta_map.get(p["name"], {})
-        p["section"] = m.get("section", "")
-        p["branch"]  = m.get("branch", "Riyadh")
-        p["email"]   = m.get("email", "")
+        p["section"]      = m.get("section", "")
+        p["branch"]       = m.get("branch", "Riyadh")
+        p["email"]        = m.get("email", "")
+        p["arabic_name"]  = m.get("arabic_name", "")
+        p["home_zone_id"] = m.get("home_zone_id")
     return jsonify({"people": people})
 
 
@@ -1465,6 +1725,18 @@ def api_sections_create():
 def api_sections_delete(name):
     db.delete_section(name)
     return jsonify({"ok": True})
+
+
+@app.route("/api/sections/<name>/rename", methods=["POST"])
+def api_sections_rename(name):
+    data = request.get_json(silent=True) or {}
+    new_name = (data.get("new_name") or "").strip()
+    if not new_name:
+        return jsonify({"ok": False, "error": "new_name is required"}), 400
+    if new_name == name:
+        return jsonify({"ok": True})
+    db.rename_section(name, new_name)
+    return jsonify({"ok": True, "new_name": new_name})
 
 
 @app.route("/api/sections/<name>/assign", methods=["POST"])
@@ -1501,6 +1773,137 @@ def api_sections_set_manager(name):
     return jsonify({"ok": True})
 
 
+# ---------------------------------------------------------------------------
+# Zones API
+# ---------------------------------------------------------------------------
+
+@app.route("/api/zones", methods=["GET"])
+def api_zones_list():
+    _require_api_key()
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "DB unavailable"}), 503
+    branch = request.args.get("branch") or None
+    return jsonify({"ok": True, "zones": db.get_zones(branch=branch)})
+
+
+@app.route("/api/zones", methods=["POST"])
+def api_zones_create():
+    _require_api_key()
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "DB unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "name is required"}), 400
+    description = (data.get("description") or "").strip()
+    branch = (data.get("branch") or "Riyadh").strip()
+    try:
+        zone_id = db.create_zone(name, description, branch)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    return jsonify({"ok": True, "id": zone_id})
+
+
+@app.route("/api/zones/<int:zone_id>", methods=["PUT"])
+def api_zones_update(zone_id):
+    _require_api_key()
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "DB unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    db.update_zone(zone_id, name=data.get("name"), description=data.get("description"), branch=data.get("branch"))
+    return jsonify({"ok": True})
+
+
+@app.route("/api/zones/<int:zone_id>", methods=["DELETE"])
+def api_zones_delete(zone_id):
+    _require_api_key()
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "DB unavailable"}), 503
+    db.delete_zone(zone_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/zones/<int:zone_id>/cameras", methods=["GET"])
+def api_zones_get_cameras(zone_id):
+    _require_api_key()
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "DB unavailable"}), 503
+    return jsonify({"ok": True, "cameras": db.get_zone_cameras(zone_id)})
+
+
+@app.route("/api/zones/<int:zone_id>/cameras", methods=["POST"])
+def api_zones_set_cameras(zone_id):
+    _require_api_key()
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "DB unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    location_ids = data.get("location_ids", [])
+    db.set_zone_cameras(zone_id, location_ids)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/zones/<int:zone_id>/members", methods=["GET"])
+def api_zones_get_members(zone_id):
+    _require_api_key()
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "DB unavailable"}), 503
+    return jsonify({"ok": True, "members": db.get_zone_members(zone_id)})
+
+
+@app.route("/api/zones/<int:zone_id>/assign", methods=["POST"])
+def api_zones_assign(zone_id):
+    _require_api_key()
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "DB unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    person_name = (data.get("person_name") or "").strip()
+    if not person_name:
+        return jsonify({"ok": False, "error": "person_name is required"}), 400
+    db.set_person_home_zone(person_name, zone_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/zones/<int:zone_id>/unassign", methods=["POST"])
+def api_zones_unassign(zone_id):
+    _require_api_key()
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "DB unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    person_name = (data.get("person_name") or "").strip()
+    if not person_name:
+        return jsonify({"ok": False, "error": "person_name is required"}), 400
+    db.set_person_home_zone(person_name, None)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/zones/status", methods=["GET"])
+def api_zones_status():
+    _require_api_key()
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "DB unavailable"}), 503
+    cfg = _load_reports_config()
+    threshold = int(cfg.get("zone_away_threshold_minutes", 30))
+    rows = db.get_zone_status_snapshot(away_threshold_minutes=threshold)
+    branch = request.args.get("branch") or None
+    if branch:
+        rows = [r for r in rows if r.get("branch") == branch]
+    return jsonify({"ok": True, "status": rows})
+
+
+@app.route("/api/zones/report", methods=["GET"])
+def api_zones_report():
+    _require_api_key()
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "DB unavailable"}), 503
+    date_from = request.args.get("date_from", "")
+    date_to = request.args.get("date_to", "")
+    branch = request.args.get("branch") or None
+    if not date_from or not date_to:
+        return jsonify({"ok": False, "error": "date_from and date_to are required"}), 400
+    rows = db.get_zone_compliance_report(date_from, date_to, branch=branch)
+    return jsonify({"ok": True, "date_from": date_from, "date_to": date_to, "rows": rows})
+
+
 @app.route("/api/person/<name>/meta", methods=["GET"])
 def api_person_meta_get(name):
     person = safe_person_name(name)
@@ -1514,13 +1917,15 @@ def api_person_meta_set(name):
     if not person:
         return jsonify({"ok": False, "error": "Invalid person name"}), 400
     data = request.get_json(silent=True) or {}
-    section = data.get("section")
-    branch  = data.get("branch")
-    email   = data.get("email")
-    if section is None and branch is None and email is None:
-        return jsonify({"ok": False, "error": "Provide section, branch, and/or email"}), 400
-    db.upsert_person_meta(person, section=section, branch=branch, email=email)
-    return jsonify({"ok": True, "name": person, "section": section, "branch": branch, "email": email})
+    section      = data.get("section")
+    branch       = data.get("branch")
+    email        = data.get("email")
+    arabic_name  = data.get("arabic_name")
+    shift        = data.get("shift")
+    if section is None and branch is None and email is None and arabic_name is None and shift is None:
+        return jsonify({"ok": False, "error": "Provide section, branch, email, arabic_name, and/or shift"}), 400
+    db.upsert_person_meta(person, section=section, branch=branch, email=email, arabic_name=arabic_name, shift=shift)
+    return jsonify({"ok": True, "name": person, "section": section, "branch": branch, "email": email, "arabic_name": arabic_name, "shift": shift})
 
 def _reload_faces_async():
     """Fire engine.reload_faces() on a background thread.
@@ -1537,6 +1942,71 @@ def _reload_faces_async():
 def api_reload_faces():
     engine.reload_faces()
     return jsonify({"ok": True, "identities": len(engine.known_embeddings)})
+
+@app.route("/api/bulk_upload_faces", methods=["POST"])
+def api_bulk_upload_faces():
+    """
+    Bulk upload face images.
+
+    form-data:
+      - bulk_mode: "single_person" | "name_from_file"
+      - existing_name / new_name / mode: (single_person only) same as upload_face
+      - files[]: one or more image files
+    """
+    files = request.files.getlist("files[]")
+    if not files:
+        return jsonify({"ok": False, "error": "no files provided"}), 400
+
+    bulk_mode = (request.form.get("bulk_mode") or "single_person").strip().lower()
+    results = []
+    errors = []
+
+    if bulk_mode == "single_person":
+        mode = (request.form.get("mode") or "existing").strip().lower()
+        existing_name = (request.form.get("existing_name") or "").strip()
+        new_name = (request.form.get("new_name") or "").strip()
+        person = safe_person_name(existing_name if mode == "existing" else new_name)
+        if not person:
+            return jsonify({"ok": False, "error": "person name is required"}), 400
+        if mode == "new":
+            person_dir_check = os.path.join(FACES_DIR, person)
+            if os.path.isdir(person_dir_check):
+                return jsonify({"ok": False, "error": f"Person '{person}' already exists. Use 'Existing' to add more images."}), 409
+        person_dir = os.path.join(FACES_DIR, person)
+        os.makedirs(person_dir, exist_ok=True)
+        for f in files:
+            original = secure_filename(f.filename or "")
+            ext = os.path.splitext(original)[1].lower()
+            if ext not in ALLOWED_EXTS:
+                ext = ".jpg"
+            filename = next_image_filename(person_dir, ext)
+            path = os.path.join(person_dir, filename)
+            f.save(path)
+            results.append({"person": person, "saved": f"/faces/{person}/{filename}"})
+
+    elif bulk_mode == "name_from_file":
+        for f in files:
+            original = secure_filename(f.filename or "")
+            stem, ext = os.path.splitext(original)
+            ext = ext.lower()
+            if ext not in ALLOWED_EXTS:
+                ext = ".jpg"
+            person = safe_person_name(stem)
+            if not person:
+                errors.append({"file": original, "error": "could not derive person name from filename"})
+                continue
+            person_dir = os.path.join(FACES_DIR, person)
+            os.makedirs(person_dir, exist_ok=True)
+            filename = next_image_filename(person_dir, ext)
+            path = os.path.join(person_dir, filename)
+            f.save(path)
+            results.append({"person": person, "saved": f"/faces/{person}/{filename}"})
+    else:
+        return jsonify({"ok": False, "error": "invalid bulk_mode"}), 400
+
+    if results:
+        _reload_faces_async()
+    return jsonify({"ok": True, "uploaded": len(results), "results": results, "errors": errors})
 
 @app.route("/api/upload_face", methods=["POST"])
 def api_upload_face():
@@ -2014,6 +2484,8 @@ def _build_analysis_pool_source():
     sources = _all_configured_sources()
     if not sources:
         return ""
+    if len(sources) < 3:
+        log.warning("build_analysis_pool_source: only %d camera(s) configured — expected 17", len(sources))
     return "grid:" + ",".join(sources)
 
 
@@ -2913,14 +3385,17 @@ def api_analytics_summary():
     absent_today = max(0, enrolled_known - present_today)
 
     peak_hour = None
+    peak_hour_count = 0
     if hour_row and hour_row.get("hr") is not None:
         h = int(hour_row["hr"])
         peak_hour = f"{h:02d}:00 – {(h + 1) % 24:02d}:00"
+        peak_hour_count = int(hour_row["cnt"])
 
     return jsonify({
         "ok": True,
         "date": date_str,
         "peak_hour":      peak_hour,
+        "peak_hour_count": peak_hour_count,
         "present_today":  present_today,
         "absent_today":   absent_today,
         "unknowns_today": unknowns_count,
@@ -3000,8 +3475,8 @@ def api_analytics_earliest():
       ?date=YYYY-MM-DD  (default: today)
       ?order=latest     (reverse sort for latest arrivals)
       ?shift=morning|night
-          morning = 04:00–16:00 on the given date
-          night   = 16:00 on the given date to 04:00 the following day
+          morning = work_start - 1h → work_end        (today)
+          night   = night_work_start - 1h (today) → night_work_end (tomorrow)
           (omit for full day)
     Returns rows sorted by first_seen, excluding unknown_N names.
     """
@@ -3021,12 +3496,22 @@ def api_analytics_earliest():
     branch = request.args.get("branch") or None
     ph = "?" if db._backend == "sqlite" else "%s"
 
+    _rcfg = _load_reports_config()
+    _morning_h, _morning_m = map(int, _rcfg.get("work_start", "09:00").split(":"))
+    _morning_end_h, _morning_end_m = map(int, _rcfg.get("work_end", "17:00").split(":"))
+    _night_h,   _night_m   = map(int, _rcfg.get("night_work_start", "21:00").split(":"))
+    _night_end_h, _night_end_m = map(int, _rcfg.get("night_work_end", "05:00").split(":"))
+
     if shift == "morning":
-        start = (day + timedelta(hours=4)).astimezone(timezone.utc)
-        end   = (day + timedelta(hours=16)).astimezone(timezone.utc)
+        # Include arrivals starting 1 hour before shift start
+        start = (day + timedelta(hours=_morning_h, minutes=_morning_m) - timedelta(hours=1)).astimezone(timezone.utc)
+        end   = (day + timedelta(hours=_morning_end_h, minutes=_morning_end_m)).astimezone(timezone.utc)
     elif shift == "night":
-        start = (day + timedelta(hours=16)).astimezone(timezone.utc)
-        end   = (day + timedelta(hours=28)).astimezone(timezone.utc)  # 04:00 next day
+        # Night shift starts this evening and ends tomorrow morning:
+        #   night_work_start - 1h (today)  →  night_work_end (tomorrow)
+        # e.g. today 20:00 → tomorrow 05:00.
+        start = (day + timedelta(hours=_night_h, minutes=_night_m) - timedelta(hours=1)).astimezone(timezone.utc)
+        end   = (day + timedelta(days=1, hours=_night_end_h, minutes=_night_end_m)).astimezone(timezone.utc)
     else:
         start = day.astimezone(timezone.utc)
         end   = (day + timedelta(days=1)).astimezone(timezone.utc)
@@ -3043,8 +3528,8 @@ def api_analytics_earliest():
     morning_exclusion = ""
     morning_params = []
     if shift == "night":
-        morning_start = (day + timedelta(hours=4)).astimezone(timezone.utc)
-        morning_end   = (day + timedelta(hours=16)).astimezone(timezone.utc)
+        morning_start = (day + timedelta(hours=_morning_h, minutes=_morning_m)).astimezone(timezone.utc)
+        morning_end   = (day + timedelta(hours=_morning_end_h, minutes=_morning_end_m)).astimezone(timezone.utc)
         ms = morning_start.isoformat() if db._backend == "sqlite" else morning_start
         me = morning_end.isoformat()   if db._backend == "sqlite" else morning_end
         morning_exclusion = f"""
@@ -3227,19 +3712,682 @@ def api_analytics_heatmap():
           AND person_name NOT LIKE 'unknown_%'
           {branch_clause}
         GROUP BY day, person_name
-        ORDER BY person_name ASC, day ASC
+        ORDER BY LOWER(person_name) ASC, day ASC
     """
     with db._cursor() as cur:
         cur.execute(sql, tuple(params))
         rows = db._rows_to_dicts(cur.fetchall())
 
     dates_set = sorted({r["day"] for r in rows})
-    persons_set = sorted({r["person_name"] for r in rows})
+    persons_set = sorted({r["person_name"] for r in rows}, key=str.lower)
     present = {p: {} for p in persons_set}
     for r in rows:
         present[r["person_name"]][r["day"]] = True
 
     return jsonify({"ok": True, "dates": dates_set, "persons": persons_set, "present": present})
+
+
+# ---------------------------------------------------------------------------
+# Gate Reports
+# ---------------------------------------------------------------------------
+
+_REPORTS_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports_config.json")
+
+
+def _load_reports_config():
+    if os.path.exists(_REPORTS_CONFIG_PATH):
+        try:
+            with open(_REPORTS_CONFIG_PATH) as f:
+                cfg = json.load(f)
+            # Migrate legacy single gate_camera → arrival_camera
+            if "gate_camera" in cfg and "arrival_camera" not in cfg:
+                cfg["arrival_camera"] = cfg.pop("gate_camera")
+            return cfg
+        except Exception:
+            pass
+    return {
+        "arrival_camera": "",
+        "exit_camera": "",
+        "manager_email": "",
+        "work_start": "08:00",
+        "late_threshold_minutes": 15,
+        "daily_send_time": "17:00",
+        "night_shift_enabled": False,
+        "night_work_start": "21:00",
+        "night_late_threshold_minutes": 15,
+    }
+
+
+def _save_reports_config(cfg):
+    with open(_REPORTS_CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def _generate_gate_report(arrival_camera, exit_camera, date_from, date_to,
+                          late_threshold_minutes=15, work_start="08:00",
+                          night_shift_enabled=False, night_work_start="21:00",
+                          night_late_threshold_minutes=15):
+    """Build per-person daily report from gate_events + arrival visits.
+
+    gate_events  → exits, returns, durations (written live by _handle_gate_event)
+    visits table → arrival time (first seen on arrival_camera each day)
+    Each person's shift (morning/night) is read from their profile; the matching
+    work_start and late threshold are used for that person's row.
+    """
+    from collections import defaultdict
+
+    date_from_str = date_from.astimezone().strftime("%Y-%m-%d")
+    date_to_str = (date_to - timedelta(seconds=1)).astimezone().strftime("%Y-%m-%d")
+
+    # Raw gate events for the date range
+    raw_events = db.get_gate_events_range(date_from_str, date_to_str)
+
+    # Arrival times: earliest visit on ANY camera per person per day
+    arrival_map = defaultdict(dict)  # person → {date_str → HH:MM}
+    ph = "?" if db._backend == "sqlite" else "%s"
+    if db._backend == "sqlite":
+        arr_params = [date_from.isoformat(), date_to.isoformat()]
+    else:
+        arr_params = [date_from, date_to]
+    arr_sql = f"""
+        SELECT person_name, MIN(first_seen) as first_seen
+        FROM visits
+        WHERE first_seen >= {ph} AND first_seen < {ph}
+          AND person_name NOT LIKE 'unknown_%'
+        GROUP BY person_name, date(first_seen)
+    """
+    with db._cursor() as cur:
+        cur.execute(arr_sql, arr_params)
+        for row in db._rows_to_dicts(cur.fetchall()):
+            fs = _to_dt(row["first_seen"])
+            if fs:
+                if fs.tzinfo is None:
+                    fs = fs.replace(tzinfo=timezone.utc)
+                day = fs.astimezone().strftime("%Y-%m-%d")
+                arrival_map[row["person_name"]][day] = fs.astimezone().strftime("%H:%M")
+
+    all_meta = db.get_all_people_meta()
+    meta_map = {m["name"]: m.get("arabic_name", "") for m in all_meta}
+    shift_map = {m["name"]: (m.get("shift") or "morning") for m in all_meta}
+    all_people = {m["name"] for m in all_meta}
+    work_h, work_m = map(int, work_start.split(":"))
+    night_h, night_m = map(int, night_work_start.split(":"))
+
+    # Group events by person+date
+    by_person_day = defaultdict(lambda: defaultdict(list))
+    for ev in raw_events:
+        by_person_day[ev["person_name"]][ev["event_date"]].append(ev)
+
+    # Include people who only have an arrival (no exits yet)
+    for person, days in arrival_map.items():
+        for day in days:
+            by_person_day[person][day]  # touch to create entry
+
+    # Add absent employees for every date in the report range
+    report_dates = set()
+    d = date_from.astimezone()
+    end = date_to.astimezone()
+    while d < end:
+        report_dates.add(d.strftime("%Y-%m-%d"))
+        d += timedelta(days=1)
+
+    for person in all_people:
+        for day_str in report_dates:
+            by_person_day[person][day_str]  # touch — creates empty list if not present
+
+    records = []
+    for person in sorted(by_person_day, key=lambda n: n.lower()):
+        for day_str in sorted(by_person_day[person]):
+            events = sorted(by_person_day[person][day_str], key=lambda e: e["exit_time"] or "")
+
+            arrival_str = arrival_map.get(person, {}).get(day_str, "")
+            person_shift = shift_map.get(person, "morning")
+            if night_shift_enabled and person_shift == "night":
+                p_work_h, p_work_m = night_h, night_m
+                p_late_threshold = night_late_threshold_minutes
+            else:
+                p_work_h, p_work_m = work_h, work_m
+                p_late_threshold = late_threshold_minutes
+
+            # Determine arrived_late
+            if arrival_str:
+                arr_h, arr_m = map(int, arrival_str.split(":"))
+                arrived_late = (arr_h, arr_m) > (p_work_h, p_work_m)
+                late_arrival_min = round(((arr_h * 60 + arr_m) - (p_work_h * 60 + p_work_m)), 1) if arrived_late else 0.0
+            else:
+                arrived_late = False
+                late_arrival_min = 0.0
+
+            exit_events = []
+            last_exit_str = ""
+            for ev in events:
+                exit_t = ev.get("exit_time", "")
+                entry_t = ev.get("entry_time")
+                dur = ev.get("duration_minutes")
+                still_out = entry_t is None
+
+                # Format timestamps to HH:MM
+                def _fmt_ts(ts):
+                    if not ts:
+                        return "—"
+                    try:
+                        dt = _to_dt(str(ts))
+                        if dt:
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            return dt.astimezone().strftime("%H:%M")
+                    except Exception:
+                        pass
+                    return str(ts)[:5] if ts else "—"
+
+                out_at = _fmt_ts(exit_t)
+                back_at = _fmt_ts(entry_t) if not still_out else "—"
+                if out_at != "—":
+                    last_exit_str = out_at
+
+                exit_events.append({
+                    "out_at": out_at,
+                    "back_at": back_at,
+                    "duration_minutes": round(dur, 1) if dur is not None else None,
+                    "late": (dur or 0) > p_late_threshold,
+                    "still_out": still_out,
+                })
+
+            total_outside_min = round(sum(
+                e["duration_minutes"] for e in exit_events
+                if not e["still_out"] and e["duration_minutes"] is not None
+            ), 1)
+
+            absent = not arrival_str and not exit_events
+            records.append({
+                "person": person,
+                "arabic_name": meta_map.get(person, ""),
+                "date": day_str,
+                "shift": person_shift,
+                "absent": absent,
+                "arrival": arrival_str or "—",
+                "arrived_late": arrived_late,
+                "late_arrival_minutes": late_arrival_min,
+                "last_exit": last_exit_str or "—",
+                "exits": exit_events,
+                "late_exits_count": sum(1 for e in exit_events if e["late"] and not e["still_out"]),
+                "total_outside_minutes": total_outside_min,
+            })
+
+    return records
+
+
+def _build_report_excel(records, report_date_label, camera_name, work_start, late_threshold):
+    """Build an Arabic Excel (.xlsx) report and return raw bytes."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, numbers
+    from openpyxl.utils import get_column_letter
+    from io import BytesIO
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "تقرير البوابة"
+    ws.sheet_view.rightToLeft = True
+
+    # ── Palette ──────────────────────────────────────────────
+    HDR_FILL   = PatternFill("solid", fgColor="1E3A5F")
+    META_FILL  = PatternFill("solid", fgColor="2D6A4F")
+    RED_FILL    = PatternFill("solid", fgColor="FEE2E2")
+    AMBER_FILL  = PatternFill("solid", fgColor="FEF3C7")
+    OK_FILL     = PatternFill("solid", fgColor="D1FAE5")
+    ALT_FILL    = PatternFill("solid", fgColor="F8FAFC")
+    EXIT_FILL   = PatternFill("solid", fgColor="EFF6FF")
+    ABSENT_FILL = PatternFill("solid", fgColor="F1F5F9")
+    thin = Side(style="thin", color="CBD5E1")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def hdr_cell(ws, row, col, value, fill=HDR_FILL, font_size=11):
+        c = ws.cell(row=row, column=col, value=value)
+        c.font = Font(bold=True, color="FFFFFF", size=font_size, name="Cairo")
+        c.fill = fill
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = border
+        return c
+
+    def data_cell(ws, row, col, value, fill=None, bold=False, color="111111", align="center"):
+        c = ws.cell(row=row, column=col, value=value)
+        c.font = Font(bold=bold, color=color, size=10, name="Cairo")
+        if fill:
+            c.fill = fill
+        c.alignment = Alignment(horizontal=align, vertical="center", wrap_text=True)
+        c.border = border
+        return c
+
+    # ── Title row ────────────────────────────────────────────
+    ws.merge_cells("A1:K1")
+    title = ws["A1"]
+    title.value = f"تقرير البوابة اليومي — {report_date_label}"
+    title.font = Font(bold=True, size=14, color="FFFFFF", name="Cairo")
+    title.fill = PatternFill("solid", fgColor="0F172A")
+    title.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 32
+
+    # ── Meta row ─────────────────────────────────────────────
+    ws.merge_cells("A2:K2")
+    meta = ws["A2"]
+    meta.value = f"الكاميرا: {camera_name}   |   بداية الدوام: {work_start}   |   حد التأخير: {late_threshold} دقيقة"
+    meta.font = Font(bold=False, size=10, color="FFFFFF", name="Cairo")
+    meta.fill = META_FILL
+    meta.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[2].height = 22
+
+    # ── Column headers ────────────────────────────────────────
+    # Col: 1=#  2=الاسم  3=التاريخ  4=وقت الحضور  5=آخر مغادرة
+    #      6=عدد المغادرات  7=خروج  8=دخول  9=مدة الغياب  10=تأخر؟
+    #      11=إجمالي وقت الغياب  (status moved to last: but merged with total)
+    #      Actually: 11=إجمالي وقت الغياب  12=الحالة  → 12 cols still
+    headers = [
+        "#", "الاسم", "التاريخ",
+        "وقت الحضور", "آخر مغادرة", "عدد المغادرات",
+        "خروج", "دخول", "مدة الغياب (د)", "تأخر؟",
+        "إجمالي وقت الغياب (د)", "الحالة",
+    ]
+    for col, h in enumerate(headers, 1):
+        hdr_cell(ws, 3, col, h)
+    ws.row_dimensions[3].height = 28
+
+    # ── Data rows ─────────────────────────────────────────────
+    row_num = 4
+    for idx, r in enumerate(records, 1):
+        has_issue = r["arrived_late"] or r["late_exits_count"] > 0
+        row_fill = RED_FILL if has_issue else (ALT_FILL if idx % 2 == 0 else None)
+
+        if r["absent"]:
+            arrival_status = "غائب"
+            status_fill = ABSENT_FILL
+            status_color = "6B7280"
+        elif r["arrived_late"]:
+            arrival_status = "متأخر"
+            status_fill = RED_FILL
+            status_color = "991B1B"
+        else:
+            arrival_status = "في الوقت"
+            status_fill = OK_FILL
+            status_color = "166534"
+
+        exits = r.get("exits", [])
+        n_exits = len(exits)
+        last_exit = (exits[-1]["back_at"] or exits[-1]["out_at"]) if exits else "—"
+
+        if n_exits == 0:
+            data_cell(ws, row_num, 1,  idx,                           row_fill)
+            data_cell(ws, row_num, 2,  r["person"].replace("_", " "), row_fill)
+            data_cell(ws, row_num, 3,  r["date"],                     row_fill)
+            data_cell(ws, row_num, 4,  r["arrival"],                  row_fill)
+            data_cell(ws, row_num, 5,  "—",                           row_fill)
+            data_cell(ws, row_num, 6,  0,                             row_fill)
+            data_cell(ws, row_num, 7,  "—",                           row_fill)
+            data_cell(ws, row_num, 8,  "—",                           row_fill)
+            data_cell(ws, row_num, 9,  "—",                           row_fill)
+            data_cell(ws, row_num, 10, "—",                           row_fill)
+            data_cell(ws, row_num, 11, 0,                             row_fill)
+            data_cell(ws, row_num, 12, arrival_status, status_fill, color=status_color, bold=True)
+            row_num += 1
+        else:
+            for ei, ex in enumerate(exits):
+                ex_fill = EXIT_FILL if ei % 2 == 0 else ALT_FILL
+                late_fill = RED_FILL if ex["late"] else OK_FILL
+                late_color = "991B1B" if ex["late"] else "166534"
+                if ei == 0:
+                    data_cell(ws, row_num, 1, idx,                           row_fill)
+                    data_cell(ws, row_num, 2, r["person"].replace("_", " "), row_fill)
+                    data_cell(ws, row_num, 3, r["date"],                      row_fill)
+                    data_cell(ws, row_num, 4, r["arrival"],                   row_fill)
+                    data_cell(ws, row_num, 5, last_exit,                      row_fill)
+                    data_cell(ws, row_num, 6, n_exits,                        row_fill)
+                else:
+                    for col in range(1, 7):
+                        data_cell(ws, row_num, col, "", ex_fill)
+                data_cell(ws, row_num, 7,  ex["out_at"],           ex_fill)
+                data_cell(ws, row_num, 8,  ex["back_at"],          ex_fill)
+                data_cell(ws, row_num, 9,  ex["duration_minutes"], ex_fill)
+                data_cell(ws, row_num, 10, "نعم" if ex["late"] else "لا", late_fill, color=late_color, bold=ex["late"])
+                data_cell(ws, row_num, 11, r["total_outside_minutes"] if ei == 0 else "", ex_fill)
+                data_cell(ws, row_num, 12, arrival_status if ei == 0 else "", status_fill if ei == 0 else ex_fill, color=status_color if ei == 0 else "111111", bold=ei == 0)
+                row_num += 1
+
+    # ── Summary footer ────────────────────────────────────────
+    row_num += 1
+    ws.merge_cells(f"A{row_num}:F{row_num}")
+    total_late = sum(1 for r in records if r["arrived_late"] or r["late_exits_count"] > 0)
+    summary = ws[f"A{row_num}"]
+    summary.value = f"الإجمالي: {len(records)} موظف   |   مخالفات: {total_late}   |   إجمالي وقت الغياب: {round(sum(r['total_outside_minutes'] for r in records), 1)} دقيقة"
+    summary.font = Font(bold=True, size=10, color="FFFFFF", name="Cairo")
+    summary.fill = PatternFill("solid", fgColor="0F172A")
+    summary.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[row_num].height = 22
+
+    # ── Column widths ─────────────────────────────────────────
+    col_widths = [5, 22, 12, 10, 10, 10, 9, 9, 14, 8, 20, 14]
+    for i, w in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+@app.route("/api/reports/config", methods=["GET"])
+def api_reports_config_get():
+    return jsonify({"ok": True, "config": _load_reports_config()})
+
+
+@app.route("/api/reports/config", methods=["POST"])
+def api_reports_config_post():
+    data = request.get_json(silent=True) or {}
+    cfg = _load_reports_config()
+    for key in ("arrival_camera", "exit_camera", "manager_email", "cc_emails", "work_start", "late_threshold_minutes", "daily_send_time", "night_shift_enabled", "night_work_start", "night_late_threshold_minutes"):
+        if key in data:
+            cfg[key] = data[key]
+    # Drop legacy key if still present
+    cfg.pop("gate_camera", None)
+    _save_reports_config(cfg)
+    return jsonify({"ok": True, "config": cfg})
+
+
+@app.route("/api/advanced/config", methods=["GET"])
+def api_advanced_config_get():
+    return jsonify({"ok": True, "config": _load_reports_config()})
+
+
+@app.route("/api/advanced/config", methods=["POST"])
+def api_advanced_config_post():
+    data = request.get_json(silent=True) or {}
+    cfg = _load_reports_config()
+    for key in ("work_start", "work_end", "late_threshold_minutes",
+                "night_shift_enabled", "night_work_start",
+                "night_work_end", "night_late_threshold_minutes"):
+        if key in data:
+            cfg[key] = data[key]
+    _save_reports_config(cfg)
+    return jsonify({"ok": True, "config": cfg})
+
+
+@app.route("/api/reports/gate", methods=["GET"])
+def api_reports_gate():
+    """Generate gate attendance report using arrival + exit cameras."""
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+
+    cfg = _load_reports_config()
+    arrival_cam = request.args.get("arrival_camera") or cfg.get("arrival_camera", "")
+    exit_cam = request.args.get("exit_camera") or cfg.get("exit_camera", "")
+    if not arrival_cam and not exit_cam:
+        return jsonify({"ok": False, "error": "No arrival or exit camera configured"}), 400
+
+    late_threshold = int(cfg.get("late_threshold_minutes", 15))
+    work_start = cfg.get("work_start", "08:00")
+    night_shift_enabled = bool(cfg.get("night_shift_enabled", False))
+    night_work_start = cfg.get("night_work_start", "21:00")
+    night_late_threshold = int(cfg.get("night_late_threshold_minutes", 15))
+
+    days_param = request.args.get("days")
+    if days_param:
+        try:
+            n = int(days_param)
+        except ValueError:
+            return jsonify({"ok": False, "error": "invalid days param"}), 400
+        date_to = datetime.now(timezone.utc)
+        date_from = date_to - timedelta(days=n)
+    else:
+        date_str = request.args.get("date", datetime.now().strftime("%Y-%m-%d"))
+        try:
+            local_midnight = datetime.strptime(date_str, "%Y-%m-%d").astimezone()
+        except ValueError:
+            return jsonify({"ok": False, "error": "invalid date format"}), 400
+        date_from = local_midnight.astimezone(timezone.utc)
+        date_to = date_from + timedelta(days=1)
+
+    records = _generate_gate_report(arrival_cam, exit_cam, date_from, date_to, late_threshold, work_start,
+                                    night_shift_enabled, night_work_start, night_late_threshold)
+    loc = db.get_location_by_source(arrival_cam or exit_cam)
+    camera_name = loc["name"] if loc else (arrival_cam or exit_cam)
+
+    return jsonify({
+        "ok": True,
+        "arrival_camera": arrival_cam,
+        "exit_camera": exit_cam,
+        "camera_name": camera_name,
+        "work_start": work_start,
+        "late_threshold_minutes": late_threshold,
+        "records": records,
+        "summary": {
+            "total": len(records),
+            "absent": sum(1 for r in records if r.get("absent")),
+            "late_arrival": sum(1 for r in records if r["arrived_late"]),
+            "late_exits": sum(1 for r in records if r["late_exits_count"] > 0),
+        },
+    })
+
+
+@app.route("/api/reports/export", methods=["GET"])
+def api_reports_export():
+    """Export gate report as Arabic Excel (.xlsx)."""
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+
+    cfg = _load_reports_config()
+    arrival_cam = cfg.get("arrival_camera", "")
+    exit_cam = cfg.get("exit_camera", "")
+    if not arrival_cam and not exit_cam:
+        return jsonify({"ok": False, "error": "No cameras configured"}), 400
+
+    late_threshold = int(cfg.get("late_threshold_minutes", 15))
+    work_start = cfg.get("work_start", "08:00")
+    night_shift_enabled = bool(cfg.get("night_shift_enabled", False))
+    night_work_start = cfg.get("night_work_start", "21:00")
+    night_late_threshold = int(cfg.get("night_late_threshold_minutes", 15))
+
+    days_param = request.args.get("days", "1")
+    try:
+        n = int(days_param)
+    except ValueError:
+        return jsonify({"ok": False, "error": "invalid days param"}), 400
+
+    date_to = datetime.now(timezone.utc)
+    date_from = date_to - timedelta(days=n)
+
+    records = _generate_gate_report(arrival_cam, exit_cam, date_from, date_to, late_threshold, work_start,
+                                    night_shift_enabled, night_work_start, night_late_threshold)
+    loc = db.get_location_by_source(arrival_cam or exit_cam)
+    camera_name = loc["name"] if loc else (arrival_cam or exit_cam)
+    date_label = f"آخر {n} يوم" if n > 1 else datetime.now().strftime("%Y-%m-%d")
+
+    xlsx_bytes = _build_report_excel(records, date_label, camera_name, work_start, late_threshold)
+    response = app.make_response(xlsx_bytes)
+    response.headers["Content-Type"] = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    filename = f"gate_report_{n}d_{datetime.now().strftime('%Y%m%d')}.xlsx"
+    response.headers["Content-Disposition"] = f"attachment; filename={filename}"
+    return response
+
+
+def _send_report_email(records, cfg, report_date, send_cc=True):
+    """Send the gate report email via SMTP.
+
+    Args:
+        records: list of report record dicts
+        cfg: reports_config dict
+        report_date: YYYY-MM-DD string
+        send_cc: if True, include CC recipients; if False, send to manager only
+
+    Returns: (ok, msg_or_error)
+    """
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.mime.base import MIMEBase
+    from email import encoders
+
+    manager_email = cfg.get("manager_email", "")
+    cc_emails_raw = cfg.get("cc_emails", "")
+    cc_list = [e.strip() for e in cc_emails_raw.replace(";", ",").split(",") if e.strip()] if cc_emails_raw else []
+
+    smtp_host = os.getenv("SMTP_HOST", "")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user = os.getenv("SMTP_USER", "")
+    smtp_pass = os.getenv("SMTP_PASSWORD", "")
+    smtp_from = os.getenv("SMTP_FROM", smtp_user)
+
+    if not smtp_host:
+        return False, "SMTP_HOST environment variable not set"
+    if not manager_email:
+        return False, "No manager email configured"
+
+    work_start = cfg.get("work_start", "08:00")
+    late_threshold = int(cfg.get("late_threshold_minutes", 15))
+
+    arrival_cam = cfg.get("arrival_camera", "")
+    exit_cam = cfg.get("exit_camera", "")
+    loc = db.get_location_by_source(arrival_cam or exit_cam)
+    camera_name = loc["name"] if loc else (arrival_cam or exit_cam)
+
+    xlsx_bytes = _build_report_excel(records, report_date, camera_name, work_start, late_threshold)
+
+    late_count = sum(1 for r in records if r["arrived_late"] or r["late_exits_count"] > 0)
+    html_body = f"""<html dir="rtl"><body style="font-family:Arial,sans-serif;color:#111;padding:24px;direction:rtl">
+    <h2 style="margin:0 0 8px">تقرير البوابة اليومي — {report_date}</h2>
+    <p style="color:#6b7280;margin:0 0 16px">الكاميرا: {camera_name} &nbsp;|&nbsp; بداية الدوام: {work_start} &nbsp;|&nbsp; حد التأخير: {late_threshold} دقيقة</p>
+    <p style="font-size:15px">الإجمالي: <strong>{len(records)}</strong> موظف &nbsp;|&nbsp; مخالفات: <strong style="color:#dc2626">{late_count}</strong></p>
+    <p style="color:#6b7280;font-size:13px">يرجى الاطلاع على الملف المرفق للتفاصيل الكاملة.</p>
+    </body></html>"""
+
+    recipients = [manager_email]
+    if send_cc:
+        recipients += cc_list
+
+    msg = MIMEMultipart("mixed")
+    msg["Subject"] = f"تقرير البوابة اليومي — {report_date}"
+    msg["From"] = smtp_from
+    msg["To"] = manager_email
+    if send_cc and cc_list:
+        msg["Cc"] = ", ".join(cc_list)
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    part = MIMEBase("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    part.set_payload(xlsx_bytes)
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", f'attachment; filename="gate_report_{report_date}.xlsx"')
+    msg.attach(part)
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
+            server.ehlo()
+            if smtp_port != 25:
+                server.starttls()
+            if smtp_user and smtp_pass:
+                server.login(smtp_user, smtp_pass)
+            server.sendmail(smtp_from, recipients, msg.as_string())
+        return True, f"sent to {manager_email}" + (f" (CC: {', '.join(cc_list)})" if send_cc and cc_list else "")
+    except Exception as e:
+        log.error("Failed to send gate report email: %s", e)
+        return False, str(e)
+
+
+@app.route("/api/reports/send", methods=["POST"])
+def api_reports_send():
+    """Send daily gate report email. ?to=manager sends to manager only; ?to=all (default) sends to manager + CC."""
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+
+    cfg = _load_reports_config()
+    arrival_cam = cfg.get("arrival_camera", "")
+    exit_cam = cfg.get("exit_camera", "")
+    if not arrival_cam and not exit_cam:
+        return jsonify({"ok": False, "error": "No cameras configured"}), 400
+
+    send_cc = request.args.get("to", "all") != "manager"
+
+    late_threshold = int(cfg.get("late_threshold_minutes", 15))
+    work_start = cfg.get("work_start", "08:00")
+    night_shift_enabled = bool(cfg.get("night_shift_enabled", False))
+    night_work_start = cfg.get("night_work_start", "21:00")
+    night_late_threshold = int(cfg.get("night_late_threshold_minutes", 15))
+
+    date_to = datetime.now(timezone.utc)
+    date_from = date_to - timedelta(days=1)
+
+    records = _generate_gate_report(arrival_cam, exit_cam, date_from, date_to, late_threshold, work_start,
+                                    night_shift_enabled, night_work_start, night_late_threshold)
+    report_date = datetime.now().strftime("%Y-%m-%d")
+
+    ok, result = _send_report_email(records, cfg, report_date, send_cc=send_cc)
+    if ok:
+        return jsonify({"ok": True, "sent_to": result, "records": len(records)})
+    return jsonify({"ok": False, "error": result}), 500
+
+
+@app.route("/api/reports/history", methods=["GET"])
+def api_reports_history():
+    """List saved daily report summaries."""
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+    limit = min(int(request.args.get("limit", 60)), 365)
+    rows = db.list_daily_reports(limit)
+    return jsonify({"ok": True, "reports": rows})
+
+
+@app.route("/api/reports/history/<date>", methods=["GET"])
+def api_reports_history_date(date):
+    """Return full saved report for a specific date."""
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+    row = db.get_daily_report(date)
+    if not row:
+        return jsonify({"ok": False, "error": "No saved report for this date"}), 404
+    return jsonify({"ok": True, "report": row})
+
+
+@app.route("/api/reports/history/<date>/save", methods=["POST"])
+def api_reports_history_save(date):
+    """Manually trigger save of report for a given date."""
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+    cfg = _load_reports_config()
+    arrival_cam = cfg.get("arrival_camera", "")
+    exit_cam = cfg.get("exit_camera", "")
+    if not arrival_cam and not exit_cam:
+        return jsonify({"ok": False, "error": "No cameras configured"}), 400
+    try:
+        date_from = datetime.strptime(date, "%Y-%m-%d").astimezone(timezone.utc)
+    except ValueError:
+        return jsonify({"ok": False, "error": "invalid date"}), 400
+    date_to = date_from + timedelta(days=1)
+    late_threshold = int(cfg.get("late_threshold_minutes", 15))
+    work_start = cfg.get("work_start", "08:00")
+    night_shift_enabled = bool(cfg.get("night_shift_enabled", False))
+    night_work_start = cfg.get("night_work_start", "21:00")
+    night_late_threshold = int(cfg.get("night_late_threshold_minutes", 15))
+    records = _generate_gate_report(arrival_cam, exit_cam, date_from, date_to, late_threshold, work_start,
+                                    night_shift_enabled, night_work_start, night_late_threshold)
+    db.save_daily_report(date, arrival_cam, exit_cam, work_start, late_threshold, records)
+    return jsonify({"ok": True, "date": date, "total": len(records)})
+
+
+@app.route("/api/reports/history/<date>/export", methods=["GET"])
+def api_reports_history_export(date):
+    """Download Excel for a saved historical report."""
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+    row = db.get_daily_report(date)
+    if not row:
+        return jsonify({"ok": False, "error": "No saved report for this date"}), 404
+    records = row.get("records", [])
+    cfg = _load_reports_config()
+    arrival_cam = row.get("arrival_camera") or cfg.get("arrival_camera", "")
+    loc = db.get_location_by_source(arrival_cam)
+    camera_name = loc["name"] if loc else arrival_cam
+    xlsx_bytes = _build_report_excel(records, date, camera_name,
+                                     row.get("work_start", "08:00"),
+                                     row.get("late_threshold", 15))
+    response = app.make_response(xlsx_bytes)
+    response.headers["Content-Type"] = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    response.headers["Content-Disposition"] = f'attachment; filename="report_{date}.xlsx"'
+    return response
 
 
 if __name__ == "__main__":
@@ -3259,7 +4407,10 @@ if __name__ == "__main__":
     try:
         from waitress import serve  # type: ignore
         log.info("Serving with waitress on %s:%s", host, port)
-        serve(app, host=host, port=port, threads=32, channel_timeout=300)
+        # Each MJPEG stream and SSE connection holds a thread for its lifetime.
+        # With N cameras + M browser tabs open, 32 threads fills fast.
+        # 100 gives headroom: 10 streams + 10 SSE + 80 regular requests concurrent.
+        serve(app, host=host, port=port, threads=100, channel_timeout=300)
     except ImportError:
         log.warning("waitress not installed — falling back to Werkzeug dev server. "
                     "pip install waitress for production-grade concurrency.")

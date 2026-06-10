@@ -61,8 +61,12 @@ def run(conn, state, engine_kwargs, log_level=logging.INFO):
     # ---- Background thread: mirror engine state into the shared dict ----
     stop_evt = threading.Event()
 
+    _mirror_tick = 0
+
     def _mirror_loop():
+        nonlocal _mirror_tick
         while not stop_evt.is_set():
+            _mirror_tick += 1
             try:
                 state["running"] = bool(engine.is_running())
                 state["cam_index"] = engine.cam_index
@@ -78,10 +82,26 @@ def run(conn, state, engine_kwargs, log_level=logging.INFO):
                 state["loading_opened"] = int(getattr(engine, "_loading_opened", 0))
                 state["loading_total"] = int(getattr(engine, "_loading_total", 0))
 
-                # Hot-path data
+                # Hot-path data (every tick)
                 state["tracks"] = list(engine.get_tracks() or [])
-                state["jpeg"] = engine.get_jpeg()
-                state["qr_state"] = tuple(engine.get_qr_state() or (None, 0.0))
+
+                # Heavy JPEG copies at 5 Hz instead of every tick (20 Hz)
+                if _mirror_tick % 4 == 0:
+                    state["jpeg"] = engine.get_jpeg()
+                    state["qr_state"] = tuple(engine.get_qr_state() or (None, 0.0))
+
+                    # Per-camera JPEGs for the on-demand /video/<source> endpoint.
+                    try:
+                        cam_jpegs = {}
+                        with engine._grid_workers_lock:
+                            worker_keys = list(engine._grid_workers.keys())
+                        for src_key in worker_keys:
+                            jpg = engine.get_camera_jpeg(src_key)
+                            if jpg is not None:
+                                cam_jpegs[src_key] = jpg
+                        state["camera_jpegs"] = cam_jpegs
+                    except Exception:
+                        pass
 
                 # Activity tables (engine internals; tolerate absence)
                 act_by_name = {}

@@ -23,7 +23,9 @@ Uses InsightFace (RetinaFace + ArcFace, ONNX Runtime GPU) for face detection and
 - **Action detection** — CLIP ViT-B/32 zero-shot classification (e.g., "Using phone", "Typing", "Idle"). Only runs when face detector confirms the person (not on head-only or tracker-only boxes). Optional, toggled via `ACTION_DETECTION_ENABLED` env var.
 - **Auto-capture unknowns** — Automatically saves face crops of unrecognised people as `unknown_1`, `unknown_2`, etc. Re-identifies them on reappearance. Best for small crowds. Optional, toggled via `AUTO_CAPTURE_ENABLED` env var.
 - **AI kill switch** — Set `FACE_DETECTION_ENABLED=false` to disable all inference (detection, recognition, tracking, attendance) and run as a pure camera stream viewer. Useful for diagnosing lag or running on non-GPU hardware.
-- **People management** — Dedicated `/people` page to view all enrolled persons, rename anyone (especially auto-captured unknowns), delete persons, view face images, transfer images between persons, and delete individual images.
+- **People management** — Dedicated `/people` page to view all enrolled persons, rename anyone (especially auto-captured unknowns), delete persons, view/transfer/bulk-delete face images. Person metadata includes section, branch, arabic name, shift, and home zone.
+- **Sections** — Named groups (e.g. "IT", "HR") with optional manager assignment. Managed from Settings → Sections.
+- **Zones** — Named camera zones with per-zone camera assignments. People can be given a home zone; the zone status API shows who is present vs. away in real time.
 - **History dashboard** — Visit history across four views: Attendance (first/last seen per person per day), Daily Summary, Per Person, and Per Location — all with footage playback. All date pickers display as dd-mm-yyyy.
 - **Analytics dashboard** — Top 10 Earliest Arrivals (by day), Top 10 Latest Arrivals (by day), and Top 10 Longest Working shown as an interactive horizontal bar chart (hover for duration tooltip), all filterable by period.
 - **SSE attendance stream** — Real-time attendance events via Server-Sent Events
@@ -166,11 +168,16 @@ docker-compose.yml      # Optional PostgreSQL via Docker (not required for SQLit
 
 ## API Endpoints
 
+See [api.md](api.md) for the full endpoint reference. Summary:
+
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/video` | GET | MJPEG video stream (503 when stopped) |
 | `/api/status` | GET | Engine status, identity count, action detection flag |
+| `/api/tracks` | GET | Live track snapshot: `[{name, bbox, activity}]` |
 | `/api/camera` | GET/POST | Get or set camera source |
+| `/api/camera/statuses` | GET | Live/dead status map for all grid cameras |
+| `/api/camera/reconnect` | POST | Immediately retry a disconnected camera |
 | `/api/attendance/stream` | GET | SSE attendance event stream |
 | `/api/grid/config` | GET/POST | Get or set grid layout and camera assignments |
 | `/api/history/daily` | GET | Daily visit summary |
@@ -183,9 +190,44 @@ docker-compose.yml      # Optional PostgreSQL via Docker (not required for SQLit
 | `/api/person/<name>/images` | GET | List all face images for a person |
 | `/api/person/<name>/image/<file>` | DELETE | Delete a single face image |
 | `/api/person/<name>/image/<file>/transfer` | POST | Move an image to another person |
+| `/api/person/<name>/images/bulk_delete` | POST | Bulk delete images |
+| `/api/person/<name>/images/bulk_transfer` | POST | Bulk transfer images to another person |
+| `/api/person/<name>/meta` | GET/POST | Get or update person metadata (section, branch, arabic_name, shift, home_zone_id) |
+| `/api/people/merge` | POST | Merge multiple person folders |
 | `/api/upload_face` | POST | Upload a face image for a person |
+| `/api/bulk_upload_faces` | POST | Bulk upload face images |
+| `/api/reload_faces` | POST | Force synchronous embedding rebuild |
+| `/api/sections` | GET/POST | List or create sections |
+| `/api/sections/<name>` | DELETE | Delete a section |
+| `/api/sections/<name>/rename` | POST | Rename a section |
+| `/api/sections/<name>/assign` | POST | Assign a person to a section |
+| `/api/sections/<name>/unassign` | POST | Remove a person from a section |
+| `/api/sections/<name>/manager` | POST | Set the section manager |
+| `/api/zones` | GET/POST | List or create zones |
+| `/api/zones/<id>` | PUT/DELETE | Update or delete a zone |
+| `/api/zones/<id>/cameras` | GET/POST | Get or set cameras for a zone |
+| `/api/zones/<id>/members` | GET | List people assigned to a zone |
+| `/api/zones/<id>/assign` | POST | Assign a person's home zone |
+| `/api/zones/<id>/unassign` | POST | Clear a person's home zone |
+| `/api/zones/status` | GET | Live zone presence snapshot |
+| `/api/zones/report` | GET | Zone compliance report (date range) |
+| `/api/ip_cameras` | GET | List IP camera groups and cameras |
+| `/api/ip_cameras/groups/<id>/reorder` | POST | Reorder cameras within a group |
+| `/api/analytics/summary` | GET | Dashboard summary tiles |
+| `/api/analytics/present_absent` | GET | Present/absent name lists |
+| `/api/analytics/earliest` | GET | Top 10 earliest/latest arrivals |
+| `/api/analytics/longest` | GET | Top 10 longest working |
+| `/api/analytics/headcount` | GET | Daily headcount chart data |
+| `/api/analytics/heatmap` | GET | Presence heatmap data |
+| `/api/reports/gate` | GET | Generate gate report |
+| `/api/reports/history` | GET | List saved daily reports |
+| `/api/reports/history/<date>` | GET | Retrieve a saved report |
+| `/api/reports/history/<date>/export` | GET | Download report as CSV |
+| `/api/engine/config` | GET/POST | Get or update engine tuning parameters |
+| `/api/advanced/config` | GET/POST | Get or update shift time configuration |
 | `/history` | GET | History dashboard page |
 | `/people` | GET | People management page |
+| `/settings` | GET | Settings page |
 
 ## Tuning
 

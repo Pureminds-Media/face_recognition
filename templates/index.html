@@ -14,6 +14,11 @@
       .flatpickr-months .flatpickr-month, .flatpickr-weekdays, span.flatpickr-weekday { background: #1e293b; color: #94a3b8; }
       .flatpickr-current-month .flatpickr-monthDropdown-months, .numInput { color: #e2e8f0; background: #1e293b; }
       .flatpickr-prev-month svg, .flatpickr-next-month svg { fill: #94a3b8; }
+      /* Toast animations */
+      @keyframes toast-in { from { transform: translateX(120%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+      @keyframes toast-out { from { transform: translateX(0); opacity: 1; } to { transform: translateX(120%); opacity: 0; } }
+      .toast-animate { animation: toast-in 0.3s ease-out; }
+      .toast-hide { animation: toast-out 0.25s ease-in forwards; }
     </style>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -204,9 +209,18 @@
             </div>
             <div class="p-3 relative overflow-hidden">
               <div id="cameraMsg" class="mb-2 text-xs text-slate-400"></div>
-              <div id="videoStage" class="relative select-none touch-pan-y overflow-hidden">
-                <img id="videoFeed" class="w-full block" src="" alt="video" style="transform-origin: 0 0; cursor: default; will-change: transform;" />
+              <div id="videoStage" class="relative flex select-none touch-pan-y overflow-hidden h-[55vh]">
+                <img id="videoFeed" class="h-full w-auto block" src="" alt="video" style="transform-origin: 0 0; cursor: default; will-change: transform;" />
                 <div id="gridOverlay" class="hidden absolute inset-0 pointer-events-auto"></div>
+
+                <!-- Loading overlay: shown while switching cameras -->
+                <div id="camLoadingOverlay" class="hidden absolute inset-0 z-30 flex flex-col items-center justify-center bg-black/60 pointer-events-none">
+                  <svg class="animate-spin w-8 h-8 text-emerald-400 mb-2" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3"/>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/>
+                  </svg>
+                  <span class="text-xs text-slate-300" id="camLoadingLabel">Connecting…</span>
+                </div>
 
                 <!-- Offline overlay: shown when the current camera has no frames -->
                 <div id="camOfflineOverlay" class="hidden absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/70 pointer-events-auto">
@@ -321,6 +335,7 @@
               <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200" data-tab="daily" data-i18n="tab_daily">Daily Summary</button>
               <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200" data-tab="person" data-i18n="tab_person">Per Person</button>
               <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200" data-tab="location" data-i18n="tab_location">Per Location</button>
+              <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200" data-tab="zones" data-i18n="tab_zones">Zones</button>
             </div>
 
             <!-- Attendance Tab -->
@@ -332,8 +347,8 @@
                 <input id="attendanceDate" type="date" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm" />
                 <div id="attendanceMsg" class="text-xs text-slate-400"></div>
               </div>
-              <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-hidden">
-                <table class="w-full text-sm">
+              <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-x-auto overflow-y-hidden">
+                <table class="w-full text-sm whitespace-nowrap min-w-[500px]">
                   <thead>
                     <tr class="border-b border-slate-800 text-slate-400 text-xs">
                       <th class="px-4 py-3 text-left" data-i18n="col_footage">Footage</th>
@@ -360,25 +375,22 @@
               </div>
               <!-- dailyTotals hidden -->
               <!-- <div id="dailyTotals" class="mb-4"></div> -->
-              <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-hidden">
-                <table class="w-full text-sm">
+<div class="rounded-xl border border-slate-800 bg-slate-900 overflow-x-auto overflow-y-hidden">
+                <table class="w-full text-sm whitespace-nowrap min-w-[600px]">
                   <thead>
                     <tr class="border-b border-slate-800 text-slate-400 text-xs">
                       <th class="px-4 py-3 text-left" data-i18n="col_footage">Footage</th>
                       <th class="px-4 py-3 text-left" data-i18n="col_person">Person</th>
-                      <th class="px-4 py-3 text-left" data-i18n="col_location">Location</th>
                       <th class="px-4 py-3 text-left" data-i18n="col_arrived">Arrived</th>
                       <th class="px-4 py-3 text-left" data-i18n="col_left">Left</th>
-                      <th class="px-4 py-3 text-left" data-i18n="col_duration">Duration</th>
-                      <th class="px-4 py-3 text-left activity-col" data-i18n="col_action">Action</th>
                       <th class="px-4 py-3 text-left" data-i18n="col_status">Status</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_section">Section</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_footage">Footage</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_activity">Activity</th>
                     </tr>
                   </thead>
-                  <tbody id="dailyTableBody">
-                    <tr><td class="px-4 py-6 text-center text-slate-500 empty-msg" data-i18n="empty_date">Select a date and click Load</td></tr>
-                  </tbody>
+                  <tbody id="dailyTableBody"></tbody>
                 </table>
-                <div id="dailyPager" class="px-4 py-3 border-t border-slate-800 hidden"></div>
               </div>
             </div>
 
@@ -393,8 +405,8 @@
                 <input id="personTo" type="date" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm" />
               </div>
               <div id="personSummary" class="mb-4"></div>
-              <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-hidden">
-                <table class="w-full text-sm">
+              <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-x-auto overflow-y-hidden">
+                <table class="w-full text-sm whitespace-nowrap min-w-[700px]">
                   <thead>
                     <tr class="border-b border-slate-800 text-slate-400 text-xs">
                       <th class="px-4 py-3 text-left" data-i18n="col_footage">Footage</th>
@@ -425,13 +437,12 @@
                 <label class="text-sm text-slate-400" data-i18n="label_to">To:</label>
                 <input id="locationTo" type="date" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm" />
               </div>
-              <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-hidden">
-                <table class="w-full text-sm">
+              <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-x-auto overflow-y-hidden">
+                <table class="w-full text-sm whitespace-nowrap min-w-[600px]">
                   <thead>
                     <tr class="border-b border-slate-800 text-slate-400 text-xs">
                       <th class="px-4 py-3 text-left" data-i18n="col_footage">Footage</th>
                       <th class="px-4 py-3 text-left" data-i18n="col_person">Person</th>
-                      <th class="px-4 py-3 text-left" data-i18n="col_date">Date</th>
                       <th class="px-4 py-3 text-left" data-i18n="col_arrived">Arrived</th>
                       <th class="px-4 py-3 text-left" data-i18n="col_left">Left</th>
                       <th class="px-4 py-3 text-left" data-i18n="col_duration">Duration</th>
@@ -439,11 +450,28 @@
                       <th class="px-4 py-3 text-left" data-i18n="col_status">Status</th>
                     </tr>
                   </thead>
-                  <tbody id="locationTableBody">
-                    <tr><td class="px-4 py-6 text-center text-slate-500 empty-msg" data-i18n="empty_location">Select a location and click Load</td></tr>
-                  </tbody>
+                  <tbody id="locationTableBody"></tbody>
                 </table>
                 <div id="locationPager" class="px-4 py-3 border-t border-slate-800 hidden"></div>
+              </div>
+            </div>
+
+            <!-- Zones Tab -->
+            <div id="tab-zones" class="tab-content hidden">
+              <div class="flex items-center gap-3 mb-4 flex-wrap">
+                <select id="zonesTabBranchFilter" onchange="loadZoneStatusTab()"
+                  class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm">
+                  <option value="">All Branches</option>
+                  <option value="Riyadh" data-i18n="branch_riyadh">Riyadh</option>
+                  <option value="Egypt" data-i18n="branch_egypt">Egypt</option>
+                </select>
+                <button onclick="loadZoneStatusTab()"
+                  class="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300">↻ Refresh</button>
+                <span class="text-xs text-slate-500" data-i18n="zone_last_updated">Last updated</span>
+                <span id="zonesLastUpdated" class="text-xs text-slate-400"></span>
+              </div>
+              <div id="zonesStatusContainer">
+                <div class="text-center text-slate-500 py-8 text-sm" data-i18n="zone_no_data">No employees have a home zone assigned.</div>
               </div>
             </div>
 
@@ -452,9 +480,12 @@
 
               <!-- Summary tiles -->
               <div class="grid grid-cols-4 gap-4 mb-6">
-                <div class="rounded-xl border border-slate-800 bg-slate-900 px-5 py-4 text-center">
+                <div id="peakHourCard" class="rounded-xl border border-slate-800 bg-slate-900 px-5 py-4 text-center cursor-default select-none">
                   <p class="text-xs text-slate-500 uppercase tracking-wide mb-1" data-i18n="tile_peak_hour">Peak Hour Today</p>
-                  <p id="tilePeakHour" class="text-2xl font-semibold text-white">—</p>
+                  <p class="text-2xl font-semibold text-white relative overflow-hidden h-9 flex items-center justify-center">
+                    <span id="tilePeakHourTime" class="transition-all duration-300">—</span>
+                    <span id="tilePeakHourCount" class="absolute transition-all duration-300 opacity-0 pointer-events-none">—</span>
+                  </p>
                 </div>
                 <div onclick="openPresenceModal('present')" class="rounded-xl border border-slate-800 bg-slate-900 px-5 py-4 text-center cursor-pointer hover:border-emerald-700 transition-colors">
                   <p class="text-xs text-slate-500 uppercase tracking-wide mb-1" data-i18n="tile_present">Present Today</p>
@@ -478,44 +509,48 @@
                 </div>
 
                 <div class="grid grid-cols-2 gap-4 items-stretch">
-                  <!-- Morning shift (04:00–16:00) -->
+                  <!-- Morning shift -->
                   <div class="flex flex-col">
                     <div class="flex items-center justify-between mb-2">
-                      <p class="text-xs text-slate-500 font-medium uppercase tracking-wide"><span data-i18n="morning_shift">Morning shift</span> &nbsp;04:00 – 16:00</p>
+                      <p class="text-xs text-slate-500 font-medium uppercase tracking-wide"><span data-i18n="morning_shift">Morning shift</span></p>
                       <div class="flex rounded-lg overflow-hidden border border-slate-700 text-xs">
                         <button id="morningToggleEarliest" onclick="setArrivalOrder('morning','earliest')" class="px-3 py-1 bg-emerald-700 text-white" data-i18n="btn_earliest">Earliest</button>
                         <button id="morningToggleLatest"   onclick="setArrivalOrder('morning','latest')"   class="px-3 py-1 text-slate-400 hover:text-white" data-i18n="btn_latest">Latest</button>
                       </div>
                     </div>
-                    <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-hidden flex-1">
-                      <table class="w-full text-sm">
+                    <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-x-auto overflow-y-hidden flex-1">
+                      <table class="w-full text-sm whitespace-nowrap min-w-[500px]">
                         <thead><tr class="border-b border-slate-800 text-slate-400 text-xs">
                           <th class="px-4 py-3 text-left w-8" data-i18n="col_num">#</th>
-                          <th class="px-4 py-3 text-left" data-i18n="col_employee">Employee</th>
+                          <th class="px-4 py-3 text-left" data-i18n="col_name">Name</th>
                           <th class="px-4 py-3 text-left" data-i18n="col_arrived">Arrived</th>
+                          <th class="px-4 py-3 text-left" data-i18n="col_left">Left</th>
+                          <th class="px-4 py-3 text-left" data-i18n="col_duration">Duration</th>
                         </tr></thead>
-                        <tbody id="morningArrivalBody"><tr><td colspan="3" class="px-4 py-6 text-center text-slate-500">Loading...</td></tr></tbody>
+                        <tbody id="peopleVisitTableBody"></tbody>
                       </table>
                     </div>
                   </div>
 
-                  <!-- Night shift (16:00–04:00) -->
+                  <!-- Night shift -->
                   <div class="flex flex-col">
                     <div class="flex items-center justify-between mb-2">
-                      <p class="text-xs text-slate-500 font-medium uppercase tracking-wide"><span data-i18n="night_shift">Night shift</span> &nbsp;16:00 – 04:00</p>
+                      <p class="text-xs text-slate-500 font-medium uppercase tracking-wide"><span data-i18n="night_shift">Night shift</span></p>
                       <div class="flex rounded-lg overflow-hidden border border-slate-700 text-xs">
                         <button id="nightToggleEarliest" onclick="setArrivalOrder('night','earliest')" class="px-3 py-1 bg-emerald-700 text-white" data-i18n="btn_earliest">Earliest</button>
                         <button id="nightToggleLatest"   onclick="setArrivalOrder('night','latest')"   class="px-3 py-1 text-slate-400 hover:text-white" data-i18n="btn_latest">Latest</button>
                       </div>
                     </div>
-                    <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-hidden flex-1">
-                      <table class="w-full text-sm">
+                    <div class="rounded-xl border border-slate-800 bg-slate-900 overflow-x-auto overflow-y-hidden flex-1">
+                      <table class="w-full text-sm whitespace-nowrap min-w-[500px]">
                         <thead><tr class="border-b border-slate-800 text-slate-400 text-xs">
                           <th class="px-4 py-3 text-left w-8" data-i18n="col_num">#</th>
                           <th class="px-4 py-3 text-left" data-i18n="col_employee">Employee</th>
                           <th class="px-4 py-3 text-left" data-i18n="col_arrived">Arrived</th>
+                          <th class="px-4 py-3 text-left" data-i18n="col_duration">Duration</th>
+                          <th class="px-4 py-3 text-left" data-i18n="col_status_location">Status / Location</th>
                         </tr></thead>
-                        <tbody id="nightArrivalBody"><tr><td colspan="3" class="px-4 py-6 text-center text-slate-500">Loading...</td></tr></tbody>
+                        <tbody id="currentVisitTableBody"></tbody>
                       </table>
                     </div>
                   </div>
@@ -669,10 +704,31 @@
       // Set after a switch so loadCameraOptions doesn't overwrite the label
       // with a stale viewer_source before the mirror loop catches up.
       let _confirmedViewerSrc = null;
+      let _currentViewerSource = null;
+      let _camLoadingTimer = null;
+
+      function _showCamLoading(label) {
+        const el = document.getElementById("camLoadingOverlay");
+        const lbl = document.getElementById("camLoadingLabel");
+        if (el) { el.classList.remove("hidden"); if (lbl) lbl.textContent = label || "Connecting…"; }
+        if (_camLoadingTimer) clearTimeout(_camLoadingTimer);
+        _camLoadingTimer = setTimeout(_hideCamLoading, 5000);
+      }
+
+      function _hideCamLoading() {
+        const el = document.getElementById("camLoadingOverlay");
+        if (el) el.classList.add("hidden");
+        if (_camLoadingTimer) { clearTimeout(_camLoadingTimer); _camLoadingTimer = null; }
+      }
 
       // --- stream control ---
       function startStream() {
         if (!videoFeed) return;
+        // Always use /video — get_jpeg() returns the correct frame for
+        // the current viewer mode (single → full-res annotated single
+        // camera; grid → composite).  Per-camera /video/<source> serves
+        // grid tiles (low res, stretched) and should only be used for
+        // external embedding, not the main feed.
         videoFeed.src = "/video?ts=" + Date.now(); // bust cache
       }
 
@@ -700,7 +756,7 @@
         }
       }
 
-      async function loadCameraOptions() {
+      async function loadCameraOptions(skipAutoSwitch) {
         const r = await fetch("/api/camera");
         const j = await r.json();
         const devices = j.devices || [];
@@ -720,7 +776,7 @@
         // in its grid analysis pool regardless of viewer mode.
         const viewerMode = j.viewer_mode || currentCamMode;
         currentCamMode = "single";
-        if (viewerMode === "grid" && singleCamDevices.length > 0) {
+        if (!skipAutoSwitch && viewerMode === "grid" && singleCamDevices.length > 0) {
           // Fire-and-forget — switchCamera() updates the carousel state
           // and starts the stream when it returns.
           switchCamera(String(singleCamDevices[0].value)).catch(() => {});
@@ -735,6 +791,7 @@
         if (viewerSrc) {
           const idx = singleCamDevices.findIndex(d => String(d.value || "") === viewerSrc);
           if (idx >= 0) singleCamIndex = idx;
+          _currentViewerSource = viewerSrc;
         }
         // Sync grid pagination
         if (typeof j.viewer_grid_offset === "number") gridOffset = j.viewer_grid_offset;
@@ -836,6 +893,7 @@
       async function switchCamera(source) {
         closeAllDropdowns();
         if (cameraMsg) cameraMsg.textContent = "Switching...";
+        _showCamLoading("Connecting…");
         try {
           const r = await fetch("/api/camera", {
             method: "POST",
@@ -844,6 +902,7 @@
           });
           const j = await r.json();
           if (!r.ok || !j.ok) {
+            _hideCamLoading();
             if (cameraMsg) cameraMsg.textContent = `Switch failed: ${j.error || "unknown error"}`;
             return false;
           }
@@ -856,7 +915,10 @@
           if (typeof j.grid_page_count === "number") gridPageCount = j.grid_page_count;
           // Pin the confirmed source so loadCameraOptions won't overwrite the
           // label with a stale mirror-loop value before the engine catches up.
-          if (j.viewer_source) _confirmedViewerSrc = j.viewer_source;
+          if (j.viewer_source) {
+            _confirmedViewerSrc = j.viewer_source;
+            _currentViewerSource = j.viewer_source;
+          }
           if (cameraMsg) cameraMsg.textContent = j.viewer_mode === "single"
             ? `Viewing ${camLabelFor(j.viewer_source)}`
             : `Viewing grid`;
@@ -864,10 +926,13 @@
           updateCarouselUI();
           // Refresh the dropdown's active indicator from the switch response
           // devices list — avoids a second round-trip and the stale-label race.
-          loadCameraOptions().catch(() => {});
+          // Pass skipAutoSwitch=true to prevent re-entering switchCamera if
+          // the mirror loop still reports grid mode.
+          loadCameraOptions(true).catch(() => {});
           if (j.running && videoFeed) startStream();
           return true;
         } catch (e) {
+          _hideCamLoading();
           if (cameraMsg) cameraMsg.textContent = `Switch failed: ${String(e)}`;
           return false;
         }
@@ -910,11 +975,12 @@
         attendanceES.onerror = () => {
           attendanceES.close();
           attendanceES = null;
-          // Engine crashed — wait for watchdog to bring it back then reload
+          // Engine may be restarting — reconnect after a delay
           if (!_streamReconnectTimer) {
             _streamReconnectTimer = setTimeout(() => {
-              window.location.reload();
-            }, 4000);
+              _streamReconnectTimer = null;
+              connectAttendanceStream();
+            }, 2000);
           }
         };
 
@@ -936,20 +1002,41 @@
       function toast(message, kind = "info") {
         if (!toastContainer) return;
 
+        // Enforce max 5 visible toasts
+        while (toastContainer.children.length >= 5) {
+          const first = toastContainer.children[0];
+          first.classList.add("toast-hide");
+          setTimeout(() => first.remove(), 250);
+        }
+
         const el = document.createElement("div");
         el.className =
-          "rounded-lg border border-slate-700 bg-slate-900/95 px-3 py-2 text-sm shadow-lg";
+          "toast-animate rounded-lg border border-slate-700 bg-slate-900/95 pl-3 pr-8 py-2 text-sm shadow-lg relative flex items-center gap-2";
 
         if (kind === "success") el.classList.add("border-emerald-700");
-        if (kind === "warn") el.classList.add("border-amber-700");
+        if (kind === "warn")    el.classList.add("border-amber-700");
+        if (kind === "error")   el.classList.add("border-red-700");
 
-        el.textContent = message;
+        const textSpan = document.createElement("span");
+        textSpan.textContent = message;
+        textSpan.className = "flex-1";
+        el.appendChild(textSpan);
+
+        // Close button
+        const closeBtn = document.createElement("button");
+        closeBtn.innerHTML = "&times;";
+        closeBtn.className = "absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 hover:text-white text-lg leading-none";
+        closeBtn.onclick = () => { el.classList.add("toast-hide"); setTimeout(() => el.remove(), 250); };
+        el.appendChild(closeBtn);
+
         toastContainer.appendChild(el);
 
         setTimeout(() => {
-          el.classList.add("opacity-0");
-          setTimeout(() => el.remove(), 250);
-        }, 2500);
+          if (el.parentNode) {
+            el.classList.add("toast-hide");
+            setTimeout(() => el.remove(), 250);
+          }
+        }, 3500);
       }
 
       function fmtTime(ts) {
@@ -1131,8 +1218,18 @@
         try { return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }); }
         catch { return "--"; }
       }
+      // Arabic name map: { english_key: "الاسم" } — populated once on load.
+      let _arabicNames = {};
+      fetch("/api/people").then(r => r.json()).then(j => {
+        _arabicNames = {};
+        for (const p of (j.people || [])) {
+          if (p.arabic_name) _arabicNames[p.name] = p.arabic_name;
+        }
+      }).catch(() => {});
+
       function fmtName(n) {
         if (!n) return "";
+        if (window._lang === "ar" && _arabicNames[n]) return _arabicNames[n];
         return n.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
       }
 
@@ -1502,7 +1599,7 @@
       async function loadHeadcount() {
         const from = headcountFrom.value, to = headcountTo.value;
         if (!from || !to) return;
-        headcountMsg.textContent = t("loading");
+        headcountMsg.innerHTML = '<svg class="animate-spin w-5 h-5 text-emerald-400 mx-auto mb-1" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/></svg><span class="text-xs text-slate-400">'+t("loading")+'</span>';
         headcountMsg.classList.remove("hidden");
         try {
           const r = await fetch(`/api/analytics/headcount?from=${from}&to=${to}&branch=${encodeURIComponent(window._branch)}`);
@@ -1564,7 +1661,7 @@
       async function loadHeatmap() {
         const from = heatmapFrom.value, to = heatmapTo.value;
         if (!from || !to) return;
-        heatmapMsg.textContent = t("loading");
+        heatmapMsg.innerHTML = '<svg class="animate-spin w-5 h-5 text-emerald-400 mx-auto mb-1" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/></svg><span class="text-xs text-slate-400">'+t("loading")+'</span>';
         heatmapMsg.classList.remove("hidden");
         heatmapGrid.classList.add("hidden");
         heatmapGrid.innerHTML = "";
@@ -1680,10 +1777,36 @@
         const r = await fetch(`/api/analytics/summary?date=${date}&branch=${encodeURIComponent(window._branch)}`);
         const j = await r.json();
         if (!j.ok) return;
-        document.getElementById("tilePeakHour").textContent    = j.peak_hour ?? "—";
-        document.getElementById("tilePresentToday").textContent = j.present_today;
-        document.getElementById("tileAbsentToday").textContent  = j.absent_today;
-        document.getElementById("tileUnknowns").textContent     = j.unknowns_today;
+        document.getElementById("tilePeakHourTime").textContent  = j.peak_hour ?? "—";
+        const count = j.peak_hour_count;
+        const label = count === 1 ? t("label_person_singular") : t("people_label");
+        document.getElementById("tilePeakHourCount").textContent = count != null ? `${count} ${label}` : "—";
+        document.getElementById("tilePresentToday").textContent   = j.present_today;
+        document.getElementById("tileAbsentToday").textContent    = j.absent_today;
+        document.getElementById("tileUnknowns").textContent       = j.unknowns_today;
+
+        // Hover slide effect for peak hour card
+        const peakCard = document.getElementById("peakHourCard");
+        const timeEl = document.getElementById("tilePeakHourTime");
+        const countEl = document.getElementById("tilePeakHourCount");
+        if (peakCard && timeEl && countEl) {
+          function slideIn() {
+            const rtl = document.documentElement.dir === "rtl";
+            timeEl.style.transform = rtl ? "translateX(100%)" : "translateX(-100%)";
+            timeEl.style.opacity = "0";
+            countEl.style.transform = "translateX(0)";
+            countEl.style.opacity = "1";
+          }
+          function slideOut() {
+            timeEl.style.transform = "translateX(0)";
+            timeEl.style.opacity = "1";
+            const rtl = document.documentElement.dir === "rtl";
+            countEl.style.transform = rtl ? "translateX(-100%)" : "translateX(100%)";
+            countEl.style.opacity = "0";
+          }
+          peakCard.addEventListener("mouseenter", slideIn);
+          peakCard.addEventListener("mouseleave", slideOut);
+        }
       }
 
       let _longestPeriod = "day";
@@ -1838,6 +1961,120 @@
             loadEarliest();
             loadLatest();
             loadLongest(_longestPeriod);
+          });
+        }
+        if (btn.dataset.tab === "zones") {
+          btn.addEventListener("click", () => loadZoneStatusTab());
+        }
+      });
+
+      /* ===================== ZONES STATUS TAB ===================== */
+      let _zonesRefreshInterval = null;
+
+      async function loadZoneStatusTab() {
+        const branch = (document.getElementById("zonesTabBranchFilter") || {}).value || "";
+        const url = "/api/zones/status" + (branch ? `?branch=${encodeURIComponent(branch)}` : "");
+        let rows = [];
+        try {
+          const r = await fetch(url);
+          const j = await r.json();
+          rows = j.status || [];
+        } catch (e) { console.error(e); }
+
+        const tsEl = document.getElementById("zonesLastUpdated");
+        if (tsEl) tsEl.textContent = new Date().toLocaleTimeString();
+
+        renderZoneStatusPanel(rows);
+      }
+
+      function renderZoneStatusPanel(rows) {
+        const container = document.getElementById("zonesStatusContainer");
+        if (!container) return;
+        if (!rows.length) {
+          container.innerHTML = `<div class="text-center text-slate-500 py-8 text-sm">${t('zone_no_data')}</div>`;
+          return;
+        }
+
+        // Group by home zone
+        const zones = {};
+        for (const row of rows) {
+          const key = row.home_zone_name || "Unassigned";
+          if (!zones[key]) zones[key] = [];
+          zones[key].push(row);
+        }
+
+        const statusBadge = (status) => {
+          const map = {
+            in_zone:         ["bg-emerald-900 text-emerald-300", t('status_in_zone')],
+            out_of_zone:     ["bg-amber-900 text-amber-300",    t('status_out_of_zone')],
+            out_of_building: ["bg-red-900 text-red-300",        t('status_out_of_building')],
+            away:            ["bg-slate-700 text-slate-300",    t('status_away')],
+          };
+          const [cls, label] = map[status] || ["bg-slate-700 text-slate-400", status];
+          return `<span class="inline-block px-2 py-0.5 rounded text-xs font-medium ${cls}">${label}</span>`;
+        };
+
+        const fmtTime = (isoStr) => {
+          if (!isoStr) return "—";
+          try { return new Date(isoStr).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}); } catch { return isoStr; }
+        };
+
+        container.innerHTML = Object.entries(zones).map(([zoneName, members]) => {
+          const counts = {in_zone:0, out_of_zone:0, out_of_building:0, away:0};
+          members.forEach(m => { if (counts[m.status] !== undefined) counts[m.status]++; });
+
+          const rows_html = members.map(m => {
+            const ooLong = m.status === 'out_of_zone';
+            return `<tr class="${ooLong ? 'border-l-2 border-amber-400' : ''}">
+              <td class="px-4 py-2 text-sm text-slate-200">${m.name.replace(/_/g,' ')}</td>
+              <td class="px-4 py-2">${statusBadge(m.status)}</td>
+              <td class="px-4 py-2 text-xs text-slate-400">${m.current_location_name || '—'}</td>
+              <td class="px-4 py-2 text-xs text-slate-500">${fmtTime(m.last_seen_utc)}</td>
+            </tr>`;
+          }).join('');
+
+          return `
+            <div class="rounded-xl border border-slate-800 bg-slate-900 mb-4 overflow-x-auto overflow-y-hidden">
+              <div class="px-4 py-3 border-b border-slate-800 flex items-center gap-4 flex-wrap">
+                <span class="font-semibold text-slate-200">${zoneName}</span>
+                <span class="text-xs px-2 py-0.5 rounded bg-emerald-900 text-emerald-300">${t('status_in_zone')}: ${counts.in_zone}</span>
+                <span class="text-xs px-2 py-0.5 rounded bg-amber-900 text-amber-300">${t('status_out_of_zone')}: ${counts.out_of_zone}</span>
+                <span class="text-xs px-2 py-0.5 rounded bg-red-900 text-red-300">${t('status_out_of_building')}: ${counts.out_of_building}</span>
+                <span class="text-xs px-2 py-0.5 rounded bg-slate-700 text-slate-300">${t('status_away')}: ${counts.away}</span>
+              </div>
+              <table class="w-full text-sm whitespace-nowrap min-w-[400px]">
+                <thead>
+                  <tr class="text-xs text-slate-500 border-b border-slate-800">
+                    <th class="px-4 py-2 text-left" data-i18n="col_employee">${t('col_employee')}</th>
+                    <th class="px-4 py-2 text-left" data-i18n="col_status">${t('col_status')}</th>
+                    <th class="px-4 py-2 text-left" data-i18n="col_location">${t('col_location')}</th>
+                    <th class="px-4 py-2 text-left" data-i18n="col_since">${t('col_since')}</th>
+                  </tr>
+                </thead>
+                <tbody>${rows_html}</tbody>
+              </table>
+            </div>
+          `;
+        }).join('');
+      }
+
+      // Auto-refresh zones tab every 30s when active
+      document.addEventListener("visibilitychange", () => {
+        const zonesTab = document.getElementById("tab-zones");
+        if (zonesTab && !zonesTab.classList.contains("hidden") && !document.hidden) {
+          if (!_zonesRefreshInterval) _zonesRefreshInterval = setInterval(loadZoneStatusTab, 30000);
+        } else {
+          clearInterval(_zonesRefreshInterval); _zonesRefreshInterval = null;
+        }
+      });
+      document.querySelectorAll(".tab-btn").forEach(btn => {
+        if (btn.dataset.tab === "zones") {
+          btn.addEventListener("click", () => {
+            if (!_zonesRefreshInterval) _zonesRefreshInterval = setInterval(loadZoneStatusTab, 30000);
+          });
+        } else {
+          btn.addEventListener("click", () => {
+            if (_zonesRefreshInterval) { clearInterval(_zonesRefreshInterval); _zonesRefreshInterval = null; }
           });
         }
       });
@@ -2080,6 +2317,7 @@
       });
       if (videoFeed) videoFeed.addEventListener("load", () => {
         if (inlinePZ) inlinePZ._apply();
+        _hideCamLoading();
       });
 
       // Auto-reconnect MJPEG stream when engine restarts after a crash.

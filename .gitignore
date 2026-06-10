@@ -219,3 +219,4 @@ qr_test/
 
 # Per-person embedding cache (rebuilt on demand)
 **/.embeddings*.npz
+reports_config.json
