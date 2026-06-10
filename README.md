@@ -19,7 +19,7 @@ Uses InsightFace (RetinaFace + ArcFace, ONNX Runtime GPU) for face detection and
 - **Face recognition** — InsightFace `buffalo_l` model pack (RetinaFace detector + ArcFace embeddings, ONNX Runtime on GPU) with CSRT tracking. A pool of up to `INFERENCE_POOL_SIZE` independent FaceAnalysis instances (default 6) runs concurrently across cameras; each has its own CUDA stream so detection from different cameras truly overlaps on the GPU.
 - **Head detection** — YOLOv8n (ONNX Runtime GPU) supplements face detection to sustain tracking when face is not visible (e.g. turned sideways). Always on when model file exists, graceful fallback if missing.
 - **Visit tracking** — Per-location visits with flip-flop prevention, automatic timeout, and transition detection
-- **Footage recording** — Continuous VP8/WebM recording from visit start to end at native camera resolution
+- **Footage recording** — Continuous MPEG-4 Part 2 (`.mp4`) recording from visit start to end at native camera resolution
 - **Action detection** — CLIP ViT-B/32 zero-shot classification (e.g., "Using phone", "Typing", "Idle"). Only runs when face detector confirms the person (not on head-only or tracker-only boxes). Optional, toggled via `ACTION_DETECTION_ENABLED` env var.
 - **Auto-capture unknowns** — Automatically saves face crops of unrecognised people as `unknown_1`, `unknown_2`, etc. Re-identifies them on reappearance. Best for small crowds. Optional, toggled via `AUTO_CAPTURE_ENABLED` env var.
 - **AI kill switch** — Set `FACE_DETECTION_ENABLED=false` to disable all inference (detection, recognition, tracking, attendance) and run as a pure camera stream viewer. Useful for diagnosing lag or running on non-GPU hardware.
@@ -111,8 +111,13 @@ Key settings in `.env`:
 | `ACTION_DETECTION_ENABLED` | `false` | Enable/disable CLIP action detection |
 | `AUTO_CAPTURE_ENABLED` | `false` | Enable/disable auto-capture of unknown persons (best for small crowds) |
 | `USE_NVDEC` | `true` | Use GPU-side video decode (NVDEC) for RTSP streams. Set to `false` to force CPU decode (debugging / non-NVIDIA hosts). |
+| `MAX_CONCURRENT_RTSP` | `3` | Maximum cameras with open RTSP connections at once. Raise to match your total camera count so all cameras detect simultaneously. Each extra stream adds a thread and a TCP connection. |
+| `NVDEC_RECONNECT_CONCURRENCY` | `2` | Max cameras reconnecting to NVDEC simultaneously. Raise to 4+ on GPUs with multiple NVDEC engines (e.g. RTX 5090). |
+| `NVDEC_RECONNECT_GAP_SECS` | `3` | Minimum seconds between consecutive NVDEC open/close cycles. Raise on older hardware if you see CUDA corruption. |
+| `MAX_NVDEC_TRANSFERS` | `8` | Max concurrent GPU→CPU frame downloads across all cameras. Lower to 3–4 for laptop/mobile GPUs. |
+| `DETECT_SCALE` | `0.5` | Scale factor applied to frames before face detection. `0.5` = half resolution (faster, less accurate for distant faces). Set to `1.0` for full-resolution detection. |
 | `LIVE_ANNOTATIONS_ENABLED` | `true` | Draw bounding boxes + name labels on the live MJPEG feed. Set to `false` for a clean live stream when scenes get crowded — boxes still appear on saved footage regardless. |
-| `FOOTAGE_DIR` | *(required)* | Directory where footage WebM files are written. Set to a network mount path (e.g. `/mnt/camera_system/footage`) to offload storage to a NAS. |
+| `FOOTAGE_DIR` | *(required)* | Directory where footage `.mp4` files are written. Set to a network mount path (e.g. `/mnt/camera_system/footage`) to offload storage to a NAS. |
 
 ### 5) Add face images
 
@@ -155,7 +160,7 @@ templates/
   history.html          # Visit history dashboard
   people.html           # People management (view, rename, delete, transfer)
 faces/                  # Enrolled face images (per-person subdirectories)
-footage/                # Recorded visit footage (WebM) — or a NAS mount path via FOOTAGE_DIR
+footage/                # Recorded visit footage (MP4) — or a NAS mount path via FOOTAGE_DIR
 models/
   head-yolov8n-onnx/    # YOLOv8n head detector ONNX model (~12MB)
   clip-vit-base-patch32-onnx/  # CLIP ViT-B/32 ONNX model (~600MB)
@@ -236,7 +241,7 @@ Key parameters in `app.py` engine initialization:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `detect_every` | `5` | Seconds between face detection runs per camera |
-| `detect_scale` | `1.0` | Scale factor for detection (lower = faster, less accurate) |
+| `detect_scale` | `0.5` | Scale factor applied to frames before detection (lower = faster, less accurate). Env-configurable via `DETECT_SCALE`. |
 | `width` / `height` | `1280` / `720` | Camera resolution |
 | `out_fps` | `15` | Target FPS for MJPEG stream and footage |
 | `threshold` | `0.5` | Cosine distance threshold for ArcFace face matching. Below this distance → recognised as that person. Raise (toward 0.6) if same person is being mis-labeled "unknown"; lower (toward 0.4) if different people are being collapsed together. |
@@ -285,9 +290,9 @@ curl -X POST http://localhost:5001/api/history/clear
 
 **Action detection not loading** — Ensure `onnxruntime-gpu` is installed and `onnxruntime` (CPU) is not. Check CUDA drivers with `nvidia-smi`.
 
-**Footage won't play in browser** — Files are VP8/WebM. All modern browsers support this. The OpenCV "tag VP80 is not supported" warning is misleading — the files are valid.
+**Footage won't play in browser** — Files are MPEG-4 Part 2 (`.mp4`). All modern browsers support this format natively.
 
-**Engine subprocess crashes (exit code -11 / SIGSEGV)** — Most common causes: (1) VRAM exhaustion — reduce `INFERENCE_POOL_SIZE` in `face_engine.py` (each instance uses ~400 MB VRAM; default 6 is safe on 8 GB; raising above 8–10 risks OOM with 20+ cameras); (2) concurrent NVDEC context creation/destruction — fixed in `hw_capture.py` by serialising `av.open()` / `container.close()` under a module-level lock; (3) visit flip-flopping creating rapid footage-writer churn — raise `VISIT_TRANSITION_SECS` (default 30 s).
+**Engine subprocess crashes (exit code -11 / SIGSEGV)** — Most common causes: (1) VRAM exhaustion — reduce `INFERENCE_POOL_SIZE` in `face_engine.py` (each instance uses ~400 MB VRAM; default 6 is safe on 8 GB; raising above 8–10 risks OOM with 20+ cameras); (2) concurrent NVDEC driver state access — mitigated in `hw_capture.py` by a readers-writer lock (`_NvdecRWLock`): `av.open()` and `container.close()` hold an exclusive write lock, while `packet.decode()` + `frame.to_ndarray()` hold a read lock (many may run concurrently); network I/O (`container.demux()`) runs without any lock; (3) visit flip-flopping creating rapid footage-writer churn — raise `VISIT_TRANSITION_SECS` (default 30 s).
 
 **Cameras flip-flopping between locations** — A person in a camera overlap zone can be detected on alternating cameras each cycle, creating rapid visit transitions and footage writer churn. Raise `VISIT_TRANSITION_SECS` (default 30 s) so a person must be absent from their current camera for at least that long before transitioning.
 

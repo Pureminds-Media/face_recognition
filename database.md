@@ -52,7 +52,7 @@ Core attendance table. One row per continuous presence of one person at one came
 | `confidence` | REAL | FLOAT | Lowest (best) ArcFace cosine distance seen |
 | `session_id` | TEXT → `sessions.id` | UUID → `sessions.id` | FK |
 | `screenshot` | TEXT | TEXT | Face crop filename, served at `/faces/` |
-| `footage` | TEXT | TEXT | WebM clip filename, served at `/footage/` |
+| `footage` | TEXT | TEXT | MP4 clip filename, served at `/footage/` |
 | `visible_duration` | REAL | FLOAT | Seconds actually tracked (footage clock) |
 | `activity` | TEXT | TEXT | Most frequent CLIP action label |
 | `branch` | TEXT NOT NULL DEFAULT 'Riyadh' | TEXT NOT NULL DEFAULT 'Riyadh' | Auto-assigned from the camera's IP group |

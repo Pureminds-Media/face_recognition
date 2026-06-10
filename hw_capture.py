@@ -33,36 +33,100 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
-# Serialise concurrent NVDEC context creation/destruction.  Creating or
-# tearing down multiple CUDA video-decode contexts simultaneously can
-# corrupt internal NVDEC state and cause SIGSEGV.
+
+class _NvdecRWLock:
+    """Readers-writer lock for NVDEC context operations.
+
+    Readers  — frame.to_ndarray() calls (many may run concurrently).
+    Writers  — av.open() and container.close() (exclusive; waits for all
+               active readers to finish before proceeding).
+
+    Writers get priority: once a write is queued, new readers block so the
+    writer is not starved by a steady stream of decode transfers.
+    """
+
+    def __init__(self):
+        self._cv = threading.Condition(threading.Lock())
+        self._readers: int = 0
+        self._writers_waiting: int = 0
+        self._writing: bool = False
+
+    def acquire_read(self, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._cv:
+            while self._writing or self._writers_waiting > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cv.wait(timeout=min(remaining, 0.1))
+            self._readers += 1
+            return True
+
+    def release_read(self) -> None:
+        with self._cv:
+            self._readers -= 1
+            if self._readers == 0:
+                self._cv.notify_all()
+
+    def acquire_write(self, timeout: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._cv:
+            self._writers_waiting += 1
+            while self._readers > 0 or self._writing:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._writers_waiting -= 1
+                    return False
+                self._cv.wait(timeout=min(remaining, 0.1))
+            self._writers_waiting -= 1
+            self._writing = True
+            return True
+
+    def release_write(self) -> None:
+        with self._cv:
+            self._writing = False
+            self._cv.notify_all()
+
+
+# Global RW lock for all NVDEC operations.
+# to_ndarray() holds a read slot; av.open() / container.close() hold the
+# write slot (exclusive).  This prevents container teardown from racing with
+# active GPU→CPU transfers on other cameras, which causes SIGSEGV in the
+# NVDEC driver.
+_nvdec_rw = _NvdecRWLock()
+
+# Legacy simple lock kept for the _nvdec_reconnect_sem path in face_engine.py
+# which imports it by name.  The RW lock supersedes it for actual CUDA ops.
 _nvdec_lock = threading.Lock()
 
 # Limit concurrent camera reconnects.  Each reconnect does: close old context
-# (joins its reader thread, up to 3 s) then opens a new context.  If multiple
-# cameras fail at the same time the dying reader threads overlap with new
-# context creates even though _nvdec_lock serialises each individual op —
-# the interleaving of live threads is enough to corrupt CUDA state.
-# Serialise all reconnects: concurrent NVDEC open+close pairs (even just two)
-# corrupt CUDA state when unstable cameras cycle rapidly, causing SIGSEGV.
-# One reconnect at a time is slower to recover but eliminates the crash.
-_nvdec_reconnect_sem = threading.Semaphore(1)
+# (joins its reader thread, up to ~7 s) then opens a new context.
+# NVDEC_RECONNECT_CONCURRENCY: how many cameras may reconnect simultaneously.
+#   Default 1 — safest; one reconnect at a time prevents driver state churn.
+#   The RW lock now handles the deeper race, but keeping concurrency low
+#   avoids a thundering-herd of simultaneous av.open() calls.
+def _nvdec_reconnect_concurrency() -> int:
+    try:
+        return max(1, int(os.getenv("NVDEC_RECONNECT_CONCURRENCY", "1")))
+    except (ValueError, TypeError):
+        return 1
+
+_nvdec_reconnect_sem = threading.Semaphore(_nvdec_reconnect_concurrency())
 # Monotonic time of the last reconnect completion; enforces a minimum gap
 # between consecutive reconnect operations to avoid back-to-back NVDEC churn.
 _nvdec_last_reconnect_t: float = 0.0
-_NVDEC_RECONNECT_GAP = float(os.getenv("NVDEC_RECONNECT_GAP_SECS", "10.0"))
+# NVDEC_RECONNECT_GAP_SECS: minimum seconds between consecutive NVDEC
+# open/close cycles.
+_NVDEC_RECONNECT_GAP = float(os.getenv("NVDEC_RECONNECT_GAP_SECS", "2.0"))
 
 # Limit concurrent GPU→CPU frame downloads (frame.to_ndarray on NVDEC frames).
-# Each camera's to_ndarray() runs only in its own reader thread, so concurrent
-# transfers == number of cameras actively decoding.  The semaphore caps this to
-# avoid overwhelming a single NVDEC engine.
-# Raise MAX_NVDEC_TRANSFERS in env if you have a high-end GPU with multiple
-# NVDEC engines (e.g. RTX 5090).
+# MAX_NVDEC_TRANSFERS: default 8 — suitable for RTX 5090 (2 NVDEC engines).
+# Lower to 3-4 for laptop/mobile GPUs (RTX 40 series and below).
 def _max_nvdec_transfers() -> int:
     try:
-        return max(1, int(os.getenv("MAX_NVDEC_TRANSFERS", "3")))
+        return max(1, int(os.getenv("MAX_NVDEC_TRANSFERS", "8")))
     except (ValueError, TypeError):
-        return 3
+        return 8
 
 _nvdec_transfer_sem: Optional[threading.Semaphore] = None
 _nvdec_transfer_sem_lock = threading.Lock()
@@ -141,7 +205,12 @@ class HwRtspCapture:
         hwaccel = HWAccel(device_type="cuda", allow_software_fallback=False)
 
         _av_timeout = int(_stimeout) / 1000.0 + 0.5  # slightly above stimeout
-        with _nvdec_lock:
+
+        # av.open() is a write operation — must not run while any other
+        # camera's to_ndarray() is in progress (NVDEC driver shared state).
+        if not _nvdec_rw.acquire_write(timeout=30.0):
+            raise RuntimeError(f"Timed out waiting for NVDEC write lock: {url}")
+        try:
             self._container = av.open(
                 url, options=options, timeout=_av_timeout, hwaccel=hwaccel,
             )
@@ -159,6 +228,8 @@ class HwRtspCapture:
                 raise RuntimeError(
                     f"hwaccel did not attach for codec {base_codec!r} on {url}"
                 )
+        finally:
+            _nvdec_rw.release_write()
 
         self._stream = stream
         self._width = int(stream.codec_context.width or 0)
@@ -178,38 +249,53 @@ class HwRtspCapture:
     # ---------- background reader ----------
     def _reader_loop(self):
         try:
-            for frame in self._container.decode(self._stream):
+            # Split demux (network I/O) from decode (NVDEC hardware) so the
+            # read lock is only held during actual GPU operations, not while
+            # waiting for the next packet from the network.
+            #
+            # Without this split, a stalled camera would hold the read lock
+            # indefinitely, blocking all reconnect writes on other cameras.
+            #
+            # Timeline per packet:
+            #   container.demux() → reads encoded packet from network  [no lock]
+            #   packet.decode()   → NVDEC hardware decode              [read lock]
+            #   frame.to_ndarray()→ GPU→CPU transfer                   [read lock]
+            for packet in self._container.demux(self._stream):
                 if self._stop.is_set():
                     break
-                # NVDEC produces NV12 frames in GPU memory; PyAV
-                # transparently downloads + reformats to BGR via
-                # libswscale. Cheaper than a CPU H.264/H.265 decode.
+                # flush packet — end of stream sentinel from PyAV
+                if packet.dts is None:
+                    break
+                # Encoded packet is now in CPU memory; no NVDEC touched yet.
+                # Acquire read slot only for the hardware decode + transfer.
+                if not _nvdec_rw.acquire_read(timeout=2.0):
+                    continue  # reconnect write pending; drop this packet
                 try:
-                    with _get_transfer_sem():
-                        ndarr = frame.to_ndarray(format="bgr24")
+                    for frame in packet.decode():
+                        with _get_transfer_sem():
+                            ndarr = frame.to_ndarray(format="bgr24")
+                        with self._lock:
+                            self._latest = ndarr
+                            self._latest_t = time.monotonic()
+                            if self._width == 0:
+                                self._height, self._width = ndarr.shape[:2]
                 except Exception:
-                    continue
-                with self._lock:
-                    self._latest = ndarr
-                    self._latest_t = time.monotonic()
-                    if self._width == 0:
-                        self._height, self._width = ndarr.shape[:2]
+                    pass
+                finally:
+                    _nvdec_rw.release_read()
         except Exception as e:
             log.warning("HwRtspCapture reader error on %s: %s", self._url, e)
         finally:
-            # Close the container from the reader thread so there is no race
-            # between container.close() and container.decode().  FFmpeg frees
-            # the AVFormatContext (including NVDEC CUDA context) in close(); if
-            # another thread calls close() while we are still inside decode() /
-            # av_read_frame() the freed memory causes SIGSEGV.  Closing here,
-            # after decode() has already returned, eliminates that race.
-            # to_ndarray() (the only other CUDA call) also runs in this thread,
-            # so it has always completed before we reach this finally block.
-            with _nvdec_lock:
-                try:
-                    self._container.close()
-                except Exception:
-                    pass
+            # container.close() is a write operation — waits for all active
+            # decode+transfer ops on other cameras to complete first.
+            if not _nvdec_rw.acquire_write(timeout=30.0):
+                log.warning("HwRtspCapture: timed out waiting for write lock on close: %s", self._url)
+            try:
+                self._container.close()
+            except Exception:
+                pass
+            finally:
+                _nvdec_rw.release_write()
             self._opened = False
 
     # ---------- cv2.VideoCapture-compatible API ----------

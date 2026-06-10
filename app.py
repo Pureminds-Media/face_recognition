@@ -324,7 +324,7 @@ _ENGINE_KWARGS = dict(
     model="buffalo_l",
     threshold=0.55,
     detect_every=10,
-    detect_scale=0.5,
+    detect_scale=float(os.getenv("DETECT_SCALE", "0.5")),
     tracker_type="CSRT",
     width=1280,
     height=720,
@@ -896,7 +896,7 @@ def _start_visit_footage(visit_id, person_name, camera_source):
     person is visible on the camera.
     """
     try:
-        fname = f"visit_{visit_id}.webm"
+        fname = f"visit_{visit_id}.mp4"
         ok, actual_fname = engine.start_footage(
             visit_id, person_name, camera_source, FOOTAGE_DIR, fname
         )

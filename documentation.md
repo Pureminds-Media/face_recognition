@@ -218,7 +218,7 @@ close_visit()  ─── sets ended=1, final last_seen
 | `confidence` | float | Best (lowest) cosine distance seen |
 | `session_id` | UUID FK | References `sessions.id` |
 | `screenshot` | text | Filename of face crop image |
-| `footage` | text | Filename of WebM footage clip |
+| `footage` | text | Filename of MP4 footage clip |
 | `visible_duration` | float | Actual seconds on camera (footage writer clock) |
 | `activity` | text | Most frequent CLIP action label during visit |
 | `branch` | text | Branch this visit belongs to (e.g. `"Riyadh"`, `"Egypt"`). Auto-assigned from the camera's IP group. |
@@ -261,7 +261,7 @@ Controlled by `AUTO_CAPTURE_ENABLED` env var (default **false**).
 
 ## 7. Footage Recording
 
-- Every open visit with a known person (not raw "unknown") starts a `cv2.VideoWriter` writing VP8/WebM.
+- Every open visit with a known person (not raw "unknown") starts a `cv2.VideoWriter` writing MPEG-4 Part 2 (fourcc `mp4v`, `.mp4` extension). VP8/WebM was removed because libvpx's global encoder state is non-reentrant — running 17+ concurrent encoder instances caused crashes.
 - Frames come from a **ring buffer** (`FOOTAGE_RING_SECS = 1.0 s`) so the clip starts slightly before the visit opened.
 - Footage is written to `FOOTAGE_DIR` (required env var). Can be a NAS mount path.
 - On `close_visit()`, the writer is flushed and released; `visible_duration` is written to the DB.
@@ -312,10 +312,14 @@ Controlled by `USE_NVDEC` env var (default **true**). Implementation in `hw_capt
 
 | Guard | Why |
 |-------|-----|
-| `_nvdec_lock` (module-level `threading.Lock`) | Serialises `av.open()` and `container.close()` — simultaneous NVDEC context creation/destruction causes SIGSEGV |
-| `_nvdec_transfer_sem` (Semaphore, default **6**) | Caps concurrent `frame.to_ndarray()` GPU→CPU copies — too many simultaneous CUDA memcpy calls corrupt CUDA state |
+| `_NvdecRWLock` (module-level readers-writer lock) | Prevents SIGSEGV from concurrent NVDEC driver state access. Writers (exclusive): `av.open()` and `container.close()`. Readers (concurrent): `packet.decode()` + `frame.to_ndarray()`. Network I/O (`container.demux()`) runs without any lock. Writers get priority — once a write is queued, new readers block to avoid writer starvation. |
+| `_nvdec_transfer_sem` (Semaphore, default **8**) | Caps concurrent `frame.to_ndarray()` GPU→CPU copies — too many simultaneous CUDA memcpy calls can corrupt CUDA state. Redundant with the RW-lock reader path but retained as a secondary throttle. |
 
-`MAX_NVDEC_TRANSFERS` env var overrides the semaphore limit (useful on GPUs with multiple NVDEC engines like RTX 5090).
+`MAX_NVDEC_TRANSFERS` env var overrides the semaphore limit (default **8**, tuned for RTX 5090 with 2 NVDEC engines; lower to 3–4 for laptop/mobile GPUs).
+
+`NVDEC_RECONNECT_CONCURRENCY` limits how many cameras may open a new NVDEC connection simultaneously (default **2**).
+
+`NVDEC_RECONNECT_GAP_SECS` sets the minimum seconds between consecutive NVDEC open/close cycles per capture instance (default **3**).
 
 ---
 
@@ -496,9 +500,13 @@ All settings are read from `.env` (loaded by `python-dotenv` on startup). Copy `
 | `ACTION_DETECTION_ENABLED` | `false` | CLIP zero-shot action classification |
 | `AUTO_CAPTURE_ENABLED` | `false` | Auto-save face crops of unknown persons |
 | `USE_NVDEC` | `true` | GPU-side RTSP decode via PyAV + CUDA. Set `false` to force CPU decode |
-| `MAX_NVDEC_TRANSFERS` | `6` | Max concurrent GPU→CPU frame copies (raise on multi-NVDEC GPUs like RTX 5090) |
+| `MAX_CONCURRENT_RTSP` | `3` | Max cameras with open RTSP connections simultaneously. Raise to your total camera count for all cameras to detect at once. LRU eviction applies when the limit is exceeded. |
+| `NVDEC_RECONNECT_CONCURRENCY` | `2` | Max cameras reconnecting to NVDEC simultaneously. Raise to 4+ on RTX 5090. |
+| `NVDEC_RECONNECT_GAP_SECS` | `3` | Minimum seconds between consecutive NVDEC open/close cycles per capture instance. |
+| `MAX_NVDEC_TRANSFERS` | `8` | Max concurrent GPU→CPU frame copies. Lower to 3–4 for laptop/mobile GPUs; raise on multi-NVDEC GPUs (e.g. RTX 5090). |
+| `DETECT_SCALE` | `0.5` | Scale factor applied to frames before face detection. `0.5` = half resolution (faster, less accurate for distant faces). Set to `1.0` for full resolution. Overrides the `detect_scale` passed to `FaceEngine` at startup. |
 | `LIVE_ANNOTATIONS_ENABLED` | `true` | Draw bounding boxes on the live MJPEG feed. Footage always annotated. |
-| `FOOTAGE_DIR` | *(required)* | Directory where WebM footage clips are written |
+| `FOOTAGE_DIR` | *(required)* | Directory where `.mp4` footage clips are written |
 | `API_KEY` | *(unset)* | Shared-secret key for all `/api/*` routes. Unset = no auth (local dev only) |
 
 ### Engine tuning (set in `app.py` at `FaceEngine` instantiation)
@@ -506,7 +514,7 @@ All settings are read from `.env` (loaded by `python-dotenv` on startup). Copy `
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `detect_every` | `5` s | Seconds between face detection runs per camera |
-| `detect_scale` | `1.0` | Scale factor applied to frames before detection (lower = faster, less accurate) |
+| `detect_scale` | `0.5` | Scale factor applied to frames before detection (lower = faster, less accurate). Env-configurable via `DETECT_SCALE`. |
 | `width` / `height` | `1280` / `720` | Camera resolution for the MJPEG stream |
 | `out_fps` | `15` | Target FPS for MJPEG stream and footage |
 | `threshold` | `0.5` | Cosine distance threshold for ArcFace matching |
@@ -561,7 +569,7 @@ faces/                        Enrolled face images — one subdirectory per pers
     photo.jpg
     .arcface.npz              Cached ArcFace embeddings (auto-generated, do not commit)
 
-footage/                      Recorded visit WebM clips (or FOOTAGE_DIR mount)
+footage/                      Recorded visit MP4 clips (or FOOTAGE_DIR mount)
 models/
   head-yolov8n-onnx/          YOLOv8n head detector ONNX model (~12 MB)
   clip-vit-base-patch32-onnx/ CLIP ViT-B/32 ONNX model (~600 MB)

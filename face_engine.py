@@ -1156,23 +1156,37 @@ class FaceEngine:
         if w is None:
             w, h = self.width, self.height
 
-        # Use VP8/WebM — natively supported in all modern browsers.
-        # OpenCV emits a misleading "tag VP80 is not supported" warning,
-        # but the files are valid WebM with correct EBML headers.
-        fname_webm = fname.rsplit(".", 1)[0] + ".webm"
-        fpath = os.path.join(footage_dir, fname_webm)
-        fname = fname_webm
-        fourcc = cv2.VideoWriter_fourcc(*"VP80")
-        writer = cv2.VideoWriter(fpath, fourcc, fps, (w, h))
+        # Try codecs in order — best browser compatibility first.
+        # VP8/WebM was crashing: libvpx has non-reentrant global state that
+        # SIGSEGVs when many encoder instances call write() simultaneously.
+        base = fname.rsplit(".", 1)[0]
+        # avc1/H264 require libx264 which is not installed on this host
+        # (FFmpeg only has h264_v4l2m2m which fails on x86/NVIDIA).
+        # mp4v (MPEG-4 Part 2) is always available and plays in all browsers.
+        _codec_candidates = [
+            (base + ".mp4", "mp4v"),
+        ]
+        writer = None
+        fname_out = fname
+        fpath = os.path.join(footage_dir, fname)
+        for _cname, _tag in _codec_candidates:
+            _cpath = os.path.join(footage_dir, _cname)
+            _w = cv2.VideoWriter(_cpath, cv2.VideoWriter_fourcc(*_tag), fps, (w, h))
+            if _w.isOpened():
+                writer = _w
+                fname_out = _cname
+                fpath = _cpath
+                break
+            _w.release()
+        if writer is None:
+            return False, fname
+        fname = fname_out
         _fbitrate = int(os.getenv("FOOTAGE_BITRATE", "0"))
         if _fbitrate > 0:
             try:
                 writer.set(cv2.VIDEOWRITER_PROP_BITRATE, _fbitrate)
             except Exception:
                 pass
-        if not writer.isOpened():
-            writer.release()
-            return False, fname
 
         now = time.monotonic()
         # Each writer gets its own thread + queue so disk/NAS I/O never
