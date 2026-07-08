@@ -44,7 +44,10 @@ def run(conn, state, engine_kwargs, log_level=logging.INFO):
     load_dotenv()
 
     os.makedirs(engine_kwargs.get("known_dir", "faces"), exist_ok=True)
-    engine = FaceEngine(**engine_kwargs)
+    # Pop keys that are for engine_runner only, not FaceEngine.__init__
+    _runner_only_keys = ("tracker_snapshots_dir",)
+    _fe_kwargs = {k: v for k, v in engine_kwargs.items() if k not in _runner_only_keys}
+    engine = FaceEngine(**_fe_kwargs)
 
     # Apply saved grid/cam config so the child mirrors what the user had.
     saved = FaceEngine.load_grid_config()
@@ -102,6 +105,63 @@ def run(conn, state, engine_kwargs, log_level=logging.INFO):
                         state["camera_jpegs"] = cam_jpegs
                     except Exception:
                         pass
+
+                    # --- Tracker: drain crossing events, save JPEGs ---
+                    try:
+                        _raw_events = engine.pop_crossing_events()
+                        if _raw_events:
+                            import cv2 as _cv2
+                            _snap_dir = engine_kwargs.get(
+                                "tracker_snapshots_dir", "static/tracker_snapshots"
+                            )
+                            os.makedirs(_snap_dir, exist_ok=True)
+                            _serializable = []
+                            for _ev in _raw_events:
+                                _ev_copy = {k: v for k, v in _ev.items() if k != "raw_frame"}
+                                _rf = _ev.get("raw_frame")
+                                if _rf is not None:
+                                    try:
+                                        _ann = _rf.copy()
+                                        _bx, _by, _bw, _bh = (
+                                            int(v) for v in _ev.get("bbox", (0, 0, 0, 0))
+                                        )
+                                        _rh, _rw = _rf.shape[:2]
+                                        _tw = max(1, _ev.get("tile_w", _rw))
+                                        _th = max(1, _ev.get("tile_h", _rh))
+                                        _sx = _rw / _tw
+                                        _sy = _rh / _th
+                                        _rx  = int(_bx * _sx)
+                                        _ry  = int(_by * _sy)
+                                        _rww = int(_bw * _sx)
+                                        _rhh = int(_bh * _sy)
+                                        _cv2.rectangle(
+                                            _ann,
+                                            (_rx, _ry),
+                                            (_rx + _rww, _ry + _rhh),
+                                            (0, 255, 0),
+                                            2,
+                                        )
+                                        _fname = uuid.uuid4().hex + ".jpg"
+                                        _fpath = os.path.join(_snap_dir, _fname)
+                                        _cv2.imwrite(
+                                            _fpath, _ann, [_cv2.IMWRITE_JPEG_QUALITY, 85]
+                                        )
+                                        _ev_copy["snapshot_path"] = (
+                                            f"static/tracker_snapshots/{_fname}"
+                                        )
+                                    except Exception as _snap_err:
+                                        log.debug("tracker snapshot error: %s", _snap_err)
+                                        _ev_copy["snapshot_path"] = None
+                                else:
+                                    _ev_copy["snapshot_path"] = None
+                                _serializable.append(_ev_copy)
+                            _existing = list(
+                                state.get("tracker_crossing_events", []) or []
+                            )
+                            _existing.extend(_serializable)
+                            state["tracker_crossing_events"] = _existing[-50:]
+                    except Exception as _te:
+                        log.debug("tracker event mirror error: %s", _te)
 
                 # Activity tables (engine internals; tolerate absence)
                 act_by_name = {}

@@ -112,6 +112,19 @@ CREATE TABLE IF NOT EXISTS gate_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_gate_events_person_date ON gate_events (person_name, event_date);
+
+CREATE TABLE IF NOT EXISTS tracker_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type    TEXT NOT NULL,
+    person_name   TEXT NOT NULL,
+    camera_source TEXT NOT NULL,
+    camera_name   TEXT NOT NULL DEFAULT '',
+    occurred_at   TEXT NOT NULL,
+    snapshot_path TEXT,
+    confidence    REAL NOT NULL DEFAULT 0.0
+);
+CREATE INDEX IF NOT EXISTS idx_tracker_events_occurred ON tracker_events (occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tracker_events_person   ON tracker_events (person_name);
 """
 
 _PG_SCHEMA = """
@@ -192,6 +205,19 @@ CREATE TABLE IF NOT EXISTS gate_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_gate_events_person_date ON gate_events (person_name, event_date);
+
+CREATE TABLE IF NOT EXISTS tracker_events (
+    id            BIGSERIAL    PRIMARY KEY,
+    event_type    TEXT         NOT NULL,
+    person_name   TEXT         NOT NULL,
+    camera_source TEXT         NOT NULL,
+    camera_name   TEXT         NOT NULL DEFAULT '',
+    occurred_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    snapshot_path TEXT,
+    confidence    FLOAT        NOT NULL DEFAULT 0.0
+);
+CREATE INDEX IF NOT EXISTS idx_tracker_events_occurred ON tracker_events (occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tracker_events_person   ON tracker_events (person_name);
 """
 
 
@@ -320,6 +346,21 @@ def init_db(dsn=None):
                     pass
                 try:
                     cur.execute("ALTER TABLE people ADD COLUMN home_zone_id INTEGER REFERENCES zones(id)")
+                except Exception:
+                    pass
+                try:
+                    cur.execute("""CREATE TABLE IF NOT EXISTS tracker_events (
+                        id BIGSERIAL PRIMARY KEY,
+                        event_type TEXT NOT NULL,
+                        person_name TEXT NOT NULL,
+                        camera_source TEXT NOT NULL,
+                        camera_name TEXT NOT NULL DEFAULT '',
+                        occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        snapshot_path TEXT,
+                        confidence FLOAT NOT NULL DEFAULT 0.0
+                    )""")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_tracker_events_occurred ON tracker_events (occurred_at DESC)")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_tracker_events_person ON tracker_events (person_name)")
                 except Exception:
                     pass
             _backend = "postgres"
@@ -455,6 +496,24 @@ def init_db(dsn=None):
             pass
         try:
             conn.execute("ALTER TABLE people ADD COLUMN home_zone_id INTEGER REFERENCES zones(id)")
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS tracker_events (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type    TEXT NOT NULL,
+                    person_name   TEXT NOT NULL,
+                    camera_source TEXT NOT NULL,
+                    camera_name   TEXT NOT NULL DEFAULT '',
+                    occurred_at   TEXT NOT NULL,
+                    snapshot_path TEXT,
+                    confidence    REAL NOT NULL DEFAULT 0.0
+                );
+                CREATE INDEX IF NOT EXISTS idx_tracker_events_occurred ON tracker_events (occurred_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_tracker_events_person ON tracker_events (person_name);
+            """)
             conn.commit()
         except Exception:
             pass
@@ -734,6 +793,23 @@ def close_visit(visit_id):
         sql = "UPDATE visits SET ended = 1, last_seen = ? WHERE id = ? AND NOT ended"
     with _cursor(commit=True) as cur:
         cur.execute(sql, (now, visit_id))
+
+
+def insert_manual_visit(person_name, first_seen_str, last_seen_str, branch="Riyadh"):
+    """Create a closed visit with explicit first/last seen timestamps (manual attendance)."""
+    ended_val = "TRUE" if _backend == "postgres" else "1"
+    if _backend == "postgres":
+        sql = """INSERT INTO visits (person_name, location_id, first_seen, last_seen, ended, confidence, branch)
+                 VALUES (%s, NULL, %s, %s, TRUE, 1.0, %s) RETURNING id"""
+        with _cursor(commit=True) as cur:
+            cur.execute(sql, (person_name, first_seen_str, last_seen_str, branch))
+            return cur.fetchone()["id"]
+    else:
+        sql = """INSERT INTO visits (person_name, location_id, first_seen, last_seen, ended, confidence, branch)
+                 VALUES (?, NULL, ?, ?, 1, 1.0, ?)"""
+        with _cursor(commit=True) as cur:
+            cur.execute(sql, (person_name, first_seen_str, last_seen_str, branch))
+            return cur.lastrowid
 
 
 def update_visit_screenshot(visit_id, screenshot):
@@ -1279,6 +1355,54 @@ def close_gate_entry(person_name, entry_dt):
         return row_id
 
 
+def write_arrival_event(person_name, arrival_dt):
+    """Write a standalone arrival event when exit camera is unavailable.
+
+    This creates a gate_events row where exit_time == entry_time, so the
+    report can read the arrival time even when no exit-camera event was seen.
+    Only writes if no open (entry_time IS NULL) row already exists for this
+    person on the same date, and no arrival-only row exists within the last
+    30 minutes (debounce).
+    """
+    ph = "?" if _backend == "sqlite" else "%s"
+    event_date = arrival_dt.astimezone().strftime("%Y-%m-%d")
+    ts_str = arrival_dt.isoformat() if _backend == "sqlite" else arrival_dt
+    with _cursor(commit=True) as cur:
+        # Skip if an open exit row exists (normal flow will close it later)
+        cur.execute(
+            f"SELECT id FROM gate_events WHERE person_name={ph} AND entry_time IS NULL LIMIT 1",
+            (person_name,),
+        )
+        if cur.fetchone():
+            return None
+        # Debounce: skip if a same-date arrival-only row was written < 30 min ago
+        cur.execute(
+            f"SELECT exit_time FROM gate_events WHERE person_name={ph} AND event_date={ph}"
+            f" AND entry_time IS NOT NULL ORDER BY exit_time DESC LIMIT 1",
+            (person_name, event_date),
+        )
+        row = cur.fetchone()
+        if row:
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                prev = _dt.fromisoformat(row[0]) if isinstance(row[0], str) else row[0]
+                if prev.tzinfo is None:
+                    prev = prev.replace(tzinfo=_tz.utc)
+                if (arrival_dt - prev).total_seconds() < 1800:
+                    return None  # written recently enough
+            except Exception:
+                pass
+        cur.execute(
+            f"INSERT INTO gate_events (person_name, event_date, exit_time, entry_time, duration_minutes)"
+            f" VALUES ({ph},{ph},{ph},{ph},0)",
+            (person_name, event_date, ts_str, ts_str),
+        )
+        if _backend == "sqlite":
+            return cur.lastrowid
+        cur.execute("SELECT lastval()")
+        return cur.fetchone()[0]
+
+
 def get_gate_events(date_str, person_name=None):
     """Return gate_events rows for a date, optionally filtered by person."""
     ph = "?" if _backend == "sqlite" else "%s"
@@ -1540,3 +1664,43 @@ def get_zone_compliance_report(date_from, date_to, branch=None):
     with _cursor() as cur:
         cur.execute(sql, params)
         return _rows_to_dicts(cur.fetchall())
+
+
+# ---------------------------------------------------------------------------
+# Tracker events
+# ---------------------------------------------------------------------------
+
+def insert_tracker_event(event_type, person_name, camera_source,
+                          camera_name='', snapshot_path=None, confidence=0.0):
+    """Insert a line-crossing tracker event. Returns the new row id."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    now_val = _now_str() if _backend == "sqlite" else _now()
+    with _cursor(commit=True) as cur:
+        if _backend == "postgres":
+            cur.execute(
+                f"INSERT INTO tracker_events (event_type, person_name, camera_source, camera_name, occurred_at, snapshot_path, confidence) VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph}) RETURNING id",
+                (event_type, person_name, camera_source, camera_name, now_val, snapshot_path, float(confidence)),
+            )
+            return cur.fetchone()["id"]
+        else:
+            cur.execute(
+                f"INSERT INTO tracker_events (event_type, person_name, camera_source, camera_name, occurred_at, snapshot_path, confidence) VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph})",
+                (event_type, person_name, camera_source, camera_name, now_val, snapshot_path, float(confidence)),
+            )
+            return cur.lastrowid
+
+
+def get_tracker_events(limit=200, offset=0):
+    """Return recent tracker events, newest first."""
+    sql = _param("SELECT id, event_type, person_name, camera_source, camera_name, occurred_at, snapshot_path, confidence FROM tracker_events ORDER BY occurred_at DESC LIMIT %s OFFSET %s")
+    with _cursor() as cur:
+        cur.execute(sql, (limit, offset))
+        return _rows_to_dicts(cur.fetchall())
+
+
+def delete_tracker_events_before(cutoff_iso):
+    """Delete tracker_events older than cutoff_iso. Returns count deleted."""
+    sql = _param("DELETE FROM tracker_events WHERE occurred_at < %s")
+    with _cursor(commit=True) as cur:
+        cur.execute(sql, (cutoff_iso,))
+        return cur.rowcount

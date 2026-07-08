@@ -209,7 +209,7 @@ Zones are named camera zones (e.g. "Floor 1", "Server Room") with an optional br
 
 | Method | Path                                          | Description                                                 |
 | ------ | --------------------------------------------- | ----------------------------------------------------------- |
-| GET    | `/api/camera`                                 | List devices + current viewer state. The `devices` list still includes `grid_RxC` layout entries; the in-tree UI now hides them since it operates in single-camera viewer mode only, but the layouts work via direct API calls. |
+| GET    | `/api/camera`                                 | List devices + current viewer state. The `devices` list still includes `grid_RxC` layout entries; the in-tree UI no longer exposes a Single/Multi toggle or grid picker (single-camera viewer only), but the layouts still work via direct API calls. |
 | POST   | `/api/camera`                                 | Body: `{source}`. Switch viewer to a camera URL/index, or to a `grid_RxC` layout (e.g. `"grid_2x2"`). Also accepts `{grid_offset: int}` to page through cameras when in grid mode. **Note:** the analysis pool always covers every configured camera regardless of viewer mode — switching viewer mode never starts/stops detection on any camera. |
 | POST   | `/api/camera/reload`                          | Re-probe devices.                                           |
 | GET    | `/api/camera/statuses`                        | Returns live/dead status for all cameras in the active grid. Map of `{source: {ok, last_frame_age_secs, …}}`. |
@@ -283,6 +283,8 @@ All analytics endpoints accept an optional `?branch=<name>` query parameter. Whe
 | POST | `/api/reports/history/<date>/save` | Manually save the report for a date to the `daily_reports` table. |
 | GET | `/api/reports/history/<date>/export` | Download the report as a CSV file. |
 
+The Settings → Reports UI also offers client-side **Excel** (CSV download) and **PDF** (print-to-PDF via a new browser tab) export buttons for whatever report is currently displayed and filtered on screen — these do not hit new server endpoints.
+
 ### 4.6 Attendance
 
 | Method | Path                          | Description                                          |
@@ -290,6 +292,22 @@ All analytics endpoints accept an optional `?branch=<name>` query parameter. Whe
 | GET    | `/api/attendance`             | Roster snapshot: `{name, attended, present, …}`.     |
 | POST   | `/api/attendance/reset`       | Clear in-memory attendance state.                    |
 | GET    | `/api/attendance/stream`      | Server-Sent Events: `state`, `new`, `repeat`.        |
+| POST   | `/api/attendance/manual`      | Body: `{date, arrived?, left?, names: [...]}` (`arrived`/`left` default `"09:00"`/`"17:00"`). Backfills a closed visit per name with no camera association. Returns `{ok, count}`. |
+
+### 4.6.1 Camera Tracker (line-crossing)
+
+Independent people-counting feature at `/tracker`, separate from visits/attendance. See [documentation.md §17](documentation.md#17-camera-tracker-line-crossing) for the full design.
+
+| Method | Path                     | Description                                                 |
+| ------ | ------------------------ | ------------------------------------------------------------ |
+| GET    | `/tracker`               | Tracker setup + live event feed page.                        |
+| GET    | `/api/tracker/config`    | Returns `{cameras: [{source, name}], line_y_ratio, line_y_ratios, cam_transforms, tracker_rois}`. |
+| POST   | `/api/tracker/config`    | Body: any subset of `{cameras: [...up to 4 sources], line_y_ratio, line_y_ratios, cam_transforms, tracker_rois}`. Validates camera sources against configured IP cameras; 400 on unknown sources. Pins the assigned cameras in the RTSP pool and marks them high-priority. |
+| GET    | `/api/tracker/events`    | Query: `?limit=&offset=` (limit capped at 500). Paginated event history, newest first. |
+| POST   | `/api/tracker/ping`      | Keep-alive from the tracker page. While recently pinged, the main dashboard's composite MJPEG stream throttles to 1 fps to free bandwidth. |
+| GET    | `/api/tracker/stream`    | SSE stream. Initial `event: snapshot` with the last 20 events, then `event: crossing` per new event. |
+
+Each tracker event object: `{id, event_type ("enter"|"exit"), person_name, camera_name, snapshot_url, confidence, occurred_at}`.
 
 ### 4.7 Test runner (offline video)
 

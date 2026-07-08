@@ -143,7 +143,9 @@ FACES_DIR = "faces"
 TEST_UPLOAD_DIR = os.path.join("test_runs", "uploads")
 TEST_OUTPUT_DIR = os.path.join("test_runs", "outputs")
 FOOTAGE_DIR = os.environ["FOOTAGE_DIR"]
-IP_CAMERAS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ip_cameras.json")
+IP_CAMERAS_PATH       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ip_cameras.json")
+TRACKER_CONFIG_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracker_config.json")
+TRACKER_SNAPSHOTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "tracker_snapshots")
 _ip_cameras_lock = threading.Lock()
 
 
@@ -229,6 +231,43 @@ def _load_ip_cameras():
 def _save_ip_cameras(state):
     with open(IP_CAMERAS_PATH, "w") as f:
         json.dump(state, f, indent=2)
+
+
+def _load_tracker_config():
+    try:
+        with open(TRACKER_CONFIG_PATH) as f:
+            d = json.load(f)
+        raw_transforms = d.get("cam_transforms") or {}
+        cam_transforms = {}
+        for src, t in raw_transforms.items():
+            if not isinstance(t, dict):
+                continue
+            cam_transforms[str(src)] = {
+                "zoom":   max(0.5, min(8.0, float(t.get("zoom", 1.0)))),
+                "panX":   float(t.get("panX", 0.0)),
+                "panY":   float(t.get("panY", 0.0)),
+                "rotate": int(t.get("rotate", 0)) % 360,
+            }
+        raw_rois = d.get("tracker_rois") or {}
+        tracker_rois = {}
+        for src, r in raw_rois.items():
+            if isinstance(r, (list, tuple)) and len(r) == 4:
+                tracker_rois[str(src)] = [max(0.0, min(1.0, float(v))) for v in r]
+        return {
+            "cameras":        [str(s) for s in (d.get("cameras") or [])][:4],
+            "line_y_ratio":   float(d.get("line_y_ratio", 0.5)),
+            "line_y_ratios":  {str(k): max(0.05, min(0.95, float(v)))
+                               for k, v in (d.get("line_y_ratios") or {}).items()},
+            "cam_transforms": cam_transforms,
+            "tracker_rois":   tracker_rois,
+        }
+    except Exception:
+        return {"cameras": [], "line_y_ratio": 0.5, "line_y_ratios": {}, "cam_transforms": {}, "tracker_rois": {}}
+
+
+def _save_tracker_config(config):
+    with open(TRACKER_CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
 
 
 def _resolved_camera_url(cam, base_url):
@@ -322,7 +361,7 @@ _ENGINE_KWARGS = dict(
     known_dir=FACES_DIR,
     detector="retinaface",
     model="buffalo_l",
-    threshold=0.55,
+    threshold=0.6,
     detect_every=10,
     detect_scale=float(os.getenv("DETECT_SCALE", "0.5")),
     tracker_type="CSRT",
@@ -337,6 +376,7 @@ _ENGINE_KWARGS = dict(
     # are always annotated regardless of this flag.
     live_annotations=_env_bool("LIVE_ANNOTATIONS_ENABLED", True),
     min_face_size=int(os.getenv("MIN_FACE_SIZE", "10")),
+    tracker_snapshots_dir=TRACKER_SNAPSHOTS_DIR,
 )
 
 # Module-level placeholder so route handlers (which only resolve `engine`
@@ -464,6 +504,12 @@ def _engine_watchdog():
                             if pool:
                                 engine.cam_index = pool
                             _refresh_source_name_map()
+                            _cam_urls = sorted(set(
+                                url for _, _, url in _expanded_cameras(_load_ip_cameras())
+                            ))
+                            if _cam_urls:
+                                engine.set_grid_layout(2, 2)
+                                engine.set_viewer(mode="single", source=_cam_urls[0])
                             engine.start()
                             log.info("engine watchdog: auto-resumed camera grid")
                 except Exception:
@@ -476,10 +522,13 @@ state_lock = threading.Lock()
 # Attendance state (in-memory, per server run)
 attendance_lock = threading.Lock()
 attendance_state = {}  # name -> {attended: bool, first_seen_ts: float, last_seen_mono: float, present: bool}
-attendance_events_q = Queue(maxsize=200)
+attendance_events_q    = Queue(maxsize=200)
+tracker_events_q       = Queue(maxsize=500)
+_tracker_active_t      = 0.0   # monotonic timestamp of last tracker ping
+_TRACKER_ACTIVE_TTL    = 8.0   # seconds; tracker considered active if pinged within this window
 ATTENDANCE_LOOP_SECS = 0.3
 ATTENDANCE_DISAPPEAR_SECS = 2.0
-UNKNOWN_PROMPT_SECS = 10.0
+UNKNOWN_PROMPT_SECS = 5.0
 UNKNOWN_RESET_GRACE_SECS = 1.5
 VISIT_TIMEOUT_MINUTES = int(os.getenv("VISIT_TIMEOUT_MINUTES", "10"))
 VISIT_STALE_CHECK_SECS = 30.0  # how often to check for stale visits
@@ -520,6 +569,7 @@ def _bootstrap_post_engine():
     threading.Thread(target=_attendance_loop, daemon=True).start()
     threading.Thread(target=_qr_loop, daemon=True).start()
     threading.Thread(target=_daily_report_scheduler_loop, daemon=True, name="daily-report-scheduler").start()
+    threading.Thread(target=_tracker_poll_loop, daemon=True, name="tracker-poll").start()
     try:
         _rc = _load_reports_config()
         _hp = [s for s in [_rc.get("arrival_camera", ""), _rc.get("exit_camera", "")] if s]
@@ -528,6 +578,15 @@ def _bootstrap_post_engine():
             log.info("High-priority gate cameras registered: %s", _hp)
     except Exception as _e:
         log.warning("Could not set high_priority_sources: %s", _e)
+    try:
+        _tc = _load_tracker_config()
+        if _tc["cameras"]:
+            engine.set_tracker_cameras(_tc["cameras"])
+            engine.set_config({"tracker_line_y_ratios": _tc.get("line_y_ratios", {}),
+                               "tracker_rois": _tc.get("tracker_rois", {})})
+            log.info("Tracker cameras configured: %s", _tc["cameras"])
+    except Exception as _e:
+        log.warning("tracker camera init: %s", _e)
 
     # Auto-start: cycle through all IP cameras every 3 minutes
     try:
@@ -553,29 +612,10 @@ def _bootstrap_post_engine():
             with state_lock:
                 engine.cam_index = pool
                 engine.set_grid_layout(2, 2)
-                engine.set_viewer(mode="grid", source="", grid_offset=0)
+                engine.set_viewer(mode="single", source=_all_camera_urls[0])
                 engine.start()
-            log.info("engine auto-started: grid of %d cameras (2x2 viewer, auto-page every 30s)",
+            log.info("engine auto-started: pool of %d cameras, viewer on first camera",
                      len(_all_camera_urls))
-
-            # Lightweight auto-pager — advances the viewport every 30s
-            # without stopping or restarting the engine.
-            def _auto_pager():
-                PAGE_INTERVAL = 30
-                while True:
-                    time.sleep(PAGE_INTERVAL)
-                    try:
-                        page_size = engine.grid_page_size()
-                        n_pages = engine.grid_page_count()
-                        if n_pages <= 1:
-                            continue
-                        cur_offset = int(getattr(engine, 'viewer_grid_offset', 0))
-                        next_page = ((cur_offset // page_size) + 1) % n_pages
-                        engine.set_viewer(grid_offset=next_page * page_size)
-                    except Exception as _e:
-                        log.warning("auto-pager error: %s", _e)
-
-            threading.Thread(target=_auto_pager, daemon=True, name="auto-pager").start()
     except Exception as _e:
         log.warning("auto-start failed: %s", _e)
 
@@ -810,6 +850,46 @@ def _attendance_loop():
         time.sleep(ATTENDANCE_LOOP_SECS if running else 1.0)
 
 
+def _tracker_poll_loop():
+    """Poll the engine for tracker crossing events, persist to DB, and broadcast via SSE."""
+    os.makedirs(TRACKER_SNAPSHOTS_DIR, exist_ok=True)
+    while True:
+        try:
+            if engine is not None and engine.is_running():
+                for ev in engine.pop_tracker_crossing_events():
+                    cam_name = (engine.source_name_map or {}).get(
+                        ev.get("camera_source", ""), ev.get("camera_source", "")
+                    )
+                    row_id = None
+                    try:
+                        row_id = db.insert_tracker_event(
+                            event_type=ev["direction"],
+                            person_name=ev.get("name", "unknown"),
+                            camera_source=ev.get("camera_source", ""),
+                            camera_name=cam_name,
+                            snapshot_path=ev.get("snapshot_path"),
+                            confidence=float(ev.get("best", 0.0)),
+                        )
+                    except Exception as _e:
+                        log.warning("tracker DB insert: %s", _e)
+                    payload = {
+                        "id":           row_id,
+                        "event_type":   ev.get("direction"),
+                        "person_name":  ev.get("name", "unknown"),
+                        "camera_name":  cam_name,
+                        "snapshot_url": f"/{ev['snapshot_path']}" if ev.get("snapshot_path") else None,
+                        "confidence":   float(ev.get("best", 0.0)),
+                        "occurred_at":  datetime.now(timezone.utc).isoformat(),
+                    }
+                    try:
+                        tracker_events_q.put_nowait({"event": "crossing", "data": payload})
+                    except Exception:
+                        pass
+        except Exception as _e:
+            log.debug("tracker_poll_loop: %s", _e)
+        time.sleep(0.5)
+
+
 def _update_attendance_from_tracks(tracks):
     """Update attendance_state and DB visits based on current recognized tracks.
 
@@ -950,7 +1030,13 @@ def _handle_gate_event(person_name, camera_source):
         if exit_cam and camera_source == exit_cam:
             db.open_gate_exit(person_name, now_dt)
         elif arrival_cam and camera_source == arrival_cam:
-            db.close_gate_entry(person_name, now_dt)
+            # Try to close an open exit event (normal two-camera flow).
+            closed = db.close_gate_entry(person_name, now_dt)
+            if closed is None:
+                # No open exit event — exit camera may be offline.
+                # Write a standalone arrival record so the report still shows
+                # arrival time even without exit-camera data.
+                db.write_arrival_event(person_name, now_dt)
     except Exception as e:
         log.debug("gate_event error for %s on %s: %s", person_name, camera_source, e)
 
@@ -1445,6 +1531,12 @@ def mjpeg_generator():
     interval = 1.0 / max(1, getattr(engine, "out_fps", 15))
 
     while engine.is_running():
+        # When the tracker page is active, throttle the composite stream to
+        # 1 fps to free bandwidth for per-camera streams.
+        if time.monotonic() - _tracker_active_t < _TRACKER_ACTIVE_TTL:
+            time.sleep(1.0)
+            continue
+
         frame = engine.get_jpeg()
         if frame is None:
             time.sleep(0.05)
@@ -1528,7 +1620,10 @@ def video_camera(source):
             ok, buf = _cv2.imencode(".jpg", img, [_cv2.IMWRITE_JPEG_QUALITY, 60])
             return bytes(buf) if ok else b""
 
-        NO_SIGNAL_TIMEOUT = 2.0  # seconds before yielding a placeholder frame
+        # Tracker cameras are pinned/high-priority — give them much longer before
+        # showing "No Signal" so a brief reconnect doesn't flash the placeholder.
+        _tracker_srcs = set(getattr(engine, "tracker_camera_sources", set()) or set())
+        NO_SIGNAL_TIMEOUT = 30.0 if source in _tracker_srcs else 2.0
         interval = 1.0 / max(1, getattr(engine, "out_fps", 15))
         last_id = None
         last_frame_t = time.monotonic()
@@ -1698,6 +1793,33 @@ def api_people():
         p["arabic_name"]  = m.get("arabic_name", "")
         p["home_zone_id"] = m.get("home_zone_id")
     return jsonify({"people": people})
+
+
+@app.route("/api/attendance/manual", methods=["POST"])
+def api_manual_attendance():
+    data = request.get_json(silent=True) or {}
+    date_str   = (data.get("date")    or "").strip()
+    arrived_str = (data.get("arrived") or "09:00").strip()
+    left_str    = (data.get("left")    or "17:00").strip()
+    names = data.get("names") or []
+    if not date_str or not names:
+        return jsonify({"ok": False, "error": "date and names are required"}), 400
+    try:
+        day = datetime.strptime(date_str, "%Y-%m-%d").date()
+        arr_h, arr_m = map(int, arrived_str.split(":"))
+        lft_h, lft_m = map(int, left_str.split(":"))
+    except (ValueError, AttributeError):
+        return jsonify({"ok": False, "error": "Invalid date or time format"}), 400
+    first_seen = datetime(day.year, day.month, day.day, arr_h, arr_m).strftime("%Y-%m-%d %H:%M:%S")
+    last_seen  = datetime(day.year, day.month, day.day, lft_h, lft_m).strftime("%Y-%m-%d %H:%M:%S")
+    count = 0
+    for name in names:
+        name = str(name).strip()
+        if not name:
+            continue
+        db.insert_manual_visit(name, first_seen, last_seen)
+        count += 1
+    return jsonify({"ok": True, "count": count})
 
 
 @app.route("/api/sections", methods=["GET"])
@@ -3032,13 +3154,24 @@ def history_page():
 
 
 def _to_dt(val):
-    """Convert a value to datetime — handles both datetime objects and ISO strings."""
+    """Convert a value to datetime — handles both datetime objects and ISO strings.
+
+    Timestamps are stored as bare local-time strings (no tzinfo suffix).
+    fromisoformat() returns a naive datetime; we attach the local timezone so
+    that .astimezone() calls elsewhere produce the correct local time instead
+    of shifting by the UTC offset.
+    """
     if val is None:
         return None
     if isinstance(val, datetime):
+        if val.tzinfo is None:
+            return val.astimezone()  # attach local tz
         return val
     if isinstance(val, str):
-        return datetime.fromisoformat(val)
+        dt = datetime.fromisoformat(val)
+        if dt.tzinfo is None:
+            dt = dt.astimezone()  # treat bare string as local time
+        return dt
     return val
 
 
@@ -3287,6 +3420,117 @@ def attendance_stream():
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+# ── Camera Tracker ───────────────────────────────────────────────────────────
+
+@app.route("/tracker")
+def tracker_page():
+    return render_template("tracker.html", api_key=API_KEY)
+
+
+@app.route("/api/tracker/config", methods=["GET"])
+def api_tracker_config_get():
+    cfg = _load_tracker_config()
+    nm  = engine.source_name_map if engine else {}
+    return jsonify({
+        "cameras":        [{"source": s, "name": nm.get(s, s)} for s in cfg["cameras"]],
+        "line_y_ratio":   cfg["line_y_ratio"],
+        "line_y_ratios":  cfg.get("line_y_ratios", {}),
+        "cam_transforms": cfg.get("cam_transforms", {}),
+        "tracker_rois":   cfg.get("tracker_rois", {}),
+    })
+
+
+@app.route("/api/tracker/config", methods=["POST"])
+def api_tracker_config_set():
+    payload = request.get_json(silent=True) or {}
+    cameras = [str(s).strip() for s in (payload.get("cameras") or []) if str(s).strip()][:4]
+    line_y  = max(0.05, min(0.95, float(payload.get("line_y_ratio", 0.5))))
+    # Per-camera line positions: {source: ratio}
+    raw_ratios = payload.get("line_y_ratios") or {}
+    line_y_ratios = {str(k): max(0.05, min(0.95, float(v)))
+                     for k, v in raw_ratios.items() if str(k) and v is not None}
+    known   = set(_all_configured_sources())
+    invalid = [c for c in cameras if c not in known]
+    if invalid:
+        return jsonify({"ok": False, "error": f"Unknown camera sources: {invalid}"}), 400
+    raw_transforms = payload.get("cam_transforms") or {}
+    cam_transforms = {}
+    for src, t in raw_transforms.items():
+        if not isinstance(t, dict):
+            continue
+        cam_transforms[str(src)] = {
+            "zoom":   max(0.5, min(8.0, float(t.get("zoom", 1.0)))),
+            "panX":   float(t.get("panX", 0.0)),
+            "panY":   float(t.get("panY", 0.0)),
+            "rotate": int(t.get("rotate", 0)) % 360,
+        }
+    raw_rois = payload.get("tracker_rois") or {}
+    tracker_rois = {}
+    for src, r in raw_rois.items():
+        if isinstance(r, (list, tuple)) and len(r) == 4:
+            tracker_rois[str(src)] = [max(0.0, min(1.0, float(v))) for v in r]
+    cfg = {"cameras": cameras, "line_y_ratio": line_y, "line_y_ratios": line_y_ratios,
+           "cam_transforms": cam_transforms, "tracker_rois": tracker_rois}
+    try:
+        _save_tracker_config(cfg)
+    except Exception as _e:
+        return jsonify({"ok": False, "error": str(_e)}), 500
+    try:
+        if engine:
+            engine.set_tracker_cameras(cameras)
+            engine.set_config({"tracker_line_y_ratios": line_y_ratios,
+                               "tracker_rois": tracker_rois})
+    except Exception as _e:
+        log.warning("set_tracker_cameras: %s", _e)
+    return jsonify({"ok": True, "config": cfg})
+
+
+@app.route("/api/tracker/events")
+def api_tracker_events():
+    if not db.is_available():
+        return jsonify({"ok": False, "error": "database not available"}), 503
+    limit  = min(int(request.args.get("limit", 200)), 500)
+    offset = int(request.args.get("offset", 0))
+    rows   = db.get_tracker_events(limit=limit, offset=offset)
+    for r in rows:
+        r["snapshot_url"] = f"/{r['snapshot_path']}" if r.get("snapshot_path") else None
+    return jsonify({"ok": True, "events": rows})
+
+
+@app.route("/api/tracker/ping", methods=["POST"])
+def api_tracker_ping():
+    """Keep-alive from the tracker page. Marks tracker as active so the main
+    composite stream yields bandwidth to per-camera streams."""
+    global _tracker_active_t
+    _tracker_active_t = time.monotonic()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/tracker/stream")
+def api_tracker_stream():
+    def gen():
+        try:
+            rows = db.get_tracker_events(limit=20)
+            for r in rows:
+                r["snapshot_url"] = f"/{r['snapshot_path']}" if r.get("snapshot_path") else None
+            yield f"event: snapshot\ndata: {json.dumps(rows)}\n\n"
+        except Exception:
+            pass
+        while True:
+            try:
+                msg = tracker_events_q.get(timeout=20)
+            except Empty:
+                yield ": ping\n\n"
+                continue
+            yield f"event: {msg['event']}\ndata: {json.dumps(msg['data'])}\n\n"
+
+    return Response(
+        stream_with_context(gen()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -3801,8 +4045,6 @@ def _generate_gate_report(arrival_camera, exit_camera, date_from, date_to,
         for row in db._rows_to_dicts(cur.fetchall()):
             fs = _to_dt(row["first_seen"])
             if fs:
-                if fs.tzinfo is None:
-                    fs = fs.replace(tzinfo=timezone.utc)
                 day = fs.astimezone().strftime("%Y-%m-%d")
                 arrival_map[row["person_name"]][day] = fs.astimezone().strftime("%H:%M")
 
@@ -3873,8 +4115,6 @@ def _generate_gate_report(arrival_camera, exit_camera, date_from, date_to,
                     try:
                         dt = _to_dt(str(ts))
                         if dt:
-                            if dt.tzinfo is None:
-                                dt = dt.replace(tzinfo=timezone.utc)
                             return dt.astimezone().strftime("%H:%M")
                     except Exception:
                         pass

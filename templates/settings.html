@@ -570,7 +570,17 @@
             <div id="reportResultsCard" class="rounded-xl border border-slate-800 bg-slate-900 hidden">
               <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
                 <div class="font-medium" id="reportResultsTitle">Daily Gate Report</div>
-                <div id="reportSummaryBadges" class="flex gap-2 text-xs"></div>
+                <div class="flex items-center gap-3">
+                  <div id="reportSummaryBadges" class="flex gap-2 text-xs"></div>
+                  <button onclick="exportReportExcel()" class="px-3 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-xs font-medium text-white flex items-center gap-1">
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+                    Excel
+                  </button>
+                  <button onclick="exportReportPDF()" class="px-3 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-600 text-xs font-medium text-white flex items-center gap-1">
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>
+                    PDF
+                  </button>
+                </div>
               </div>
               <!-- Filter row -->
               <div class="px-4 pt-3 flex gap-2 items-center flex-wrap">
@@ -3458,6 +3468,105 @@
         </td>
       </tr>`;
     }).join("");
+  }
+
+  function _getFilteredRows() {
+    const shiftFilter = (document.getElementById("filterShift")?.value) || "";
+    let rows = _reportRecords;
+    if (_reportFilter === "present") rows = rows.filter(r => !r.absent);
+    if (_reportFilter === "absent")  rows = rows.filter(r => r.absent);
+    if (_reportFilter === "late")    rows = rows.filter(r => !r.absent && (r.arrived_late || r.late_exits_count > 0));
+    if (_reportFilter === "ontime")  rows = rows.filter(r => !r.absent && !r.arrived_late && r.late_exits_count === 0);
+    if (shiftFilter) rows = rows.filter(r => r.absent || (r.shift || "morning") === shiftFilter);
+    return rows;
+  }
+
+  function _rowStatus(r) {
+    if (r.absent) return "Absent";
+    const parts = [];
+    if (r.arrived_late) parts.push(`Late +${r.late_arrival_minutes}m`);
+    if (r.late_exits_count) parts.push(`${r.late_exits_count} late exit(s)`);
+    return parts.join(", ") || "On Time";
+  }
+
+  function exportReportExcel() {
+    const rows = _getFilteredRows();
+    const title = document.getElementById("reportResultsTitle").textContent;
+    const headers = ["Person", "Date", "Shift", "Arrival", "Last Exit", "Total Out (min)", "Status"];
+    const csvRows = [
+      [title],
+      headers,
+      ...rows.map(r => [
+        r.person,
+        r.date,
+        r.shift === "night" ? "Night" : "Morning",
+        r.arrival || "—",
+        r.last_exit || "—",
+        r.total_outside_minutes || 0,
+        _rowStatus(r)
+      ])
+    ];
+    const csv = csvRows.map(row =>
+      row.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",")
+    ).join("\r\n");
+    const blob = new Blob(["﻿" + csv, ], { type: "text/csv;charset=utf-8;" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${title.replace(/[^a-z0-9]/gi, "_")}.csv`;
+    a.click();
+  }
+
+  function exportReportPDF() {
+    const rows = _getFilteredRows();
+    const title = document.getElementById("reportResultsTitle").textContent;
+    const badges = document.getElementById("reportSummaryBadges").textContent.trim();
+
+    const tableRows = rows.map(r => {
+      const status = _rowStatus(r);
+      const statusColor = r.absent ? "#94a3b8" : (r.arrived_late || r.late_exits_count > 0) ? "#f87171" : "#34d399";
+      const exitsText = r.exits && r.exits.length
+        ? r.exits.map(e => `${e.out_at}→${e.back_at}(${e.duration_minutes ?? "..."}m)`).join(", ")
+        : "—";
+      return `<tr>
+        <td>${r.person}</td>
+        <td>${r.date}</td>
+        <td>${r.shift === "night" ? "Night" : "Morning"}</td>
+        <td>${r.arrival || "—"}</td>
+        <td>${r.last_exit || "—"}</td>
+        <td>${exitsText}</td>
+        <td>${r.total_outside_minutes || "—"}</td>
+        <td style="color:${statusColor};font-weight:600">${status}</td>
+      </tr>`;
+    }).join("");
+
+    const html = `<!DOCTYPE html><html><head><meta charset="utf-8">
+    <title>${title}</title>
+    <style>
+      body { font-family: Arial, sans-serif; font-size: 11px; color: #111; margin: 20px; }
+      h2 { font-size: 15px; margin-bottom: 4px; }
+      .meta { font-size: 10px; color: #666; margin-bottom: 12px; }
+      table { width: 100%; border-collapse: collapse; }
+      th { background: #1e293b; color: #fff; padding: 6px 8px; text-align: left; font-size: 10px; text-transform: uppercase; }
+      td { padding: 5px 8px; border-bottom: 1px solid #e2e8f0; vertical-align: top; }
+      tr:nth-child(even) td { background: #f8fafc; }
+      @media print { body { margin: 0; } }
+    </style></head><body>
+    <h2>${title}</h2>
+    <div class="meta">${badges} &nbsp;|&nbsp; Exported: ${new Date().toLocaleString()}</div>
+    <table>
+      <thead><tr>
+        <th>Person</th><th>Date</th><th>Shift</th><th>Arrival</th>
+        <th>Last Exit</th><th>Exits</th><th>Total Out</th><th>Status</th>
+      </tr></thead>
+      <tbody>${tableRows}</tbody>
+    </table>
+    </body></html>`;
+
+    const win = window.open("", "_blank");
+    win.document.write(html);
+    win.document.close();
+    win.focus();
+    setTimeout(() => win.print(), 400);
   }
 
   async function sendDailyReport(to) {

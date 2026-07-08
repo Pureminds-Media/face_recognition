@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Face Recognition
+Comment=Start Face Recognition Camera System
+Exec=gnome-terminal -- bash -c "cd /home/main/Repos/face_recognition && source .venv/bin/activate && python app.py; exec bash"
+Icon=camera-web
+Terminal=false
+Categories=System;

@@ -57,6 +57,8 @@ Core attendance table. One row per continuous presence of one person at one came
 | `activity` | TEXT | TEXT | Most frequent CLIP action label |
 | `branch` | TEXT NOT NULL DEFAULT 'Riyadh' | TEXT NOT NULL DEFAULT 'Riyadh' | Auto-assigned from the camera's IP group |
 
+Rows can also be created directly via `db.insert_manual_visit()` for manual attendance backfill (see [Manual Attendance](documentation.md#18-manual-attendance)) — these have `location_id = NULL`, are inserted already `ended = true`, and `confidence = 1.0`.
+
 **Indexes:**
 
 | Index | Columns | Condition |
@@ -144,6 +146,28 @@ Records exit/entry pairs through the two designated gate cameras. Written live a
 - A row is **opened** (only `exit_time` set) each time a person is detected on the exit camera.
 - The most-recent open row for that person is **closed** (`entry_time` + `duration_minutes`) when they appear on the arrival camera.
 - If they leave again before returning, a new row is opened — multiple rows per person per day are expected.
+- If a person appears on the arrival camera with **no open exit row** (e.g. the exit camera is offline), `write_arrival_event()` writes a standalone row where `exit_time == entry_time` and `duration_minutes = 0`, so the arrival time still surfaces in the gate report. Skipped if an open exit row already exists, or if a standalone arrival was already written for that person in the last 30 minutes.
+
+---
+
+### `tracker_events`
+
+Line-crossing events from the [Camera Tracker](documentation.md#17-camera-tracker-line-crossing) page (`/tracker`) — a separate people-counting feature from `visits`/`gate_events`.
+
+| Column | SQLite type | PG type | Notes |
+|--------|------------|---------|-------|
+| `id` | INTEGER PK AUTOINCREMENT | BIGSERIAL PK | |
+| `event_type` | TEXT NOT NULL | TEXT NOT NULL | `enter` or `exit` |
+| `person_name` | TEXT NOT NULL | TEXT NOT NULL | Recognised name, or `"unknown"` |
+| `camera_source` | TEXT NOT NULL | TEXT NOT NULL | RTSP URL |
+| `camera_name` | TEXT NOT NULL DEFAULT '' | TEXT NOT NULL DEFAULT '' | Resolved display name at event time |
+| `occurred_at` | TEXT NOT NULL | TIMESTAMPTZ NOT NULL DEFAULT NOW() | |
+| `snapshot_path` | TEXT | TEXT | Nullable; relative path under `static/tracker_snapshots/` |
+| `confidence` | REAL NOT NULL DEFAULT 0.0 | FLOAT NOT NULL DEFAULT 0.0 | Track's best cosine distance at crossing time |
+
+**Indexes:** `idx_tracker_events_occurred` on `occurred_at DESC`, `idx_tracker_events_person` on `person_name`.
+
+`db.delete_tracker_events_before(cutoff_iso)` exists for retention cleanup but is not currently wired to a scheduler.
 
 ---
 
@@ -206,6 +230,9 @@ gate_events
 
 daily_reports
    (standalone snapshot, no FK relations)
+
+tracker_events
+   (standalone; camera_source/person_name are informational, no FK)
 ```
 
 **Soft links** (not enforced by FK constraints): `people.name` ↔ `visits.person_name`, `people.section` ↔ `sections.name`, `gate_events.person_name` ↔ `people.name`, `sections.manager` ↔ `people.name`. These are kept consistent in application code rather than by the database.
@@ -231,6 +258,7 @@ Additive migrations run at startup inside `init_db()` using `ALTER TABLE … ADD
 | `people.home_zone_id` | Added if missing; FK to `zones.id` |
 | `zones` table | Created if missing |
 | `zone_cameras` table | Created if missing |
+| `tracker_events` table | Created if missing |
 
 ---
 
@@ -243,5 +271,7 @@ Some state is stored as files alongside the database:
 | `ip_cameras.json` | Camera groups, channel numbers, resolved RTSP URLs |
 | `reports_config.json` | Arrival/exit camera URLs, work hours, email config |
 | `grid_config.json` | Grid layout and slot assignments |
+| `tracker_config.json` | Camera Tracker: assigned cameras, line positions, per-camera pan/zoom/rotate transforms, ROIs |
 | `faces/<name>/*.jpg` | Enrolled face images |
 | `faces/<name>/.arcface.npz` | Cached ArcFace embeddings (auto-generated) |
+| `static/tracker_snapshots/*.jpg` | Annotated crossing-event snapshots (auto-generated) |

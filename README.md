@@ -28,6 +28,9 @@ Uses InsightFace (RetinaFace + ArcFace, ONNX Runtime GPU) for face detection and
 - **Zones** — Named camera zones with per-zone camera assignments. People can be given a home zone; the zone status API shows who is present vs. away in real time.
 - **History dashboard** — Visit history across four views: Attendance (first/last seen per person per day), Daily Summary, Per Person, and Per Location — all with footage playback. All date pickers display as dd-mm-yyyy.
 - **Analytics dashboard** — Top 10 Earliest Arrivals (by day), Top 10 Latest Arrivals (by day), and Top 10 Longest Working shown as an interactive horizontal bar chart (hover for duration tooltip), all filterable by period.
+- **Manual attendance** — "Add Manual" tab lets an admin backfill a person's attendance for a day (arrival/departure time) without a camera detection.
+- **Camera Tracker** — Separate `/tracker` page for counting line-crossings on up to 4 pinned cameras, independent of visit tracking. See [documentation.md](documentation.md#17-camera-tracker-line-crossing) for setup details.
+- **Gate report export** — Excel (CSV) and print-to-PDF export buttons for the daily gate report in Settings → Reports.
 - **SSE attendance stream** — Real-time attendance events via Server-Sent Events
 
 ## Requirements
@@ -159,12 +162,14 @@ templates/
   index.html            # Main dashboard UI (live feed, camera controls)
   history.html          # Visit history dashboard
   people.html           # People management (view, rename, delete, transfer)
+  tracker.html          # Camera Tracker page (line-crossing setup + live feed)
 faces/                  # Enrolled face images (per-person subdirectories)
 footage/                # Recorded visit footage (MP4) — or a NAS mount path via FOOTAGE_DIR
 models/
   head-yolov8n-onnx/    # YOLOv8n head detector ONNX model (~12MB)
   clip-vit-base-patch32-onnx/  # CLIP ViT-B/32 ONNX model (~600MB)
 grid_config.json        # Saved grid layout + camera slot assignments
+tracker_config.json     # Camera Tracker: assigned cameras, line positions, transforms, ROIs
 hw_capture.py           # NVDEC-accelerated RTSP capture wrapper (cv2.VideoCapture-compatible)
 docker-compose.yml      # Optional PostgreSQL via Docker (not required for SQLite)
 .env                    # Environment configuration (not committed)
@@ -230,9 +235,14 @@ See [api.md](api.md) for the full endpoint reference. Summary:
 | `/api/reports/history/<date>/export` | GET | Download report as CSV |
 | `/api/engine/config` | GET/POST | Get or update engine tuning parameters |
 | `/api/advanced/config` | GET/POST | Get or update shift time configuration |
+| `/api/attendance/manual` | POST | Backfill manual attendance for a day |
+| `/api/tracker/config` | GET/POST | Get or update Camera Tracker cameras/lines/ROIs |
+| `/api/tracker/events` | GET | Paginated tracker crossing-event history |
+| `/api/tracker/stream` | GET | SSE stream of tracker crossing events |
 | `/history` | GET | History dashboard page |
 | `/people` | GET | People management page |
 | `/settings` | GET | Settings page |
+| `/tracker` | GET | Camera Tracker setup + live event feed page |
 
 ## Tuning
 
@@ -244,7 +254,7 @@ Key parameters in `app.py` engine initialization:
 | `detect_scale` | `0.5` | Scale factor applied to frames before detection (lower = faster, less accurate). Env-configurable via `DETECT_SCALE`. |
 | `width` / `height` | `1280` / `720` | Camera resolution |
 | `out_fps` | `15` | Target FPS for MJPEG stream and footage |
-| `threshold` | `0.5` | Cosine distance threshold for ArcFace face matching. Below this distance → recognised as that person. Raise (toward 0.6) if same person is being mis-labeled "unknown"; lower (toward 0.4) if different people are being collapsed together. |
+| `threshold` | `0.6` | Cosine distance threshold for ArcFace face matching. Below this distance → recognised as that person. Raise if same person is being mis-labeled "unknown"; lower (toward 0.4) if different people are being collapsed together. |
 | `tracker_type` | `CSRT` | OpenCV tracker (`CSRT` or `KCF`) |
 | `INFERENCE_POOL_SIZE` | `6` | Number of parallel InsightFace instances. Each costs ~300–400 MB VRAM. On an 8 GB GPU running 20+ cameras, keep at 6 or below — higher values cause VRAM exhaustion and SIGSEGV crashes. |
 
@@ -253,12 +263,13 @@ Key parameters in `app.py` engine initialization:
 When `AUTO_CAPTURE_ENABLED=true`:
 
 1. An unrecognised face is tracked. The engine keeps the largest crop seen during the tracking window as the "best frame".
-2. After **5 seconds** of continuous tracking (`_unknown_capture_min_seconds`), the best frame is gated through a quality check — InsightFace must re-detect a face in that crop with `det_score ≥ 0.50` and dimensions `≥ 60×60 px`. Crops that fail (motion blur, profile shots, tracker drift onto hands/shoulders) are silently rejected and we wait for a better frame on the next track.
-3. On pass: the crop is saved to `faces/unknown_N/1.jpg` and the track is promoted to `unknown_N`.
-4. **Bootstrap sample accumulation:** for the first 10 frames after enrolment, additional samples are saved with only a 5-second per-camera cooldown (instead of the steady-state 10 minutes). This builds a diverse averaged template fast, fixing the "single-frame template never matches re-appearances" failure mode.
-5. After the bootstrap phase the per-camera cooldown reverts to 10 minutes; a different camera's view of the same person is always allowed immediately. Maximum 30 images per person, 150 auto-captured `unknown_N` folders total.
-6. Tracks that lose recognition for 12 consecutive frames (~3.6 s at default cadence) are demoted from `unknown_N` back to "unknown" and become eligible for new enrolment. This patience window is what prevents one person from generating dozens of duplicate folders.
-7. Use the **People** page (`/people`) to rename `unknown_N` entries to real names, or delete false captures.
+2. `_unknown_capture_min_seconds` (currently `0`, temporarily lowered from `1.5` for testing) gates how long a track must be held before the best frame is captured.
+3. **Temporarily disabled:** the InsightFace re-detection quality gate (`det_score ≥ 0.50`, min face size) is off for testing — crops save directly once they're ≥ 64×64 px. Re-enable it for production use to avoid false enrolments from motion blur / profile shots / tracker drift.
+4. On pass: the crop is saved to `faces/unknown_N/1.jpg` and the track is promoted to `unknown_N`.
+5. **Bootstrap sample accumulation:** for the first 10 frames after enrolment, additional samples are saved with only a 5-second per-camera cooldown (instead of the steady-state 10 minutes). This builds a diverse averaged template fast, fixing the "single-frame template never matches re-appearances" failure mode.
+6. After the bootstrap phase the per-camera cooldown reverts to 10 minutes; a different camera's view of the same person is always allowed immediately. Maximum 30 images per person, 150 auto-captured `unknown_N` folders total, up to 10 simultaneous unknown tracks per camera (temporarily raised from 3).
+7. Tracks that lose recognition for 5 consecutive misses (raised from 3) are dropped from tracking.
+8. Use the **People** page (`/people`) to rename `unknown_N` entries to real names, or delete false captures.
 
 Designed for **small, controlled environments** (offices, labs). Disable it for large public spaces where many strangers would quickly fill the 150-slot cap.
 

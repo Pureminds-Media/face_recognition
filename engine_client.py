@@ -157,6 +157,7 @@ class EngineClient:
     _MIRRORED = {
         "cam_index", "viewer_source", "viewer_mode", "viewer_grid_offset",
         "_grid_layout", "activity_enabled", "source_name_map",
+        "tracker_camera_sources",
     }
 
     def __getattr__(self, name):
@@ -174,3 +175,16 @@ class EngineClient:
             object.__setattr__(self, name, value)
             return
         self._call("setattr", name, value)
+
+    # ---------- tracker ----------
+
+    def pop_tracker_crossing_events(self):
+        """Drain pending crossing events from shared state. Returns list."""
+        events = list(self._state.get("tracker_crossing_events", []) or [])
+        if events:
+            self._state["tracker_crossing_events"] = []
+        return events
+
+    def set_tracker_cameras(self, sources):
+        """Tell the engine which camera sources have tracker crossing detection enabled."""
+        self._call("set_config", {"tracker_camera_sources": list(sources)})

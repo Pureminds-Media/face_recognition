@@ -188,6 +188,7 @@ class RtspConnectionPool:
         self._lock = threading.Lock()
         self._active: set = set()     # source keys currently holding a slot
         self._lru: list = []          # sources ordered LRU-first
+        self._pinned: set = set()     # sources immune to LRU eviction
 
     @property
     def active_sources(self) -> list:
@@ -210,8 +211,11 @@ class RtspConnectionPool:
             if source in self._active:
                 self._touch_locked(source)
                 return False
-            while len(self._active) >= self._max and self._lru:
-                evict = self._lru.pop(0)
+            # Evict LRU candidates that are not pinned
+            candidates = [s for s in self._lru if s not in self._pinned]
+            while len(self._active) >= self._max and candidates:
+                evict = candidates.pop(0)
+                self._lru.remove(evict)
                 self._active.discard(evict)
                 evicted.append(evict)
             self._active.add(source)
@@ -248,6 +252,21 @@ class RtspConnectionPool:
                     self._on_evict(e)
                 except Exception:
                     pass
+
+    def pin(self, source: str) -> None:
+        """Mark *source* as immune to LRU eviction. Acquires a slot if needed."""
+        with self._lock:
+            self._pinned.add(source)
+
+    def unpin(self, source: str) -> None:
+        """Remove the eviction immunity for *source*."""
+        with self._lock:
+            self._pinned.discard(source)
+
+    def set_pinned(self, sources) -> None:
+        """Replace the entire pinned set."""
+        with self._lock:
+            self._pinned = set(sources)
 
     def _touch_locked(self, source: str) -> None:
         self._lru.remove(source)
@@ -408,7 +427,7 @@ class FaceEngine:
         # Save an unknown after they've been tracked continuously for this
         # many seconds. Time-based (not detection-count-based) so cadence
         # changes / lock contention don't affect when capture fires.
-        self._unknown_capture_min_seconds = 3.0
+        self._unknown_capture_min_seconds = 0
         self._unknown_max_auto = 150  # max unknown_N folders
         # After an unknown_N is created, keep adding sample images while
         # the same track is still in frame, up to this cap. More samples
@@ -443,6 +462,16 @@ class FaceEngine:
         # Janitor thread handle.
         self._janitor_t = None
         self._janitor_stop = threading.Event()
+
+        # Tracker: line-crossing detection state.
+        import collections as _collections
+        self._tracker_crossing_queue      = _collections.deque(maxlen=100)
+        self._tracker_crossing_queue_lock = threading.Lock()
+        self._tracker_cross_state         = {}  # keyed by (camera_source_str, _tid)
+        self._tracker_cross_state_lock    = threading.Lock()
+        self.tracker_camera_sources       = set()   # updated via set_config()
+        self._tracker_line_y_ratios       = {}      # {source: float} per-camera line position
+        self._tracker_rois                = {}      # {source: (rx,ry,rw,rh)} normalized 0-1
 
     # ---------- public ----------
     # Number of parallel InsightFace instances. buffalo_l costs ~1.2–1.5 GB VRAM
@@ -931,6 +960,13 @@ class FaceEngine:
         ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.viewer_jpeg_quality])
         return bytes(buf) if ok else None
 
+    def pop_crossing_events(self):
+        """Drain and return all pending tracker crossing events as a list."""
+        with self._tracker_crossing_queue_lock:
+            evts = list(self._tracker_crossing_queue)
+            self._tracker_crossing_queue.clear()
+        return evts
+
     def ping_viewer(self):
         """Record that a viewer is actively requesting frames."""
         self._last_viewer_req_t = time.monotonic()
@@ -964,6 +1000,31 @@ class FaceEngine:
             self.min_face_size = max(1, int(d["min_face_size"]))
         if "high_priority_sources" in d:
             self.high_priority_sources = set(str(s) for s in (d["high_priority_sources"] or []))
+        if "tracker_camera_sources" in d:
+            self.tracker_camera_sources = set(str(s) for s in (d.get("tracker_camera_sources") or []))
+            # Pin tracker cameras in the RTSP pool (immune to LRU eviction)
+            # and treat them as high-priority (full-res, no motion gate).
+            self._rtsp_pool.set_pinned(self.tracker_camera_sources)
+            self.high_priority_sources = self.high_priority_sources | self.tracker_camera_sources
+            # Ensure they are connected immediately
+            for _src in self.tracker_camera_sources:
+                try:
+                    self._ensure_connected(_src)
+                except Exception:
+                    pass
+        if "tracker_line_y_ratios" in d:
+            self._tracker_line_y_ratios = {
+                str(k): max(0.05, min(0.95, float(v)))
+                for k, v in (d.get("tracker_line_y_ratios") or {}).items()
+            }
+        if "tracker_rois" in d:
+            _new_rois = {}
+            for _src, _r in (d.get("tracker_rois") or {}).items():
+                if isinstance(_r, (list, tuple)) and len(_r) == 4:
+                    _rx, _ry, _rw, _rh = (max(0.0, min(1.0, float(v))) for v in _r)
+                    if _rw > 0.01 and _rh > 0.01:
+                        _new_rois[str(_src)] = (_rx, _ry, _rw, _rh)
+            self._tracker_rois = _new_rois
 
     def set_viewer(self, mode=None, source=None, grid_offset=None):
         """Update viewer state. Cheap operation — does not touch the
@@ -1787,6 +1848,7 @@ class FaceEngine:
         return f"unknown_{next_id}", len(existing)
 
     def _try_capture_unknown(self, track, frame, now, crop_frame=None, crop_bbox=None, pending=None):
+        import logging as _logging; _ac_log = _logging.getLogger(__name__)
         """
         Watch an 'unknown' track over time. After it has been continuously
         tracked for ``_unknown_capture_min_seconds`` (~5s), save a cropped
@@ -1811,7 +1873,7 @@ class FaceEngine:
         """
         if pending is None:
             pending = self._unknown_pending
-        tid = id(track)
+        tid = track.get("_tid") or id(track)
 
         # Only process face-detector-confirmed unknowns
         if track.get("name") != "unknown":
@@ -1831,11 +1893,11 @@ class FaceEngine:
         if entry is None:
             entry = {"first_t": now, "best_frame": None, "best_bbox": None, "best_area": 0, "_log_t": 0.0}
             pending[tid] = entry
-            print(f"[auto-capture] new unknown track tid={tid} (need {self._unknown_capture_min_seconds:.1f}s)")
+            _ac_log.info("[auto-capture] new unknown track tid=%s (need %.1fs)", tid, self._unknown_capture_min_seconds)
         else:
             if (now - entry.get("_log_t", 0.0)) >= 1.0:
                 entry["_log_t"] = now
-                print(f"[auto-capture] tid={tid} elapsed={now - entry['first_t']:.1f}s area={area}")
+                _ac_log.debug("[auto-capture] tid=%s elapsed=%.1fs area=%s", tid, now - entry['first_t'], area)
 
         if area > entry["best_area"]:
             # Prefer cropping from the higher-resolution frame when available.
@@ -1851,13 +1913,13 @@ class FaceEngine:
             return None
 
         if entry["best_frame"] is None:
-            print(f"[auto-capture] tid={tid} hit time threshold but no best_frame — skipping")
+            _ac_log.warning("[auto-capture] tid=%s hit time threshold but no best_frame — skipping", tid)
             return None
 
         # --- Ready to capture ---
         next_name, existing_count = self._next_unknown_name()
         if existing_count >= self._unknown_max_auto:
-            print(f"[auto-capture] Max {self._unknown_max_auto} auto-captured unknowns reached, skipping")
+            _ac_log.warning("[auto-capture] Max %s auto-captured unknowns reached, skipping", self._unknown_max_auto)
             pending.pop(tid, None)
             return None
 
@@ -1876,50 +1938,10 @@ class FaceEngine:
             pending.pop(tid, None)
             return None
 
-        # Quality gate: re-run InsightFace on the captured crop. We
-        # require a single, large, high-confidence frontal face before
-        # enrolling — this rejects profile shots, motion-blurred frames,
-        # tracker drift onto hands/shoulders, and false-positive boxes
-        # that slipped through the per-frame detector at low det_thresh.
-        # Tuned for InsightFace's RetinaFace (det_10g) scoring — its
-        # values run lower than DeepFace's RetinaFace, so 0.5 here is
-        # roughly equivalent to DeepFace's old ~0.9 confidence gate.
-        MIN_ENROLL_DET_SCORE = 0.50
-        MIN_ENROLL_FACE_PX = 60
-        if self._face_app is None:
-            pending.pop(tid, None)
-            return None
-        # Guard: InsightFace's ONNX CUDA kernel segfaults on tiny inputs.
-        if crop.shape[0] < 32 or crop.shape[1] < 32:
-            pending.pop(tid, None)
-            return None
-        _app = self._acquire_face_app()
-        try:
-            qc_faces = _app.get(crop)
-        except Exception:
-            qc_faces = []
-        finally:
-            self._release_face_app(_app)
-        # Keep only confident faces
-        qc_faces = [
-            f for f in (qc_faces or [])
-            if float(getattr(f, "det_score", 0.0)) >= MIN_ENROLL_DET_SCORE
-        ]
-        if not qc_faces:
-            print(f"[auto-capture] {next_name} candidate REJECTED — no face >= {MIN_ENROLL_DET_SCORE} det_score in crop. Will retry on next track.")
-            pending.pop(tid, None)
-            return None
-        # Pick the largest face in the crop
-        qc_faces.sort(
-            key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
-            reverse=True,
-        )
-        qf = qc_faces[0]
-        qbb = qf.bbox
-        qw = int(qbb[2] - qbb[0])
-        qh = int(qbb[3] - qbb[1])
-        if qw < MIN_ENROLL_FACE_PX or qh < MIN_ENROLL_FACE_PX:
-            print(f"[auto-capture] {next_name} candidate REJECTED — face too small ({qw}x{qh} < {MIN_ENROLL_FACE_PX}px).")
+        # TEMPORARY: quality gate disabled — save directly from bbox without
+        # re-running InsightFace on the crop. Avoids det_score rejections.
+        # Guard: still skip crops too small to be useful.
+        if crop.shape[0] < 64 or crop.shape[1] < 64:
             pending.pop(tid, None)
             return None
 
@@ -1929,7 +1951,7 @@ class FaceEngine:
         # being re-enrolled while the background reload is still in flight, or
         # across multiple cameras that see the same person simultaneously.
         DEDUP_THRESHOLD = 0.45  # cosine distance; lower = stricter match
-        candidate_emb = l2norm(qf.embedding) if qf.embedding is not None else None
+        candidate_emb = None  # TEMPORARY: no re-detection, so no embedding for dedup
         matched_name = None
         if candidate_emb is not None and os.path.isdir(self.known_dir):
             import re as _re2
@@ -1963,7 +1985,7 @@ class FaceEngine:
                     break
 
         if matched_name:
-            print(f"[auto-capture] candidate matches existing {matched_name} — skipping new folder")
+            _ac_log.info("[auto-capture] candidate matches existing %s — skipping new folder", matched_name)
             track["name"] = matched_name
             track["unknown_hits"] = 0
             pending.pop(tid, None)
@@ -1974,7 +1996,7 @@ class FaceEngine:
         os.makedirs(person_dir, exist_ok=True)
         save_path = os.path.join(person_dir, "1.jpg")
         cv2.imwrite(save_path, crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        print(f"[auto-capture] Saved {next_name} -> {save_path}  (face {qw}x{qh} det={float(qf.det_score):.2f})")
+        _ac_log.info("[auto-capture] Saved %s -> %s (crop %dx%d)", next_name, save_path, crop.shape[1], crop.shape[0])
 
         # Promote track
         track["name"] = next_name
@@ -1986,9 +2008,9 @@ class FaceEngine:
                 self.reload_faces()
                 with self._embeddings_lock:
                     _n = len(self.known_embeddings)
-                print(f"[auto-capture] reload_faces() done, {_n} people")
+                _ac_log.info("[auto-capture] reload_faces() done, %s people", _n)
             except Exception as e:
-                print(f"[auto-capture] reload_faces() error: {e}")
+                _ac_log.error("[auto-capture] reload_faces() error: %s", e)
         threading.Thread(target=_bg_reload, daemon=True).start()
 
         # Cleanup
@@ -2651,12 +2673,13 @@ class FaceEngine:
                 "tracks": [],
                 "latest_tracks": [],
                 "last_det_t": time.monotonic() + _phase_offset,
-                "track_max_misses": 3,
+                "track_max_misses": 5,
                 "bbox_smooth_alpha": 0.55,
-                "max_unknown_tracks": 3,
+                "max_unknown_tracks": 10,
                 "capture_thread": None,
                 "detect_thread": None,
                 "unknown_pending": {},
+                "_track_id_seq": 0,
             }
             worker["capture_thread"] = threading.Thread(
                 target=self._grid_capture_loop,
@@ -3272,6 +3295,7 @@ class FaceEngine:
                             det_bbox, frame.shape, _trk_err,
                         )
                         continue
+                    worker["_track_id_seq"] = worker.get("_track_id_seq", 0) + 1
                     tracks.append(
                         {
                             "tracker": tr,
@@ -3284,6 +3308,7 @@ class FaceEngine:
                             "last_head_t": now,
                             "misses": 0,
                             "unknown_hits": 0 if name != "unknown" else 1,
+                            "_tid": worker["_track_id_seq"],
                         }
                     )
 
@@ -3293,6 +3318,77 @@ class FaceEngine:
 
             tracks = [t for t in tracks if int(t.get("misses", 0)) <= track_max_misses]
             tracks = self._dedupe_tracks(tracks)
+
+            # --- Tracker: line-crossing detection ---
+            _src_key = str(worker.get("source", ""))
+            if _src_key in self.tracker_camera_sources:
+                _LINE_Y   = self._tracker_line_y_ratios.get(_src_key, 0.5)
+                _DEBOUNCE = 3.0
+                _HIST_LEN = 3
+                # ROI in normalized tile coords: (rx, ry, rw, rh) or None = full tile
+                _roi = self._tracker_rois.get(_src_key)
+
+                for _t in tracks:
+                    _tid = _t.get("_tid")
+                    if _tid is None:
+                        continue
+                    _bx, _by, _bw, _bh = map(int, _t.get("bbox", (0, 0, 0, 0)))
+                    _cx_n = (_bx + _bw / 2) / max(1, tile_w_local)
+                    _cy_n = (_by + _bh / 2) / max(1, tile_h_local)
+
+                    # If an ROI is set, skip tracks whose center falls outside it
+                    if _roi is not None:
+                        _rx, _ry, _rw, _rh = _roi
+                        if not (_rx <= _cx_n <= _rx + _rw and _ry <= _cy_n <= _ry + _rh):
+                            continue
+                        # Express cy relative to the ROI for line comparison
+                        _y_rat = (_cy_n - _ry) / max(0.001, _rh)
+                    else:
+                        _y_rat = _cy_n
+
+                    _key = (_src_key, _tid)
+
+                    with self._tracker_cross_state_lock:
+                        _cs = self._tracker_cross_state.setdefault(
+                            _key,
+                            {"last_y_ratio": _y_rat, "last_cross_t": 0.0, "side_history": []}
+                        )
+                        _hist = _cs["side_history"]
+                        _hist.append(1 if _y_rat > _LINE_Y else 0)
+                        if len(_hist) > _HIST_LEN:
+                            _hist.pop(0)
+
+                        if len(_hist) == _HIST_LEN and len(set(_hist)) == 1:
+                            _confirmed = _hist[0]
+                            _prev      = 1 if _cs["last_y_ratio"] > _LINE_Y else 0
+                            if _confirmed != _prev and (now - _cs["last_cross_t"]) >= _DEBOUNCE:
+                                _cs["last_cross_t"] = now
+                                _cs["last_y_ratio"]  = _y_rat
+                                _raw = worker.get("latest_raw_frame")
+                                with self._tracker_crossing_queue_lock:
+                                    self._tracker_crossing_queue.append({
+                                        "camera_source": _src_key,
+                                        "tid":           _tid,
+                                        "name":          _t.get("name", "unknown"),
+                                        "best":          float(_t.get("best", 1.0)),
+                                        "bbox":          [_bx, _by, _bw, _bh],
+                                        "direction":     "enter" if _confirmed == 1 else "exit",
+                                        "raw_frame":     _raw.copy() if _raw is not None else None,
+                                        "tile_h":        tile_h_local,
+                                        "tile_w":        tile_w_local,
+                                        "roi":           list(_roi) if _roi else None,
+                                    })
+                            else:
+                                _cs["last_y_ratio"] = _y_rat
+                        else:
+                            _cs["last_y_ratio"] = _y_rat
+
+                # Prune state for tracks that no longer exist
+                _live = {(_src_key, _t2["_tid"]) for _t2 in tracks if _t2.get("_tid") is not None}
+                with self._tracker_cross_state_lock:
+                    for _k in [_k2 for _k2 in self._tracker_cross_state
+                               if _k2[0] == _src_key and _k2 not in _live]:
+                        del self._tracker_cross_state[_k]
 
             # --- Head matching (cheap — already ran inference above) ---
             self._match_heads_to_tracks(tracks, head_bboxes, now)
@@ -3322,7 +3418,7 @@ class FaceEngine:
                             pending=worker["unknown_pending"],
                         )
                         if captured:
-                            print(f"[grid-detect] auto-captured {captured} on cam {worker['source']}")
+                            import logging as _logging; _logging.getLogger(__name__).info("[grid-detect] auto-captured %s on cam %s", captured, worker['source'])
                     else:
                         # Recognised (auto-captured unknown_N or human-named):
                         # top up samples, throttled per (person, camera).
@@ -3331,7 +3427,7 @@ class FaceEngine:
                             camera_source=worker.get("source"),
                         )
                 self._cleanup_unknown_pending(
-                    {id(t) for t in tracks}, pending=worker["unknown_pending"]
+                    {t.get("_tid") or id(t) for t in tracks}, pending=worker["unknown_pending"]
                 )
 
             # --- Action detection (enqueue to async thread, throttled) ---
@@ -3965,7 +4061,7 @@ class FaceEngine:
                                 t, frame, bbox, now,
                                 camera_source=self.cam_index,
                             )
-                    self._cleanup_unknown_pending({id(t) for t in self.tracks})
+                    self._cleanup_unknown_pending({t.get("_tid") or id(t) for t in self.tracks})
 
                 # --- Action detection (enqueue to async thread, throttled) ---
                 # Only enqueue when face detector recently confirmed the person;

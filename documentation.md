@@ -22,6 +22,8 @@ A comprehensive reference for the Face Recognition Attendance System — archite
 14. [Web UI Pages](#14-web-ui-pages)
 15. [Gate Events & Daily Reports](#15-gate-events--daily-reports)
 16. [Analytics & Reports](#16-analytics--reports)
+17. [Camera Tracker (Line-Crossing)](#17-camera-tracker-line-crossing)
+18. [Manual Attendance](#18-manual-attendance)
 
 ---
 
@@ -123,7 +125,7 @@ The grid render thread tracks when the last MJPEG frame was requested (`_last_vi
 ### Recognition matching
 
 - Each detected face embedding is compared against all known person templates using **cosine distance**.
-- Match threshold: `0.4` (default in `FaceEngine.__init__`; `app.py` passes `0.5`).
+- Match threshold: `0.4` (default in `FaceEngine.__init__`; `app.py` passes `0.6`).
   - Distance < threshold → recognised as that person.
   - Distance ≥ threshold → labelled "unknown".
 - Confidence stored in the visit row is the minimum cosine distance seen across all detections in that visit (lower = more confident).
@@ -154,6 +156,10 @@ The grid render thread tracks when the last MJPEG frame was requested (`_last_vi
 
 - If a grid camera's `cap.read()` fails, a background thread (`_reconnect`) waits 3 seconds then reopens the capture with `open_capture()`.
 - Uses `hw_capture.open_capture()` which tries NVDEC first, falls back to `cv2.VideoCapture` on failure.
+
+### RTSP connection pool pinning
+
+`RtspConnectionPool` supports pinning sources (`pin()`, `unpin()`, `set_pinned()`) so they are immune to LRU eviction under `MAX_CONCURRENT_RTSP` pressure. Cameras assigned to the [Camera Tracker](#17-camera-tracker-line-crossing) are automatically pinned and added to `high_priority_sources` (full-res, no motion gate) so their connections are never dropped.
 
 ### IP camera groups
 
@@ -237,11 +243,9 @@ Controlled by `AUTO_CAPTURE_ENABLED` env var (default **false**).
 ### Enrolment flow
 
 1. An unrecognised face is tracked. The engine accumulates frames and keeps the highest-quality crop (largest bounding box area).
-2. After **5 continuous seconds** of tracking (`_unknown_capture_min_seconds`), the best crop is quality-gated:
-   - InsightFace must re-detect a face in the crop with `det_score ≥ 0.50`.
-   - Crop dimensions must be ≥ 60×60 px.
-   - Passes a deduplication check against all existing `unknown_N` embeddings (cosine distance > 0.5 required to confirm it's a new person).
-3. On pass: image saved to `faces/unknown_N/1.jpg`; track promoted to `unknown_N`.
+2. `_unknown_capture_min_seconds` (currently **0** — capture as soon as a track exists) gates how long a track must be held before the best crop is considered.
+3. **TEMPORARY:** the InsightFace re-detection quality gate (`det_score ≥ 0.50`, min face size, embedding-based dedup) is disabled — crops are saved directly from the tracker bbox once they are ≥ 64×64 px. This is a testing change to speed up capture. Production defaults: `_unknown_capture_min_seconds = 1.5`, quality gate enabled.
+4. On pass: image saved to `faces/unknown_N/1.jpg`; track promoted to `unknown_N`.
 
 ### Bootstrap accumulation
 
@@ -250,12 +254,13 @@ Controlled by `AUTO_CAPTURE_ENABLED` env var (default **false**).
 
 ### Demotion
 
-- Tracks that lose recognition for **12 consecutive frames** (~3.6 s at default cadence) are demoted from `unknown_N` back to "unknown" and become eligible for new enrolment.
+- Tracks that lose recognition for **5 consecutive misses** (`track_max_misses`, up from 3) are dropped from the active track list.
 
 ### Limits
 
 - Maximum **30 images** per person.
 - Maximum **150** auto-captured `unknown_N` folders total.
+- Maximum **10** simultaneous unknown tracks per camera (`max_unknown_tracks`, up from 3) — a testing change; see auto-capture note above.
 
 ---
 
@@ -517,7 +522,7 @@ All settings are read from `.env` (loaded by `python-dotenv` on startup). Copy `
 | `detect_scale` | `0.5` | Scale factor applied to frames before detection (lower = faster, less accurate). Env-configurable via `DETECT_SCALE`. |
 | `width` / `height` | `1280` / `720` | Camera resolution for the MJPEG stream |
 | `out_fps` | `15` | Target FPS for MJPEG stream and footage |
-| `threshold` | `0.5` | Cosine distance threshold for ArcFace matching |
+| `threshold` | `0.6` | Cosine distance threshold for ArcFace matching (raised from 0.5) |
 | `tracker_type` | `CSRT` | OpenCV tracker algorithm (`CSRT` or `KCF`) |
 | `INFERENCE_POOL_SIZE` | `6` | Number of parallel InsightFace instances (~300–400 MB VRAM each) |
 | `motion_gate` | `true` | Enable CPU motion check before GPU inference |
@@ -563,6 +568,7 @@ templates/
   index.html                  Main dashboard (live feed, cameras, analytics, attendance)
   history.html                Visit history dashboard (daily, per-person, per-location)
   people.html                 People management (view, rename, delete, transfer)
+  tracker.html                Camera Tracker page (line-crossing setup + live event feed)
 
 faces/                        Enrolled face images — one subdirectory per person
   <name>/
@@ -593,9 +599,10 @@ README.md                     Setup, features, and troubleshooting guide
 
 - **Branch switcher**: Riyadh / Egypt tabs at the top of the page. The active branch is persisted in `localStorage`. All history and analytics requests include `?branch=<active>` so each tab shows data for its own location.
 - **Live feed**: MJPEG stream from `/video`. Auto-reconnects on error; retries every 2 s after engine recovery.
-- **Camera controls**: carousel arrows / swipe to cycle cameras in single mode; grid layout selector.
+- **Camera controls**: carousel arrows / swipe to cycle cameras. The dashboard viewer is **single-camera-only** now — the old Single/Multi mode toggle and the grid-layout picker/dropdown were removed from this page. The analysis pool still covers every configured camera regardless of what the viewer shows; grid-layout viewing is still reachable via direct `POST /api/camera` calls with a `grid_RxC` source, just not from this UI.
 - **Analytics tab** (default): Arrivals by shift (single table per shift with an Earliest/Latest toggle; both datasets fetched in parallel on load and cached so toggling is instant), Top 10 Longest Working bar chart, Daily Headcount bar chart, Attendance Heatmap.
 - **Attendance tab**: real-time roster driven by SSE stream (`/api/attendance/stream`).
+- **Add Manual tab**: see [Manual Attendance](#18-manual-attendance).
 
 ### `/history` — Visit History
 
@@ -650,7 +657,7 @@ The `_handle_gate_event()` function in `app.py` is called from `_update_visit_fo
 2. When a person transitions from one camera to another.
 
 If the camera is the **exit camera**: `db.open_gate_exit()` writes a new `gate_events` row with `exit_time = now`.
-If the camera is the **arrival camera**: `db.close_gate_entry()` finds the most-recent open row for that person and fills in `entry_time` + `duration_minutes`.
+If the camera is the **arrival camera**: `db.close_gate_entry()` finds the most-recent open row for that person and fills in `entry_time` + `duration_minutes`. If there is no open exit row to close (e.g. the exit camera is offline), `db.write_arrival_event()` writes a standalone row (`exit_time == entry_time`) so the arrival still shows up in reports. This standalone write is skipped if an open exit row already exists, or if a standalone arrival was already written for that person within the last 30 minutes (debounce).
 
 The gate camera URLs are cached for 60 seconds (`_gate_camera_cache`) to avoid re-reading `reports_config.json` on every visit transition.
 
@@ -715,3 +722,91 @@ A single endpoint that returns three KPIs for a given day, loaded in one request
 - Returns a person × day presence matrix over a date range (default: current month).
 - Rendered as a scrollable HTML table (max-height 400 px) with emerald cells for present days.
 - Excludes `unknown_N` names.
+
+### Gate report export (Excel / PDF)
+
+The **Reports** tab in Settings can export the currently displayed gate report:
+
+- **Excel** (`exportReportExcel()`): builds a UTF-8 BOM-prefixed CSV client-side (title row, header row, one row per person) and triggers a browser download. Opens correctly in Excel despite the `.csv` extension.
+- **PDF** (`exportReportPDF()`): renders an HTML table into a new browser tab/window and calls `window.print()`, so the "export" is really "print to PDF" via the browser's print dialog.
+
+Both respect whatever filter (`present`/`absent`/`late`/`ontime`) and shift filter are currently applied to the report table — they do not re-fetch, they export what's on screen.
+
+---
+
+## 17. Camera Tracker (Line-Crossing)
+
+A dedicated page (`/tracker`) for counting people crossing a configurable line on up to **4** pinned cameras — independent of the visit/attendance system.
+
+### Setup page (`templates/tracker.html`)
+
+- 2×2 grid of camera tiles. Each tile supports pan/zoom/rotate (drag to pan, scroll/pinch to zoom, stored per-camera) and an optional rectangular ROI — when set, only track centers inside the ROI are considered for crossing detection.
+- A draggable horizontal line per camera (`line_y_ratio`, expressed relative to the ROI if one is set, otherwise relative to the full tile) marks the crossing boundary.
+- A live event feed (SSE) shows crossings as they happen, with the annotated snapshot.
+
+### Config (`tracker_config.json`, via `/api/tracker/config`)
+
+| Key | Description |
+|-----|--------------|
+| `cameras` | List of up to 4 RTSP URLs assigned to tracker tiles |
+| `line_y_ratio` | Legacy/global default line position (0.05–0.95) |
+| `line_y_ratios` | Per-camera line position `{source: ratio}` |
+| `cam_transforms` | Per-camera `{zoom, panX, panY, rotate}` view transform, purely cosmetic (does not affect detection coordinates) |
+| `tracker_rois` | Per-camera normalized ROI `[rx, ry, rw, rh]` (0–1 range); crossing detection ignores tracks outside it |
+
+Cameras assigned here are automatically **pinned** in the RTSP pool (immune to `MAX_CONCURRENT_RTSP` LRU eviction) and added to `high_priority_sources` (full-res, no motion gate) via `FaceEngine.set_config()`.
+
+### Crossing detection (`face_engine.py`, `_grid_detect_loop`)
+
+For each track on a tracker-enabled camera:
+1. Compute the track's bbox-center Y position, normalized to the tile (or to the ROI, if one is set for that camera).
+2. Maintain a 3-frame history of which side of the line the center falls on (`side_history`), keyed by `(camera_source, _tid)` where `_tid` is a per-worker monotonic track ID (stable across frames, unlike `id(track)`).
+3. A crossing fires only when all 3 history entries agree on the new side **and** it differs from the last confirmed side **and** at least `3.0` s (debounce) have passed since the last crossing for that track.
+4. On a confirmed crossing, an event (`camera_source`, `tid`, `name`, `direction` = `enter`/`exit`, `bbox`, a copy of the raw frame) is pushed onto an in-memory queue (`_tracker_crossing_queue`, max 100).
+5. Track state is pruned once a track disappears from the live track list.
+
+### Event pipeline
+
+`engine_runner.py` drains `pop_crossing_events()` every poll cycle, draws the bbox onto a copy of the raw frame, saves it as a JPEG under `static/tracker_snapshots/<uuid>.jpg`, and mirrors the serializable event (with `snapshot_path`, minus the raw frame) into the shared `Manager` dict (`tracker_crossing_events`, capped at the last 50).
+
+`app.py`'s `_tracker_poll_loop()` thread polls `engine.pop_tracker_crossing_events()` every 0.5 s, persists each event via `db.insert_tracker_event()`, and pushes it onto `tracker_events_q` for the `/api/tracker/stream` SSE endpoint.
+
+### Database: `tracker_events` table
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | integer PK | |
+| `event_type` | text | `enter` or `exit` |
+| `person_name` | text | Recognised name, or `"unknown"` |
+| `camera_source` | text | RTSP URL |
+| `camera_name` | text | Resolved display name at event time |
+| `occurred_at` | timestamp | |
+| `snapshot_path` | text (nullable) | Relative path under `static/tracker_snapshots/` |
+| `confidence` | float | Track's best cosine distance at crossing time |
+
+Indexed on `occurred_at DESC` and `person_name`. `db.delete_tracker_events_before(cutoff_iso)` is available for retention cleanup but is not currently wired to a scheduler.
+
+### API
+
+| Method | Path | Description |
+|--------|------|--------------|
+| GET | `/tracker` | Tracker setup + live feed page |
+| GET | `/api/tracker/config` | Current tracker camera assignment, line positions, transforms, ROIs |
+| POST | `/api/tracker/config` | Update the above; validates camera sources against configured IP cameras |
+| GET | `/api/tracker/events?limit=&offset=` | Paginated event history (max 500/page) |
+| POST | `/api/tracker/ping` | Keep-alive from the tracker page — see bandwidth note below |
+| GET | `/api/tracker/stream` | SSE stream of new crossing events (`event: crossing`) plus an initial `event: snapshot` backfill of the last 20 |
+
+### Bandwidth interaction with the main dashboard
+
+While the tracker page is actively pinging (`POST /api/tracker/ping`, tracked via `_tracker_active_t` with an 8 s TTL), the main dashboard's composite MJPEG stream (`mjpeg_generator`) throttles itself to 1 fps so bandwidth is freed for the tracker page's per-camera streams. Tracker-assigned camera streams (`/video/<source>`) also get a much longer "No Signal" grace period (30 s vs 2 s) since they are pinned/high-priority and briefer reconnects shouldn't flash a placeholder.
+
+---
+
+## 18. Manual Attendance
+
+An **Add Manual** tab on the main dashboard's Attendance section lets an admin backfill attendance for a day without a camera detection — e.g. for someone who worked off-site.
+
+- UI: pick a date, an arrival time (default `09:00`) and a departure time (default `17:00`), then check off any subset of enrolled people from a grid (Select All / Deselect All helpers), and submit.
+- `POST /api/attendance/manual` — body `{date: "YYYY-MM-DD", arrived: "HH:MM", left: "HH:MM", names: [...]}`. For each name, calls `db.insert_manual_visit(name, first_seen, last_seen)`.
+- `db.insert_manual_visit()` inserts a `visits` row directly in the **closed** state (`ended = true`), with `location_id = NULL` (no camera association), `confidence = 1.0`, and `branch` defaulting to `"Riyadh"`. It shows up in history/analytics like any other visit.

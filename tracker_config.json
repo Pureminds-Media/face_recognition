@@ -1,0 +1,73 @@
+{
+  "cameras": [
+    "rtsp://admin:a1234567@192.168.100.20:554/Streaming/Channels/1501",
+    "rtsp://admin:a1234567@192.168.100.20:554/Streaming/Channels/301",
+    "rtsp://admin:a1234567@192.168.100.20:554/Streaming/Channels/1101",
+    "rtsp://admin:a1234567@192.168.100.20:554/Streaming/Channels/901"
+  ],
+  "line_y_ratio": 0.5,
+  "line_y_ratios": {
+    "rtsp://admin:a1234567@192.168.100.20:554/Streaming/Channels/1501": 0.5940170940170939,
+    "rtsp://admin:a1234567@192.168.100.20:554/Streaming/Channels/1901": 0.6718562874251497,
+    "rtsp://admin:a1234567@192.168.100.20:554/Streaming/Channels/301": 0.7017964071856287,
+    "rtsp://admin:a1234567@192.168.100.20:554/Streaming/Channels/1101": 0.4419161676646707
+  },
+  "cam_transforms": {
+    "rtsp://admin:a1234567@192.168.100.20:554/Streaming/Channels/1501": {
+      "zoom": 1.056300611529708,
+      "panX": 9.17785419257066,
+      "panY": -9.67838920938307,
+      "rotate": 0
+    },
+    "rtsp://admin:a1234567@192.168.100.20:554/Streaming/Channels/1601": {
+      "zoom": 1.0,
+      "panX": 0.0,
+      "panY": 0.0,
+      "rotate": 0
+    },
+    "rtsp://admin:a1234567@192.168.100.20:554/Streaming/Channels/1901": {
+      "zoom": 1.0,
+      "panX": 0.0,
+      "panY": 0.0,
+      "rotate": 90
+    },
+    "rtsp://admin:a1234567@192.168.100.20:554/Streaming/Channels/2001": {
+      "zoom": 1.0,
+      "panX": 0.0,
+      "panY": 0.0,
+      "rotate": 0
+    },
+    "rtsp://admin:a1234567@192.168.100.20:554/Streaming/Channels/201": {
+      "zoom": 1.0,
+      "panX": 0.0,
+      "panY": 0.0,
+      "rotate": 0
+    },
+    "rtsp://admin:a1234567@192.168.100.20:554/Streaming/Channels/301": {
+      "zoom": 1.0,
+      "panX": 0.0,
+      "panY": 0.0,
+      "rotate": 0
+    },
+    "rtsp://admin:a1234567@192.168.100.20:554/Streaming/Channels/901": {
+      "zoom": 1.0,
+      "panX": 0.0,
+      "panY": 0.0,
+      "rotate": 0
+    },
+    "rtsp://admin:a1234567@192.168.100.20:554/Streaming/Channels/1101": {
+      "zoom": 1.0,
+      "panX": 0.0,
+      "panY": 0.0,
+      "rotate": 0
+    }
+  },
+  "tracker_rois": {
+    "rtsp://admin:a1234567@192.168.100.20:554/Streaming/Channels/1501": [
+      0.2314487632508834,
+      0.20359281437125748,
+      0.5742049469964664,
+      0.5604790419161677
+    ]
+  }
+}

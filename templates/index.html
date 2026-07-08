@@ -196,22 +196,12 @@
                      between live feeds via the carousel arrows. The buttons
                      and multi dropdown stay in the DOM so the existing JS
                      handlers can reference them without null checks. -->
-                <div class="relative hidden" id="camModeGroup">
-                  <div class="flex rounded-lg overflow-hidden border border-slate-700">
-                    <button id="singleCamBtn" type="button" class="hidden"></button>
-                    <button id="multiCamBtn" type="button" class="hidden"></button>
-                  </div>
-                  <div id="multiCamDropdown" class="hidden">
-                    <div id="multiCamList"></div>
-                  </div>
-                </div>
               </div>
             </div>
             <div class="p-3 relative overflow-hidden">
               <div id="cameraMsg" class="mb-2 text-xs text-slate-400"></div>
               <div id="videoStage" class="relative flex select-none touch-pan-y overflow-hidden h-[55vh]">
                 <img id="videoFeed" class="h-full w-auto block" src="" alt="video" style="transform-origin: 0 0; cursor: default; will-change: transform;" />
-                <div id="gridOverlay" class="hidden absolute inset-0 pointer-events-auto"></div>
 
                 <!-- Loading overlay: shown while switching cameras -->
                 <div id="camLoadingOverlay" class="hidden absolute inset-0 z-30 flex flex-col items-center justify-center bg-black/60 pointer-events-none">
@@ -336,6 +326,7 @@
               <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200" data-tab="person" data-i18n="tab_person">Per Person</button>
               <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200" data-tab="location" data-i18n="tab_location">Per Location</button>
               <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200" data-tab="zones" data-i18n="tab_zones">Zones</button>
+              <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200" data-tab="manual">Add Manual</button>
             </div>
 
             <!-- Attendance Tab -->
@@ -472,6 +463,25 @@
               </div>
               <div id="zonesStatusContainer">
                 <div class="text-center text-slate-500 py-8 text-sm" data-i18n="zone_no_data">No employees have a home zone assigned.</div>
+              </div>
+            </div>
+
+            <!-- Manual Attendance Tab -->
+            <div id="tab-manual" class="tab-content hidden">
+              <div class="flex items-center gap-3 mb-4 flex-wrap">
+                <label class="text-sm text-slate-400">Date:</label>
+                <input id="manualDate" type="date" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm" />
+                <label class="text-sm text-slate-400">Arrived:</label>
+                <input id="manualArrived" type="time" value="09:00" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm" />
+                <label class="text-sm text-slate-400">Left:</label>
+                <input id="manualLeft" type="time" value="17:00" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm" />
+                <button onclick="manualSelectAll(true)" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300">Select All</button>
+                <button onclick="manualSelectAll(false)" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300">Deselect All</button>
+                <button onclick="submitManualAttendance()" class="px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium text-white">Mark Attendance</button>
+                <span id="manualMsg" class="text-xs text-slate-400"></span>
+              </div>
+              <div id="manualEmployeeList" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
+                <div class="text-slate-500 text-sm col-span-4">Loading employees...</div>
               </div>
             </div>
 
@@ -657,17 +667,12 @@
       const attendanceMetaEl = document.getElementById("attendanceMeta");
       const toastContainer = document.getElementById("toastContainer");
       const qrPrompt = document.getElementById("qrPrompt");
-      const singleCamBtn = document.getElementById("singleCamBtn");
-      const multiCamBtn = document.getElementById("multiCamBtn");
-      const multiCamDropdown = document.getElementById("multiCamDropdown");
-      const multiCamList = document.getElementById("multiCamList");
       const cameraMsg = document.getElementById("cameraMsg");
       const carouselPrev = document.getElementById("carouselPrev");
       const carouselNext = document.getElementById("carouselNext");
       const carouselLabel = document.getElementById("carouselLabel");
       const videoStage = document.getElementById("videoStage");
 
-      let currentCamMode = "single"; // "single" or "multi"
       let singleCamDevices = [];     // healthy single-camera devices only
       function _looksLikeAddress(s) {
         s = String(s || "");
@@ -688,11 +693,7 @@
         return _sanitizeLocationLabel(s);
       }
       let allSingleCamDevices = [];  // unfiltered list (for probing)
-      let multiCamLayouts = [];
       let singleCamIndex = 0;
-      let gridOffset = 0;
-      let gridPageSize = 4;
-      let gridPageCount = 1;
       const _deadCameras = new Set(); // session-only failure cache
 
       let attendanceES = null;
@@ -757,28 +758,14 @@
         const j = await r.json();
         const devices = j.devices || [];
 
-        // Split devices into single cameras vs grid layouts
         allSingleCamDevices = devices.filter(d => !String(d.value || "").startsWith("grid_"));
-        multiCamLayouts = devices.filter(d => String(d.value || "").startsWith("grid_"));
 
         // Apply known-dead filter and branch filter from this session
         singleCamDevices = allSingleCamDevices.filter(d =>
           !_deadCameras.has(String(d.value)) && (!d.branch || d.branch === window._branch)
         );
 
-        // UI is single-mode only. If the backend currently has the viewer
-        // in grid mode (e.g. from a saved layout), force it to single on
-        // the first available camera. Backend keeps all cameras running
-        // in its grid analysis pool regardless of viewer mode.
-        const viewerMode = j.viewer_mode || currentCamMode;
-        currentCamMode = "single";
-        if (!skipAutoSwitch && viewerMode === "grid" && singleCamDevices.length > 0) {
-          // Fire-and-forget — switchCamera() updates the carousel state
-          // and starts the stream when it returns.
-          switchCamera(String(singleCamDevices[0].value)).catch(() => {});
-        }
-
-        // Sync the single-mode carousel index with the viewer's source.
+        // Sync the carousel index with the viewer's source.
         // Prefer _confirmedViewerSrc (set on switch) over the status API value
         // which may still be stale if the mirror loop hasn't ticked yet.
         const apiSrc = String(j.viewer_source || "");
@@ -789,82 +776,19 @@
           if (idx >= 0) singleCamIndex = idx;
           _currentViewerSource = viewerSrc;
         }
-        // Sync grid pagination
-        if (typeof j.viewer_grid_offset === "number") gridOffset = j.viewer_grid_offset;
-        if (typeof j.grid_page_size === "number") gridPageSize = j.grid_page_size;
-        if (typeof j.grid_page_count === "number") gridPageCount = j.grid_page_count;
+
         updateCarouselUI();
-        // Note: we no longer pre-probe and prune the carousel. With NVRs
-        // hosting many channels under one IP, parallel probes overwhelm
-        // the device's RTSP session limit and falsely mark cameras dead.
-        // Cameras now only get hidden when an actual switchCamera() call
-        // fails (see switchCamera below).
-
-        // Render multi camera list (active = currently selected layout)
-        const isGrid = currentCamMode === "multi";
-        const currentLayout = Array.isArray(j.grid_layout) ? `grid_${j.grid_layout[0]}x${j.grid_layout[1]}` : "";
-        if (multiCamList) {
-          let html = "";
-          multiCamLayouts.forEach(d => {
-            const val = String(d.value || "");
-            const active = isGrid && val === currentLayout;
-            html += `<button type="button" data-source="${val}"
-              class="w-full text-left px-3 py-2 text-xs hover:bg-slate-800 transition-colors flex items-center justify-between ${active ? 'bg-slate-800 text-emerald-400' : 'text-slate-300'}">
-              <span>${d.label || val}</span>
-              ${active ? '<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"/></svg>' : ''}
-            </button>`;
-          });
-          if (!multiCamLayouts.length) {
-            html = '<div class="px-3 py-2 text-xs text-slate-500">No cameras for grid</div>';
-          }
-          multiCamList.innerHTML = html;
-        }
-
-        // Update mode button styling
-        updateCamModeButtons();
 
         if (cameraMsg) {
-          cameraMsg.textContent = isGrid
-            ? `Viewing grid (${currentLayout || "default"})`
-            : (viewerSrc ? `Viewing ${camLabelFor(viewerSrc)}` : "No camera selected");
+          cameraMsg.textContent = viewerSrc ? `Viewing ${camLabelFor(viewerSrc)}` : "No camera selected";
         }
-      }
-
-      function updateCamModeButtons() {
-        const onClasses = ["bg-emerald-600", "hover:bg-emerald-500", "text-white"];
-        const offClasses = ["bg-slate-800", "hover:bg-slate-700"];
-        [singleCamBtn, multiCamBtn].forEach((btn, i) => {
-          if (!btn) return;
-          const isActive = (i === 0 && currentCamMode === "single") || (i === 1 && currentCamMode === "multi");
-          onClasses.forEach(c => btn.classList.toggle(c, isActive));
-          offClasses.forEach(c => btn.classList.toggle(c, !isActive));
-        });
-      }
-
-      function closeAllDropdowns() {
-        if (multiCamDropdown) multiCamDropdown.classList.add("hidden");
       }
 
       function updateCarouselUI() {
-        // Arrows show when there's somewhere to go in either mode:
-        // - single: there are 2+ cameras to cycle through
-        // - grid: there are 2+ pages of cameras
-        const showSingle = currentCamMode === "single" && singleCamDevices.length > 1;
-        const showGrid = currentCamMode === "multi" && gridPageCount > 1;
-        const show = showSingle || showGrid;
+        const show = singleCamDevices.length > 1;
         if (carouselPrev) carouselPrev.classList.toggle("hidden", !show);
         if (carouselNext) carouselNext.classList.toggle("hidden", !show);
-        // Show "Page X / Y" label in grid mode so the user knows where
-        // they are; stay quiet in single (one feed speaks for itself).
-        if (carouselLabel) {
-          if (showGrid) {
-            const pageIdx = Math.floor(gridOffset / Math.max(1, gridPageSize)) + 1;
-            carouselLabel.textContent = `Page ${pageIdx} / ${gridPageCount}`;
-            carouselLabel.classList.remove("hidden");
-          } else {
-            carouselLabel.classList.add("hidden");
-          }
-        }
+        if (carouselLabel) carouselLabel.classList.add("hidden");
       }
 
       async function showSingleCameraAt(index, _attemptsLeft) {
@@ -887,7 +811,6 @@
       }
 
       async function switchCamera(source) {
-        closeAllDropdowns();
         if (cameraMsg) cameraMsg.textContent = "Switching...";
         _showCamLoading("Connecting…");
         try {
@@ -902,23 +825,11 @@
             if (cameraMsg) cameraMsg.textContent = `Switch failed: ${j.error || "unknown error"}`;
             return false;
           }
-          // Sync local mode + pagination state so the Single/Multi buttons
-          // and the carousel arrows reflect the new viewer.
-          // UI is single-only; ignore engine's reported grid mode in viewer.
-          currentCamMode = "single";
-          if (typeof j.viewer_grid_offset === "number") gridOffset = j.viewer_grid_offset;
-          if (typeof j.grid_page_size === "number") gridPageSize = j.grid_page_size;
-          if (typeof j.grid_page_count === "number") gridPageCount = j.grid_page_count;
-          // Pin the confirmed source so loadCameraOptions won't overwrite the
-          // label with a stale mirror-loop value before the engine catches up.
           if (j.viewer_source) {
             _confirmedViewerSrc = j.viewer_source;
             _currentViewerSource = j.viewer_source;
           }
-          if (cameraMsg) cameraMsg.textContent = j.viewer_mode === "single"
-            ? `Viewing ${camLabelFor(j.viewer_source)}`
-            : `Viewing grid`;
-          updateCamModeButtons();
+          if (cameraMsg) cameraMsg.textContent = `Viewing ${camLabelFor(j.viewer_source)}`;
           updateCarouselUI();
           // Refresh the dropdown's active indicator from the switch response
           // devices list — avoids a second round-trip and the stale-label race.
@@ -934,9 +845,11 @@
         }
       }
 
+      let _currentRoster = [];
       function renderAttendance(roster) {
         if (!attendanceListEl) return;
         roster = roster || [];
+        _currentRoster = roster;
 
         const attendedCount = roster.filter((r) => r.attended).length;
         if (attendanceMetaEl)
@@ -1065,65 +978,17 @@
         }
       }
 
-      // --- Single / Multi cam mode buttons ---
-      if (singleCamBtn) {
-        // Single mode: jump straight to the first camera (no dropdown).
-        // If already in single mode, advance to the next camera.
-        singleCamBtn.onclick = () => {
-          closeAllDropdowns();
-          if (!singleCamDevices.length) {
-            if (cameraMsg) cameraMsg.textContent = "No single cameras available.";
-            return;
-          }
-          if (currentCamMode !== "single") {
-            currentCamMode = "single";
-            updateCamModeButtons();
-            showSingleCameraAt(0);
-          } else {
-            showSingleCameraAt(singleCamIndex + 1);
-          }
-        };
-      }
-      if (multiCamBtn) {
-        multiCamBtn.onclick = () => {
-          const wasOpen = !multiCamDropdown.classList.contains("hidden");
-          closeAllDropdowns();
-          if (!wasOpen) multiCamDropdown.classList.remove("hidden");
-        };
-      }
-
-      async function pageGrid(delta) {
-        if (gridPageCount <= 1) return;
-        const pageSize = Math.max(1, gridPageSize);
-        const newOffset = gridOffset + delta * pageSize;
-        try {
-          const r = await fetch("/api/camera", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ grid_offset: newOffset }),
-          });
-          const j = await r.json();
-          if (!j.ok) return;
-          gridOffset = j.viewer_grid_offset ?? gridOffset;
-          if (typeof j.grid_page_count === "number") gridPageCount = j.grid_page_count;
-          updateCarouselUI();
-        } catch (_) { /* silent */ }
-      }
-
-      // Carousel arrow handlers — single mode cycles cameras, multi
-      // mode pages through the grid.
+      // Carousel arrow handlers
       if (carouselPrev) {
         carouselPrev.onclick = (e) => {
           e.stopPropagation();
-          if (currentCamMode === "multi") pageGrid(-1);
-          else showSingleCameraAt(singleCamIndex - 1);
+          showSingleCameraAt(singleCamIndex - 1);
         };
       }
       if (carouselNext) {
         carouselNext.onclick = (e) => {
           e.stopPropagation();
-          if (currentCamMode === "multi") pageGrid(1);
-          else showSingleCameraAt(singleCamIndex + 1);
+          showSingleCameraAt(singleCamIndex + 1);
         };
       }
 
@@ -1141,28 +1006,11 @@
           const dx = e.changedTouches[0].clientX - touchStartX;
           const dy = e.changedTouches[0].clientY - touchStartY;
           if (!(Math.abs(dx) > 40 && Math.abs(dx) > Math.abs(dy))) return;
-          const dir = dx < 0 ? 1 : -1;
-          if (currentCamMode === "multi" && gridPageCount > 1) {
-            pageGrid(dir);
-          } else if (currentCamMode === "single" && singleCamDevices.length >= 2) {
-            showSingleCameraAt(singleCamIndex + dir);
+          if (singleCamDevices.length >= 2) {
+            showSingleCameraAt(singleCamIndex + (dx < 0 ? 1 : -1));
           }
         }, { passive: true });
       }
-
-      // Delegate clicks within dropdown lists
-      if (multiCamList) {
-        multiCamList.onclick = (e) => {
-          const btn = e.target.closest("[data-source]");
-          if (btn) switchCamera(btn.dataset.source);
-        };
-      }
-
-      // Close dropdowns on outside click
-      document.addEventListener("click", (e) => {
-        const group = document.getElementById("camModeGroup");
-        if (group && !group.contains(e.target)) closeAllDropdowns();
-      });
 
       // --- Loading overlay (startup camera open progress) ---
       const loadingOverlay = document.getElementById("loadingOverlay");
@@ -1209,9 +1057,19 @@
         });
       });
 
+      function _parseLocalIso(iso) {
+        // Stored timestamps have no timezone suffix (e.g. "2026-06-17 09:30:00").
+        // Without a suffix, JS Date() treats them as UTC and shifts to local time,
+        // adding +3 h. Replacing the space with T and appending no suffix keeps
+        // them as local time on all browsers.
+        if (!iso) return null;
+        const s = String(iso).trim();
+        if (/[Zz+\-]\d{2}:?\d{2}$/.test(s) || s.endsWith("Z")) return new Date(s);
+        return new Date(s.replace(" ", "T"));
+      }
       function fmtTimeH(iso) {
         if (!iso) return "--";
-        try { return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }); }
+        try { return _parseLocalIso(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }); }
         catch { return "--"; }
       }
       // Arabic name map: { english_key: "الاسم" } — populated once on load.
@@ -1232,7 +1090,7 @@
       function fmtDateH(iso) {
         if (!iso) return "--";
         try {
-          const d = new Date(iso);
+          const d = _parseLocalIso(iso);
           const dd = String(d.getDate()).padStart(2, "0");
           const mm = String(d.getMonth() + 1).padStart(2, "0");
           const yyyy = d.getFullYear();
@@ -2075,6 +1933,93 @@
         }
       });
 
+      // ===================== MANUAL ATTENDANCE =====================
+      (function () {
+        const dateInput = document.getElementById("manualDate");
+        const listEl = document.getElementById("manualEmployeeList");
+        const msgEl = document.getElementById("manualMsg");
+        let _allPeople = [];
+
+        dateInput.value = todayStr();
+
+        async function loadManualPeople() {
+          try {
+            const date = dateInput.value || todayStr();
+            const [peopleRes, dailyRes] = await Promise.all([
+              fetch("/api/people"),
+              fetch(`/api/history/daily?date=${date}&branch=${encodeURIComponent(window._branch)}`),
+            ]);
+            const pj = await peopleRes.json();
+            _allPeople = (pj.people || []).sort((a, b) => a.name.localeCompare(b.name));
+            if (dailyRes.ok) {
+              const dj = await dailyRes.json();
+              // Build a set of names that already have a visit record today
+              _attendedToday = new Set((dj.visits || []).map(r => r.person_name).filter(Boolean));
+            }
+            renderManualList();
+          } catch (e) {
+            listEl.innerHTML = `<div class="text-red-400 text-sm col-span-4">${e}</div>`;
+          }
+        }
+        let _attendedToday = new Set();
+
+        function renderManualList() {
+          if (!_allPeople.length) {
+            listEl.innerHTML = `<div class="text-slate-500 text-sm col-span-4">No employees found</div>`;
+            return;
+          }
+          const unattended = _allPeople.filter(p => !_attendedToday.has(p.name));
+          if (!unattended.length) {
+            listEl.innerHTML = `<div class="text-slate-500 text-sm col-span-4">All employees are already marked present for this date</div>`;
+            return;
+          }
+          listEl.innerHTML = unattended.map(p => `
+            <label class="flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 cursor-pointer hover:border-emerald-700 transition-colors select-none">
+              <input type="checkbox" class="manual-check accent-emerald-500 w-4 h-4" value="${p.name}" />
+              <span class="text-sm text-slate-200 truncate">${fmtName(p.name)}</span>
+            </label>`).join("");
+        }
+
+        window.manualSelectAll = function (state) {
+          listEl.querySelectorAll(".manual-check").forEach(cb => cb.checked = state);
+        };
+
+        window.submitManualAttendance = async function () {
+          const date = dateInput.value;
+          const arrived = document.getElementById("manualArrived").value;
+          const left = document.getElementById("manualLeft").value;
+          if (!date) { msgEl.textContent = "Pick a date first"; return; }
+          if (!arrived || !left) { msgEl.textContent = "Set arrival and departure times"; return; }
+          if (arrived >= left) { msgEl.textContent = "Arrival must be before departure"; return; }
+          const names = [...listEl.querySelectorAll(".manual-check:checked")].map(cb => cb.value);
+          if (!names.length) { msgEl.textContent = "Select at least one employee"; return; }
+          msgEl.textContent = "Saving…";
+          try {
+            const r = await fetch("/api/attendance/manual", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ date, arrived, left, names })
+            });
+            const j = await r.json();
+            if (j.ok) {
+              msgEl.textContent = `Marked ${j.count} employee(s) present`;
+              manualSelectAll(false);
+            } else {
+              msgEl.textContent = j.error || "Error";
+            }
+          } catch (e) { msgEl.textContent = String(e); }
+        };
+
+        dateInput.addEventListener("change", loadManualPeople);
+
+        // Reload every time the tab is opened so the attended list is fresh
+        document.querySelectorAll(".tab-btn").forEach(btn => {
+          if (btn.dataset.tab === "manual") {
+            btn.addEventListener("click", () => loadManualPeople());
+          }
+        });
+      })();
+
       // ===================== ZOOM / PAN =====================
       // Pan/zoom controller. Uses transform-origin: 0 0 so math is direct:
       //   image-rect = (panX, panY, baseW * scale, baseH * scale)
@@ -2084,8 +2029,6 @@
       const fullscreenZoomImage = document.getElementById("fullscreenZoomImage");
       const fullscreenZoomContainer = document.getElementById("fullscreenZoomContainer");
       const fullscreenCameraLabel = document.getElementById("fullscreenCameraLabel");
-      const gridOverlay = document.getElementById("gridOverlay");
-
       class PanZoom {
         constructor({ image, container, levelEl, minZoom = 1, maxZoom = 6, step = 0.25 }) {
           this.image = image;
@@ -2345,75 +2288,6 @@
         fullscreenZoomModal.classList.remove("hidden");
         if (fsPZ) fsPZ.reset();
       }
-
-      // Grid click detection - parse grid layout and make cameras clickable
-      function setupGridClickable() {
-        if (currentCamMode !== "multi") {
-          gridOverlay.classList.add("hidden");
-          return;
-        }
-
-        // Get grid info from the layout
-        const gridLayoutText = cameraMsg.textContent || "";
-        const matches = gridLayoutText.match(/grid \((\d+)x(\d+)\)/);
-        if (!matches) {
-          gridOverlay.classList.add("hidden");
-          return;
-        }
-
-        const rows = parseInt(matches[1]);
-        const cols = parseInt(matches[2]);
-        const totalCells = rows * cols;
-
-        const feedRect = videoFeed.getBoundingClientRect();
-        const stageRect = videoStage.getBoundingClientRect();
-        const cellWidth = videoFeed.width / cols;
-        const cellHeight = videoFeed.height / rows;
-
-        let html = "";
-        for (let i = 0; i < totalCells; i++) {
-          const row = Math.floor(i / cols);
-          const col = i % cols;
-          const x = col * cellWidth;
-          const y = row * cellHeight;
-          html += `<div class="grid-cell" data-index="${i}" 
-            style="position: absolute; left: ${x}px; top: ${y}px; width: ${cellWidth}px; height: ${cellHeight}px; 
-            cursor: pointer; transition: background-color 0.2s;"
-            onmouseover="this.style.backgroundColor='rgba(34,197,94,0.1)'"
-            onmouseout="this.style.backgroundColor='transparent'"
-            onclick="openCameraFullscreen('${videoFeed.src}', ${i}, ${rows}, ${cols})"></div>`;
-        }
-        gridOverlay.innerHTML = html;
-        gridOverlay.classList.remove("hidden");
-        gridOverlay.style.width = videoFeed.width + "px";
-        gridOverlay.style.height = videoFeed.height + "px";
-      }
-
-      function openCameraFullscreen(gridImageSrc, cellIndex, rows, cols) {
-        // Open the grid image in fullscreen with indication of which cell is selected
-        const label = `Grid Camera ${cellIndex + 1} (${Math.floor(cellIndex / cols) + 1}x${cellIndex % cols + 1})`;
-        openFullscreenZoom(gridImageSrc, label);
-      }
-
-      // Update grid overlay when switching modes or loading new image
-      const originalVideoFeedSrc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
-      Object.defineProperty(videoFeed, 'src', {
-        set: function(value) {
-          originalVideoFeedSrc.set.call(this, value);
-          setupGridClickable();
-        },
-        get: function() {
-          return originalVideoFeedSrc.get.call(this);
-        }
-      });
-
-      // Also update when camera mode changes
-      const originalSwitchCamera = switchCamera;
-      window.switchCamera = async function(source) {
-        const result = await originalSwitchCamera(source);
-        setTimeout(setupGridClickable, 100);
-        return result;
-      };
 
       // ---- Camera offline overlay ----
       (function () {
