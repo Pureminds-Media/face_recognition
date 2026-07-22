@@ -10,6 +10,11 @@ if [[ ! -d "$FOOTAGE_DIR" ]]; then
     exit 1
 fi
 
+if ! mountpoint -q "$(dirname "$FOOTAGE_DIR")"; then
+    echo "ERROR: $(dirname "$FOOTAGE_DIR") is not a mounted filesystem — refusing to run" >&2
+    exit 1
+fi
+
 DAYS="${FOOTAGE_RETENTION_DAYS:-7}"
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Cleaning footage older than ${DAYS} days in: $FOOTAGE_DIR"

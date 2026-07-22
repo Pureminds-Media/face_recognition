@@ -344,7 +344,35 @@ def _serialize_state(state):
     return out
 ALLOWED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
-os.makedirs(FOOTAGE_DIR, exist_ok=True)
+# Minimum free bytes on FOOTAGE_DIR's filesystem before we refuse to start
+# new recordings (default 1 GiB headroom).
+FOOTAGE_MIN_FREE_BYTES = int(os.getenv("FOOTAGE_MIN_FREE_BYTES", str(1 * 1024 * 1024 * 1024)))
+
+if not os.path.isdir(FOOTAGE_DIR):
+    os.makedirs(FOOTAGE_DIR, exist_ok=True)
+
+
+def _footage_storage_ok():
+    """Guard against writing footage to local disk if the NAS mount is
+    down, and against writing when the target filesystem is nearly full.
+
+    FOOTAGE_DIR is expected to be a network mount (see .env). If the mount
+    fails or drops, the path still exists as a plain local directory and
+    os.makedirs()/cv2.VideoWriter would silently write there instead —
+    filling the local disk. os.path.ismount() detects that case.
+    """
+    if not os.path.ismount(FOOTAGE_DIR):
+        log.warning("Footage storage %s is not a mounted filesystem — refusing to record locally", FOOTAGE_DIR)
+        return False
+    try:
+        free = shutil.disk_usage(FOOTAGE_DIR).free
+    except OSError as e:
+        log.warning("Could not stat footage storage %s: %s", FOOTAGE_DIR, e)
+        return False
+    if free < FOOTAGE_MIN_FREE_BYTES:
+        log.warning("Footage storage %s is low on space (%.1f MB free) — refusing to record", FOOTAGE_DIR, free / 1048576)
+        return False
+    return True
 
 # The engine runs in a subprocess. We can't spawn it at module-import time
 # because Python's `spawn` start method re-imports app.py in the child;
@@ -976,6 +1004,9 @@ def _start_visit_footage(visit_id, person_name, camera_source):
     person is visible on the camera.
     """
     try:
+        if not _footage_storage_ok():
+            log.debug("Skipping footage recording for visit %s: storage unavailable/full", visit_id)
+            return
         fname = f"visit_{visit_id}.mp4"
         ok, actual_fname = engine.start_footage(
             visit_id, person_name, camera_source, FOOTAGE_DIR, fname
