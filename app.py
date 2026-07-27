@@ -1,4 +1,5 @@
 import os
+import sys
 # RTSP/HTTP camera tuning for OpenCV's FFmpeg backend.
 # - rtsp_transport=tcp avoids UDP packet loss/NAT issues common on Wi-Fi cams.
 # - stimeout (microseconds) caps socket-level read waits so a dead camera
@@ -72,6 +73,30 @@ logging.getLogger("waitress").addFilter(
         and "Task queue depth" not in r.getMessage()
 )
 log = logging.getLogger(__name__)
+
+# Uncaught exceptions in background threads (camera workers, footage
+# writers, etc.) print to stderr by default and never reach logging
+# handlers — so they're invisible once the launching terminal scrolls
+# away or closes. Route them through `logging` so they land in
+# logs/app.log like everything else.
+def _log_uncaught_thread_exception(args):
+    log.error(
+        "Unhandled exception in thread %r", args.thread.name if args.thread else "?",
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+
+
+threading.excepthook = _log_uncaught_thread_exception
+
+
+def _log_uncaught_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    log.error("Unhandled exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+
+sys.excepthook = _log_uncaught_exception
 
 app = Flask(__name__)
 
@@ -356,12 +381,20 @@ def _footage_storage_ok():
     """Guard against writing footage to local disk if the NAS mount is
     down, and against writing when the target filesystem is nearly full.
 
-    FOOTAGE_DIR is expected to be a network mount (see .env). If the mount
-    fails or drops, the path still exists as a plain local directory and
-    os.makedirs()/cv2.VideoWriter would silently write there instead —
-    filling the local disk. os.path.ismount() detects that case.
+    FOOTAGE_DIR is expected to be a subdirectory of a network mount (see
+    .env). If the mount fails or drops, the path still exists as a plain
+    local directory and os.makedirs()/cv2.VideoWriter would silently write
+    there instead — filling the local disk. Walk up from FOOTAGE_DIR to
+    find its actual mount point and check that (os.path.ismount() only
+    returns True for the mount point itself, not subdirectories under it).
     """
-    if not os.path.ismount(FOOTAGE_DIR):
+    _check_path = os.path.realpath(FOOTAGE_DIR)
+    while not os.path.ismount(_check_path):
+        parent = os.path.dirname(_check_path)
+        if parent == _check_path:
+            break
+        _check_path = parent
+    if not os.path.ismount(_check_path):
         log.warning("Footage storage %s is not a mounted filesystem — refusing to record locally", FOOTAGE_DIR)
         return False
     try:
@@ -1823,6 +1856,7 @@ def api_people():
         p["email"]        = m.get("email", "")
         p["arabic_name"]  = m.get("arabic_name", "")
         p["home_zone_id"] = m.get("home_zone_id")
+        p["shift"]        = m.get("shift", "morning")
     return jsonify({"people": people})
 
 
@@ -3714,7 +3748,7 @@ def api_analytics_present_absent():
         WHERE first_seen >= {ph} AND first_seen < {ph}
           AND person_name NOT LIKE 'unknown_%'
           {branch_clause}
-        ORDER BY person_name
+        ORDER BY LOWER(person_name)
     """
     with db._cursor() as cur:
         cur.execute(present_sql, tuple(base_params))
@@ -3726,12 +3760,12 @@ def api_analytics_present_absent():
     present_set = set(present)
     if branch:
         branch_members = db.get_branch_members(branch)
-        absent = [n for n in branch_members if n not in present_set]
+        absent = sorted((n for n in branch_members if n not in present_set), key=str.lower)
     else:
         known_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "faces")
         absent = []
         if os.path.isdir(known_dir):
-            for d in sorted(os.listdir(known_dir)):
+            for d in sorted(os.listdir(known_dir), key=str.lower):
                 if not os.path.isdir(os.path.join(known_dir, d)):
                     continue
                 if _re.match(r'^unknown_\d+$', d):
@@ -4188,6 +4222,11 @@ def _generate_gate_report(arrival_camera, exit_camera, date_from, date_to,
     return records
 
 
+def _format_person_name(name):
+    """Enrolled names are folder names like 'khaled_zaiter' — display as 'Khaled Zaiter'."""
+    return name.replace("_", " ").title()
+
+
 def _build_report_excel(records, report_date_label, camera_name, work_start, late_threshold):
     """Build an Arabic Excel (.xlsx) report and return raw bytes."""
     from openpyxl import Workbook
@@ -4287,7 +4326,7 @@ def _build_report_excel(records, report_date_label, camera_name, work_start, lat
 
         if n_exits == 0:
             data_cell(ws, row_num, 1,  idx,                           row_fill)
-            data_cell(ws, row_num, 2,  r["person"].replace("_", " "), row_fill)
+            data_cell(ws, row_num, 2,  _format_person_name(r["person"]), row_fill)
             data_cell(ws, row_num, 3,  r["date"],                     row_fill)
             data_cell(ws, row_num, 4,  r["arrival"],                  row_fill)
             data_cell(ws, row_num, 5,  "—",                           row_fill)
@@ -4306,7 +4345,7 @@ def _build_report_excel(records, report_date_label, camera_name, work_start, lat
                 late_color = "991B1B" if ex["late"] else "166534"
                 if ei == 0:
                     data_cell(ws, row_num, 1, idx,                           row_fill)
-                    data_cell(ws, row_num, 2, r["person"].replace("_", " "), row_fill)
+                    data_cell(ws, row_num, 2, _format_person_name(r["person"]), row_fill)
                     data_cell(ws, row_num, 3, r["date"],                      row_fill)
                     data_cell(ws, row_num, 4, r["arrival"],                   row_fill)
                     data_cell(ws, row_num, 5, last_exit,                      row_fill)

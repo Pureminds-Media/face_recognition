@@ -38,6 +38,24 @@ def run(conn, state, engine_kwargs, log_level=logging.INFO):
 
     log = logging.getLogger("engine_runner")
 
+    # Uncaught exceptions in background threads print to stderr by default
+    # and never reach the log file — route them through logging instead.
+    def _log_uncaught_thread_exception(args):
+        log.error(
+            "Unhandled exception in thread %r", args.thread.name if args.thread else "?",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    threading.excepthook = _log_uncaught_thread_exception
+
+    def _log_uncaught_exception(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        log.error("Unhandled exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+    sys.excepthook = _log_uncaught_exception
+
     # Imports happen in the child so the parent stays light.
     from face_engine import FaceEngine
     from dotenv import load_dotenv

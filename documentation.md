@@ -71,6 +71,10 @@ The Flask server and the face-recognition engine run in **separate OS processes*
   - `get_jpeg`, `get_tracks`, `get_status`, etc. — read-only queries.
 - Publishes live state (jpeg bytes, track list, running flag, fps) to the shared `Manager` dict so the Flask process can read it without round-trip latency.
 
+### Exception logging
+
+Both `app.py` and `engine_runner.py` install a `threading.excepthook` and `sys.excepthook` that route uncaught exceptions through the standard `logging` module (and therefore into `logs/app.log`) instead of letting them print to stderr only. Without this, an exception in a background thread (camera worker, footage writer thread, etc.) would be visible only in whatever terminal launched the process — invisible if that terminal isn't being watched or has since closed. Note this does **not** catch process kills from outside Python (e.g. the OOM killer's `SIGKILL`) — those still leave no trace beyond a gap in the logs and a fresh "Database initialised" line when the watchdog or manual restart brings the process back. Check `dmesg`/`journalctl -k` for OOM kills if a silent gap appears with no corresponding exception logged.
+
 ### Inter-process communication
 
 | Channel | Direction | Used for |
@@ -156,6 +160,15 @@ The grid render thread tracks when the last MJPEG frame was requested (`_last_vi
 
 - If a grid camera's `cap.read()` fails, a background thread (`_reconnect`) waits 3 seconds then reopens the capture with `open_capture()`.
 - Uses `hw_capture.open_capture()` which tries NVDEC first, falls back to `cv2.VideoCapture` on failure.
+
+### Ghost-box / track staleness (grid detect loop)
+
+A track (bounding box) can be kept alive by the head detector reconfirming it even without a fresh face detection — this bridges brief occlusions (person turns away, walks behind an obstacle) without a jumpy cut in tracking or footage. Two windows control how long a track survives without reconfirmation, in `_grid_detect_loop` (`face_engine.py`):
+
+- `head_reconfirm_secs = max(3.0, detect_every * 5.0)` — how long the head detector alone can sustain a track.
+- `known_reconfirm_secs` — how long a known person's track can go without *any* reconfirmation (face or head) before being dropped. Previously computed adaptively from GPU contention (`detect_every * n_workers`, capped at 30 s) to avoid killing real tracks when detection cadence stretched out under load with many cameras sharing the GPU. Currently a flat **5.0 s** — traded some robustness against detector slowdowns for tighter bounding on how long a track (and its associated visit/footage recording) lingers after a person actually leaves frame. If visits start fragmenting unexpectedly under heavy multi-camera load (a real visit split into several short ones), this is the first place to look — raise it back toward the old adaptive formula.
+
+Because footage recording and visit closure are driven by whether *any* track exists for a person (not by a dedicated "person has left" signal), this timeout directly controls how long recording continues after someone is actually gone.
 
 ### RTSP connection pool pinning
 
@@ -266,12 +279,16 @@ Controlled by `AUTO_CAPTURE_ENABLED` env var (default **false**).
 
 ## 7. Footage Recording
 
-- Every open visit with a known person (not raw "unknown") starts a `cv2.VideoWriter` writing MPEG-4 Part 2 (fourcc `mp4v`, `.mp4` extension). VP8/WebM was removed because libvpx's global encoder state is non-reentrant — running 17+ concurrent encoder instances caused crashes.
+- Every open visit with a known person (not raw "unknown") starts a video writer for the visit's camera.
+- **Encoder**: `_FFmpegWriter` (`face_engine.py`) pipes raw BGR24 frames to a system `ffmpeg` subprocess encoding H.264 (`libx264`), producing browser-playable `.mp4` output. This replaced `cv2.VideoWriter` with the `mp4v` (MPEG-4 Part 2) fourcc, which OpenCV's bundled FFmpeg build could produce but browsers cannot play. OpenCV's bundled FFmpeg only exposes `h264_v4l2m2m` (a hardware encoder requiring a V4L2 device, unavailable on typical x86/NVIDIA hosts) for H.264, so `cv2.VideoWriter` itself cannot produce H.264 here — hence the subprocess pipe to the system `ffmpeg` binary instead. If the `ffmpeg` binary can't be launched, falls back to the old `cv2.VideoWriter`/`mp4v` path (not browser-playable, but still a valid file).
+- **Encoder tuning**: `-preset ultrafast -tune zerolatency -bf 0 -g <2×fps> -threads 2`. Chosen to minimize per-process memory and CPU — with many visits recording concurrently (one `ffmpeg` process each), default `libx264` settings (B-frames, larger lookahead buffers, one thread per core) scale badly: unconstrained, each instance used 600 MB–1.9 GB RAM under real camera load, enough to trigger the Linux OOM killer with ~20 concurrent recordings. The tuned flags bring this down to roughly 80 MB per instance.
+- **Resolution cap** (`FOOTAGE_MAX_HEIGHT`, default `720`): frames are downscaled (aspect-ratio preserved, dimensions rounded to even for `yuv420p`) before the writer is opened. Native camera feeds can be up to 4K; software-encoding many concurrent 4K streams saturates CPU (each ~600–900% of one core observed at native res). A 4K feed downscaled to 720p is roughly a 9× reduction in encoded pixel count.
 - Frames come from a **ring buffer** (`FOOTAGE_RING_SECS = 1.0 s`) so the clip starts slightly before the visit opened.
-- Footage is written to `FOOTAGE_DIR` (required env var). Can be a NAS mount path.
+- Footage is written to `FOOTAGE_DIR` (required env var), normally a NAS mount. **Storage guard** (`_footage_storage_ok()` in `app.py`): before opening a writer, checks that `FOOTAGE_DIR` resolves (walking up parent directories) to an actual mounted filesystem (`os.path.ismount()`) with at least `FOOTAGE_MIN_FREE_BYTES` (default 1 GiB) free. If the NAS mount is down or full, recording is skipped entirely for that visit (logged as a warning) rather than silently writing to local disk underneath the unmounted mount point.
 - On `close_visit()`, the writer is flushed and released; `visible_duration` is written to the DB.
 - Footage files are served at `/footage/<filename>` (key-authenticated).
 - Footage clips are **always annotated** (bounding boxes + labels) regardless of `LIVE_ANNOTATIONS_ENABLED`.
+- **Retention**: `cleanup_footage.sh` (cron, daily) deletes footage files older than `FOOTAGE_RETENTION_DAYS` (default 7) from `FOOTAGE_DIR`. It refuses to run if the footage directory's parent isn't an actual mount (same guard rationale as above — never wants to prune local-fallback files thinking they're NAS footage). Cron output must redirect to a path the running user can write (`/var/log/` typically requires root) or the job fails silently every run with no error visible anywhere.
 
 ---
 
@@ -511,7 +528,11 @@ All settings are read from `.env` (loaded by `python-dotenv` on startup). Copy `
 | `MAX_NVDEC_TRANSFERS` | `8` | Max concurrent GPU→CPU frame copies. Lower to 3–4 for laptop/mobile GPUs; raise on multi-NVDEC GPUs (e.g. RTX 5090). |
 | `DETECT_SCALE` | `0.5` | Scale factor applied to frames before face detection. `0.5` = half resolution (faster, less accurate for distant faces). Set to `1.0` for full resolution. Overrides the `detect_scale` passed to `FaceEngine` at startup. |
 | `LIVE_ANNOTATIONS_ENABLED` | `true` | Draw bounding boxes on the live MJPEG feed. Footage always annotated. |
-| `FOOTAGE_DIR` | *(required)* | Directory where `.mp4` footage clips are written |
+| `FOOTAGE_DIR` | *(required)* | Directory where `.mp4` footage clips are written. Recording is skipped if this doesn't resolve to an actual mounted filesystem or has less than `FOOTAGE_MIN_FREE_BYTES` free — see [Footage Recording](#7-footage-recording). |
+| `FOOTAGE_MIN_FREE_BYTES` | `1073741824` (1 GiB) | Minimum free bytes required on `FOOTAGE_DIR`'s filesystem before new recordings are allowed |
+| `FOOTAGE_MAX_HEIGHT` | `720` | Recorded footage is downscaled to this max height (aspect-ratio preserved) before encoding |
+| `FOOTAGE_BITRATE` | *(unset)* | Explicit target video bitrate for the ffmpeg encoder (e.g. `2000000` for 2 Mbps). Unset = let `libx264`'s CRF-equivalent default apply. |
+| `FOOTAGE_RETENTION_DAYS` | `7` | Read by `cleanup_footage.sh` (cron) — footage files older than this are deleted |
 | `API_KEY` | *(unset)* | Shared-secret key for all `/api/*` routes. Unset = no auth (local dev only) |
 
 ### Engine tuning (set in `app.py` at `FaceEngine` instantiation)
@@ -583,6 +604,7 @@ models/
 grid_config.json              Saved grid layout + camera slot assignments
 face_recognition.db           SQLite database (default, not committed)
 docker-compose.yml            Optional PostgreSQL via Docker
+cleanup_footage.sh            Cron script: deletes footage older than FOOTAGE_RETENTION_DAYS
 
 .env                          Runtime configuration (not committed)
 .env.example                  Example configuration template

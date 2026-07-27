@@ -19,7 +19,7 @@ Uses InsightFace (RetinaFace + ArcFace, ONNX Runtime GPU) for face detection and
 - **Face recognition** — InsightFace `buffalo_l` model pack (RetinaFace detector + ArcFace embeddings, ONNX Runtime on GPU) with CSRT tracking. A pool of up to `INFERENCE_POOL_SIZE` independent FaceAnalysis instances (default 6) runs concurrently across cameras; each has its own CUDA stream so detection from different cameras truly overlaps on the GPU.
 - **Head detection** — YOLOv8n (ONNX Runtime GPU) supplements face detection to sustain tracking when face is not visible (e.g. turned sideways). Always on when model file exists, graceful fallback if missing.
 - **Visit tracking** — Per-location visits with flip-flop prevention, automatic timeout, and transition detection
-- **Footage recording** — Continuous MPEG-4 Part 2 (`.mp4`) recording from visit start to end at native camera resolution
+- **Footage recording** — Continuous H.264 (`.mp4`, browser-playable) recording from visit start to end, downscaled to a max height (default 720p, `FOOTAGE_MAX_HEIGHT`) to keep concurrent-recording CPU cost manageable. Recording is skipped (not written locally) if `FOOTAGE_DIR` isn't an actual mounted filesystem or is nearly full — see Troubleshooting.
 - **Action detection** — CLIP ViT-B/32 zero-shot classification (e.g., "Using phone", "Typing", "Idle"). Only runs when face detector confirms the person (not on head-only or tracker-only boxes). Optional, toggled via `ACTION_DETECTION_ENABLED` env var.
 - **Auto-capture unknowns** — Automatically saves face crops of unrecognised people as `unknown_1`, `unknown_2`, etc. Re-identifies them on reappearance. Best for small crowds. Optional, toggled via `AUTO_CAPTURE_ENABLED` env var.
 - **AI kill switch** — Set `FACE_DETECTION_ENABLED=false` to disable all inference (detection, recognition, tracking, attendance) and run as a pure camera stream viewer. Useful for diagnosing lag or running on non-GPU hardware.
@@ -40,6 +40,7 @@ Uses InsightFace (RetinaFace + ArcFace, ONNX Runtime GPU) for face detection and
 - **NVIDIA GPU** with CUDA 13.1+ (for GPU branch — tested on RTX 4060 Laptop 8GB)
 - A working webcam or RTSP camera source
 - `opencv-contrib-python` (not plain `opencv-python`) — needed for CSRT/KCF trackers
+- System `ffmpeg` binary with `libx264` support (`ffmpeg -codecs | grep 264` should list `libx264` as an encoder) — used to encode footage as browser-playable H.264, since OpenCV's bundled FFmpeg build cannot on most hosts (see Footage recording in Troubleshooting)
 
 ## Setup
 
@@ -120,7 +121,9 @@ Key settings in `.env`:
 | `MAX_NVDEC_TRANSFERS` | `8` | Max concurrent GPU→CPU frame downloads across all cameras. Lower to 3–4 for laptop/mobile GPUs. |
 | `DETECT_SCALE` | `0.5` | Scale factor applied to frames before face detection. `0.5` = half resolution (faster, less accurate for distant faces). Set to `1.0` for full-resolution detection. |
 | `LIVE_ANNOTATIONS_ENABLED` | `true` | Draw bounding boxes + name labels on the live MJPEG feed. Set to `false` for a clean live stream when scenes get crowded — boxes still appear on saved footage regardless. |
-| `FOOTAGE_DIR` | *(required)* | Directory where footage `.mp4` files are written. Set to a network mount path (e.g. `/mnt/camera_system/footage`) to offload storage to a NAS. |
+| `FOOTAGE_DIR` | *(required)* | Directory where footage `.mp4` files are written. Set to a network mount path (e.g. `/mnt/camera_system/footage`) to offload storage to a NAS. Recording is skipped entirely if this path isn't an actual mounted filesystem (prevents silently falling back to local disk if the NAS mount drops) or has less than `FOOTAGE_MIN_FREE_BYTES` free. |
+| `FOOTAGE_MIN_FREE_BYTES` | `1073741824` (1 GiB) | Minimum free bytes required on `FOOTAGE_DIR`'s filesystem before new recordings are allowed. |
+| `FOOTAGE_MAX_HEIGHT` | `720` | Recorded footage is downscaled (preserving aspect ratio) to this max height before encoding. Native 4K camera feeds otherwise cost several CPU cores each to encode in software when many visits record concurrently. |
 
 ### 5) Add face images
 
@@ -172,6 +175,7 @@ grid_config.json        # Saved grid layout + camera slot assignments
 tracker_config.json     # Camera Tracker: assigned cameras, line positions, transforms, ROIs
 hw_capture.py           # NVDEC-accelerated RTSP capture wrapper (cv2.VideoCapture-compatible)
 docker-compose.yml      # Optional PostgreSQL via Docker (not required for SQLite)
+cleanup_footage.sh      # Cron script: deletes footage older than FOOTAGE_RETENTION_DAYS (default 7)
 .env                    # Environment configuration (not committed)
 .env.example            # Example environment file
 ```
@@ -301,7 +305,11 @@ curl -X POST http://localhost:5001/api/history/clear
 
 **Action detection not loading** — Ensure `onnxruntime-gpu` is installed and `onnxruntime` (CPU) is not. Check CUDA drivers with `nvidia-smi`.
 
-**Footage won't play in browser** — Files are MPEG-4 Part 2 (`.mp4`). All modern browsers support this format natively.
+**Footage won't play in browser** — Footage is encoded as H.264 (`.mp4`) via a system `ffmpeg` subprocess (`_FFmpegWriter` in `face_engine.py`) — OpenCV's bundled FFmpeg build only exposes the `h264_v4l2m2m` hardware encoder, which fails on non-V4L2 hosts, so H.264 can't be produced through `cv2.VideoWriter` directly here. If footage still won't play, check `ffprobe <file>` — it should report `codec_name=h264`. Files older than this fix (or written when the `ffmpeg` binary was unavailable, which falls back to `mp4v`) are MPEG-4 Part 2 and only play in native players like VLC, not browsers.
+
+**Footage recording silently stops / "Footage storage is not a mounted filesystem" in logs** — `FOOTAGE_DIR` must resolve to an actual network mount, not just an existing directory. If the NAS mount (e.g. `/mnt/camera_system`) drops or was never mounted, the directory still exists as a plain local folder — recording is deliberately skipped in that case (`_footage_storage_ok()` in `app.py`) rather than silently filling local disk. Check with `mountpoint /mnt/camera_system` (or your configured mount) and remount with `sudo mount -a` if needed.
+
+**High CPU from many `ffmpeg` processes** — Each concurrently-recording visit spawns one `ffmpeg` subprocess. Cameras recording at native 4K get downscaled to `FOOTAGE_MAX_HEIGHT` (default 720p) before encoding to keep this manageable; lower it further if CPU load from `ffmpeg` (check with `ps aux | grep ffmpeg`) is still too high with many concurrent cameras/visits.
 
 **Engine subprocess crashes (exit code -11 / SIGSEGV)** — Most common causes: (1) VRAM exhaustion — reduce `INFERENCE_POOL_SIZE` in `face_engine.py` (each instance uses ~400 MB VRAM; default 6 is safe on 8 GB; raising above 8–10 risks OOM with 20+ cameras); (2) concurrent NVDEC driver state access — mitigated in `hw_capture.py` by a readers-writer lock (`_NvdecRWLock`): `av.open()` and `container.close()` hold an exclusive write lock, while `packet.decode()` + `frame.to_ndarray()` hold a read lock (many may run concurrently); network I/O (`container.demux()`) runs without any lock; (3) visit flip-flopping creating rapid footage-writer churn — raise `VISIT_TRANSITION_SECS` (default 30 s).
 

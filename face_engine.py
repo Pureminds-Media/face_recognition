@@ -3,6 +3,7 @@ import json
 import re
 import time
 import struct
+import subprocess
 import threading
 import collections
 from queue import Queue, Empty, Full
@@ -271,6 +272,60 @@ class RtspConnectionPool:
     def _touch_locked(self, source: str) -> None:
         self._lru.remove(source)
         self._lru.append(source)
+
+
+class _FFmpegWriter:
+    """Pipes raw BGR24 frames to ffmpeg's libx264 encoder.
+
+    cv2.VideoWriter's bundled FFmpeg build only exposes h264_v4l2m2m (a
+    hardware encoder needing a V4L2 device absent on this host), so H.264
+    output isn't reachable through cv2 directly. The system ffmpeg binary
+    has libx264, so frames are piped to it as a subprocess instead.
+    """
+
+    def __init__(self, path, fps, width, height, bitrate=0):
+        # Many of these can run concurrently (one per active visit), so
+        # memory per instance matters a lot. -preset ultrafast + -tune
+        # zerolatency + no B-frames minimizes libx264's internal lookahead/
+        # reference buffers; -threads caps worker threads per instance
+        # instead of libx264's default of one per CPU core.
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "rawvideo", "-pixel_format", "bgr24",
+            "-video_size", f"{width}x{height}", "-framerate", str(fps),
+            "-i", "-",
+            "-an", "-c:v", "libx264",
+            "-preset", "ultrafast", "-tune", "zerolatency",
+            "-bf", "0", "-g", str(int(fps) * 2), "-threads", "2",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+        ]
+        if bitrate > 0:
+            cmd += ["-b:v", str(bitrate)]
+        cmd.append(path)
+        self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        self._opened = self._proc.poll() is None
+
+    def isOpened(self):
+        return self._opened and self._proc.poll() is None
+
+    def write(self, frame):
+        try:
+            self._proc.stdin.write(frame.tobytes())
+        except (BrokenPipeError, OSError):
+            self._opened = False
+
+    def release(self):
+        if self._proc.stdin is not None:
+            try:
+                self._proc.stdin.close()
+            except OSError:
+                pass
+        self._proc.wait(timeout=15)
+        self._opened = False
+
+    def set(self, *_args, **_kwargs):
+        pass
 
 
 class FaceEngine:
@@ -1217,37 +1272,35 @@ class FaceEngine:
         if w is None:
             w, h = self.width, self.height
 
-        # Try codecs in order — best browser compatibility first.
-        # VP8/WebM was crashing: libvpx has non-reentrant global state that
-        # SIGSEGVs when many encoder instances call write() simultaneously.
+        # Cap recording resolution — native camera feeds go up to 4K, and
+        # software libx264 encoding that many concurrent 4K streams pegs
+        # every CPU core. Footage only needs to be clear enough to identify
+        # people, not full native resolution, so downscale (preserving
+        # aspect ratio) to a max height before opening the writer.
+        _max_h = int(os.getenv("FOOTAGE_MAX_HEIGHT", "720"))
+        if h > _max_h:
+            scale = _max_h / h
+            w, h = int(round(w * scale / 2) * 2), int(round(h * scale / 2) * 2)  # even dims for yuv420p
+
+        # H.264 via ffmpeg's libx264 first — actually plays in browsers.
+        # cv2.VideoWriter's bundled FFmpeg only has h264_v4l2m2m (hardware,
+        # fails on this host), so H.264 goes through a subprocess pipe
+        # instead (see _FFmpegWriter). mp4v (MPEG-4 Part 2) is the fallback
+        # if ffmpeg is unavailable — note it does NOT play in browsers,
+        # only in native players.
         base = fname.rsplit(".", 1)[0]
-        # avc1/H264 require libx264 which is not installed on this host
-        # (FFmpeg only has h264_v4l2m2m which fails on x86/NVIDIA).
-        # mp4v (MPEG-4 Part 2) is always available and plays in all browsers.
-        _codec_candidates = [
-            (base + ".mp4", "mp4v"),
-        ]
-        writer = None
-        fname_out = fname
-        fpath = os.path.join(footage_dir, fname)
-        for _cname, _tag in _codec_candidates:
-            _cpath = os.path.join(footage_dir, _cname)
-            _w = cv2.VideoWriter(_cpath, cv2.VideoWriter_fourcc(*_tag), fps, (w, h))
-            if _w.isOpened():
-                writer = _w
-                fname_out = _cname
-                fpath = _cpath
-                break
-            _w.release()
-        if writer is None:
-            return False, fname
-        fname = fname_out
         _fbitrate = int(os.getenv("FOOTAGE_BITRATE", "0"))
-        if _fbitrate > 0:
-            try:
-                writer.set(cv2.VIDEOWRITER_PROP_BITRATE, _fbitrate)
-            except Exception:
-                pass
+        fpath = os.path.join(footage_dir, base + ".mp4")
+        writer = _FFmpegWriter(fpath, fps, w, h, bitrate=_fbitrate)
+        if writer.isOpened():
+            fname = base + ".mp4"
+        else:
+            writer.release()
+            writer = cv2.VideoWriter(fpath, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+            if not writer.isOpened():
+                writer.release()
+                return False, fname
+            fname = base + ".mp4"
 
         now = time.monotonic()
         # Each writer gets its own thread + queue so disk/NAS I/O never
@@ -3525,7 +3578,7 @@ class FaceEngine:
         # with 23 cams) cause ghost boxes to float for minutes after people leave.
         _detection_cycle = self.detect_every * n_workers
         unknown_reconfirm_secs = min(max(3.0, _detection_cycle * 2.0), 20.0)
-        known_reconfirm_secs = min(max(5.0, _detection_cycle * 2.5), 30.0)
+        known_reconfirm_secs = 5.0
 
         while not self._grid_stop_evt.is_set():
             loop_start = time.monotonic()

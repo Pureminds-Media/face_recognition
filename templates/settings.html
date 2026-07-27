@@ -605,15 +605,15 @@
               <div class="overflow-x-auto overflow-y-hidden">
                 <table class="w-full text-sm mt-3 whitespace-nowrap">
                   <thead>
-                    <tr class="text-xs text-slate-500 uppercase tracking-wide border-b border-slate-800">
-                      <th class="px-4 py-3 text-left" data-i18n="col_person">Person</th>
-                      <th class="px-4 py-3 text-left" data-i18n="reports_col_date">Date</th>
-                      <th class="px-4 py-3 text-left">Shift</th>
-                      <th class="px-4 py-3 text-left" data-i18n="reports_col_arrival">Arrival</th>
-                      <th class="px-4 py-3 text-left">Last Exit</th>
-                      <th class="px-4 py-3 text-left" data-i18n="reports_col_exits">Exits</th>
-                      <th class="px-4 py-3 text-left" data-i18n="reports_col_total_outside">Total Out</th>
-                      <th class="px-4 py-3 text-left" data-i18n="reports_col_status">Status</th>
+                    <tr id="reportSortableHead" class="text-xs text-slate-500 uppercase tracking-wide border-b border-slate-800">
+                      <th class="px-4 py-3 text-left cursor-pointer select-none hover:text-slate-300" data-sort-key="person" onclick="_sortReportBy('person')"><span data-i18n="col_person">Person</span> <span class="sort-indicator"></span></th>
+                      <th class="px-4 py-3 text-left cursor-pointer select-none hover:text-slate-300" data-sort-key="date" onclick="_sortReportBy('date')"><span data-i18n="reports_col_date">Date</span> <span class="sort-indicator"></span></th>
+                      <th class="px-4 py-3 text-left cursor-pointer select-none hover:text-slate-300" data-sort-key="shift" onclick="_sortReportBy('shift')">Shift <span class="sort-indicator"></span></th>
+                      <th class="px-4 py-3 text-left cursor-pointer select-none hover:text-slate-300" data-sort-key="arrival" onclick="_sortReportBy('arrival')"><span data-i18n="reports_col_arrival">Arrival</span> <span class="sort-indicator"></span></th>
+                      <th class="px-4 py-3 text-left cursor-pointer select-none hover:text-slate-300" data-sort-key="last_exit" onclick="_sortReportBy('last_exit')">Last Exit <span class="sort-indicator"></span></th>
+                      <th class="px-4 py-3 text-left cursor-pointer select-none hover:text-slate-300" data-sort-key="exits" onclick="_sortReportBy('exits')"><span data-i18n="reports_col_exits">Exits</span> <span class="sort-indicator"></span></th>
+                      <th class="px-4 py-3 text-left cursor-pointer select-none hover:text-slate-300" data-sort-key="total_out" onclick="_sortReportBy('total_out')"><span data-i18n="reports_col_total_outside">Total Out</span> <span class="sort-indicator"></span></th>
+                      <th class="px-4 py-3 text-left cursor-pointer select-none hover:text-slate-300" data-sort-key="status" onclick="_sortReportBy('status')"><span data-i18n="reports_col_status">Status</span> <span class="sort-indicator"></span></th>
                     </tr>
                   </thead>
                   <tbody id="reportTableBody">
@@ -1111,7 +1111,7 @@
         try {
           const res = await fetch("/api/people");
           const data = await res.json();
-          _people = (data.people || []).sort((a, b) => a.name.localeCompare(b.name));
+          _people = (data.people || []).sort((a, b) => fmt(a.name).localeCompare(fmt(b.name)));
           _rebuildArabicNames();
           _knownPeopleNames = _people.map(p => p.name.toLowerCase());
           // Prune selections for people that no longer exist
@@ -3266,6 +3266,53 @@
   /* ===================== Reports Tab ===================== */
   let _reportRecords = [];
   let _reportFilter = "all";
+  let _reportSortKey = null;
+  let _reportSortDir = 1; // 1 = ascending, -1 = descending
+
+  const _REPORT_SORT_ACCESSORS = {
+    person: r => (r.person || "").toLowerCase(),
+    date: r => r.date || "",
+    shift: r => r.shift || "morning",
+    arrival: r => r.arrival || "",
+    last_exit: r => r.last_exit || "",
+    exits: r => (r.exits || []).length,
+    total_out: r => r.total_outside_minutes || 0,
+    status: r => _rowStatus(r),
+  };
+
+  function _sortReportBy(key) {
+    if (_reportSortKey === key) {
+      _reportSortDir = -_reportSortDir;
+    } else {
+      _reportSortKey = key;
+      _reportSortDir = 1;
+    }
+    _renderReportTable();
+  }
+
+  function _applyReportSort(rows) {
+    if (!_reportSortKey) return rows;
+    const accessor = _REPORT_SORT_ACCESSORS[_reportSortKey];
+    if (!accessor) return rows;
+    const sorted = rows.slice();
+    sorted.sort((a, b) => {
+      const av = accessor(a), bv = accessor(b);
+      if (av < bv) return -1 * _reportSortDir;
+      if (av > bv) return 1 * _reportSortDir;
+      return 0;
+    });
+    return sorted;
+  }
+
+  function _updateReportSortHeaders() {
+    document.querySelectorAll("#reportSortableHead [data-sort-key]").forEach(th => {
+      const indicator = th.querySelector(".sort-indicator");
+      if (!indicator) return;
+      indicator.textContent = th.dataset.sortKey === _reportSortKey
+        ? (_reportSortDir === 1 ? "▲" : "▼")
+        : "";
+    });
+  }
 
   async function loadReportsTab() {
     const saved = await _loadReportConfig();
@@ -3423,6 +3470,8 @@
     if (_reportFilter === "ontime") rows = rows.filter(r => !r.absent && !r.arrived_late && r.late_exits_count === 0);
     // Shift filter: absent people show in both shifts
     if (shiftFilter) rows = rows.filter(r => r.absent || (r.shift || "morning") === shiftFilter);
+    rows = _applyReportSort(rows);
+    _updateReportSortHeaders();
 
     if (rows.length === 0) {
       tbody.innerHTML = `<tr><td colspan="8" class="px-4 py-8 text-center text-slate-500">No records</td></tr>`;
@@ -3478,7 +3527,7 @@
     if (_reportFilter === "late")    rows = rows.filter(r => !r.absent && (r.arrived_late || r.late_exits_count > 0));
     if (_reportFilter === "ontime")  rows = rows.filter(r => !r.absent && !r.arrived_late && r.late_exits_count === 0);
     if (shiftFilter) rows = rows.filter(r => r.absent || (r.shift || "morning") === shiftFilter);
-    return rows;
+    return _applyReportSort(rows);
   }
 
   function _rowStatus(r) {
@@ -3497,7 +3546,7 @@
       [title],
       headers,
       ...rows.map(r => [
-        r.person,
+        fmtEn(r.person),
         r.date,
         r.shift === "night" ? "Night" : "Morning",
         r.arrival || "—",
@@ -3528,7 +3577,7 @@
         ? r.exits.map(e => `${e.out_at}→${e.back_at}(${e.duration_minutes ?? "..."}m)`).join(", ")
         : "—";
       return `<tr>
-        <td>${r.person}</td>
+        <td>${fmtEn(r.person)}</td>
         <td>${r.date}</td>
         <td>${r.shift === "night" ? "Night" : "Morning"}</td>
         <td>${r.arrival || "—"}</td>

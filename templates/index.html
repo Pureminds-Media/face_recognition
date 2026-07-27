@@ -372,16 +372,17 @@
                     <tr class="border-b border-slate-800 text-slate-400 text-xs">
                       <th class="px-4 py-3 text-left" data-i18n="col_footage">Footage</th>
                       <th class="px-4 py-3 text-left" data-i18n="col_person">Person</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_location">Location</th>
                       <th class="px-4 py-3 text-left" data-i18n="col_arrived">Arrived</th>
                       <th class="px-4 py-3 text-left" data-i18n="col_left">Left</th>
+                      <th class="px-4 py-3 text-left" data-i18n="col_duration">Duration</th>
+                      <th class="px-4 py-3 text-left activity-col" data-i18n="col_action">Action</th>
                       <th class="px-4 py-3 text-left" data-i18n="col_status">Status</th>
-                      <th class="px-4 py-3 text-left" data-i18n="col_section">Section</th>
-                      <th class="px-4 py-3 text-left" data-i18n="col_footage">Footage</th>
-                      <th class="px-4 py-3 text-left" data-i18n="col_activity">Activity</th>
                     </tr>
                   </thead>
                   <tbody id="dailyTableBody"></tbody>
                 </table>
+                <div id="dailyPager" class="px-4 py-3 border-t border-slate-800 hidden"></div>
               </div>
             </div>
 
@@ -1310,8 +1311,9 @@
           const r = await fetch(`/api/history/persons?branch=${encodeURIComponent(window._branch)}`);
           const j = await r.json();
           if (j.ok && j.persons) {
+            const sorted = [...j.persons].sort((a, b) => fmtName(a).localeCompare(fmtName(b)));
             const opts = `<option value="">Select...</option>` +
-              j.persons.map((n) => `<option value="${n}">${n}</option>`).join("");
+              sorted.map((n) => `<option value="${n}">${fmtName(n)}</option>`).join("");
             personSelect.innerHTML = opts;
             attendancePersonSelect.innerHTML = opts;
           }
@@ -1950,7 +1952,7 @@
               fetch(`/api/history/daily?date=${date}&branch=${encodeURIComponent(window._branch)}`),
             ]);
             const pj = await peopleRes.json();
-            _allPeople = (pj.people || []).sort((a, b) => a.name.localeCompare(b.name));
+            _allPeople = (pj.people || []).sort((a, b) => fmtName(a.name).localeCompare(fmtName(b.name)));
             if (dailyRes.ok) {
               const dj = await dailyRes.json();
               // Build a set of names that already have a visit record today
