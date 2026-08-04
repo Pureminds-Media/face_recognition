@@ -10,6 +10,10 @@
     <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="/static/i18n.js"></script>
     <script>
+    window._lockedBranch = {{ (locked_branch or "")|tojson }};
+    window._currentUsername = {{ (current_username or "")|tojson }};
+    </script>
+    <script>
     function applyLang(lang) {
       _applyLang(lang, function() {
         if (typeof renderPeople === "function") renderPeople();
@@ -20,6 +24,20 @@
       });
     }
     document.addEventListener("DOMContentLoaded", () => applyLang(window._lang));
+    document.addEventListener("DOMContentLoaded", () => {
+      if (!window._lockedBranch) return;
+      const fb = document.getElementById("filterBranch");
+      if (fb) {
+        fb.value = window._lockedBranch;
+        fb.disabled = true;
+        if (typeof renderPeople === "function") renderPeople();
+      }
+      document.querySelectorAll(".cam-branch-btn").forEach(btn => {
+        if (btn.dataset.camBranch !== window._lockedBranch) btn.remove();
+        else btn.disabled = true;
+      });
+      if (typeof setCamBranch === "function") setCamBranch(window._lockedBranch);
+    });
     </script>
     <script>
       (function () {
@@ -112,8 +130,15 @@
                 data-section="zones" data-i18n="nav_zones">Zones</button>
               <button class="section-btn w-full text-start rounded-lg px-3 py-2 text-sm font-medium text-slate-300 hover:bg-slate-800"
                 data-section="reports" data-i18n="nav_reports">Reports</button>
+              {% if is_admin %}
+              <button class="section-btn w-full text-start rounded-lg px-3 py-2 text-sm font-medium text-slate-300 hover:bg-slate-800"
+                data-section="users">User Management</button>
+              {% endif %}
               <button class="section-btn w-full text-start rounded-lg px-3 py-2 text-sm font-medium text-slate-300 hover:bg-slate-800"
                 data-section="advanced">Advanced</button>
+              <form method="post" action="{{ url_for('logout') }}" class="pt-2">
+                <button type="submit" class="w-full text-center uppercase tracking-wide rounded-lg px-3 py-2 text-sm font-medium text-red-400 bg-red-950/40 hover:bg-red-900/50 border border-red-900/60 transition-colors">Log out</button>
+              </form>
             </nav>
           </aside>
 
@@ -665,6 +690,27 @@
 
           </div><!-- /section-reports -->
 
+          {% if is_admin %}
+          <!-- ================= USER MANAGEMENT SECTION ================= -->
+          <div id="section-users" class="section-content hidden space-y-6">
+            <div class="rounded-xl border border-slate-800 bg-slate-900">
+              <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between gap-3">
+                <div>
+                  <div class="font-medium">User Management</div>
+                  <div class="text-xs text-slate-400">Create and manage login accounts for the web UI. Only affects who can access this dashboard — does not affect the camera system itself.</div>
+                </div>
+                <button id="addUserBtn" type="button" class="rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-2 text-sm font-medium shrink-0">+ Add User</button>
+              </div>
+              <div class="p-4">
+                <div id="usersMsg" class="text-xs mb-3"></div>
+                <div id="usersList" class="space-y-2">
+                  <div class="text-slate-500 text-xs text-center py-6">Loading...</div>
+                </div>
+              </div>
+            </div>
+          </div><!-- /section-users -->
+          {% endif %}
+
           <!-- ================= ADVANCED SECTION ================= -->
           <div id="section-advanced" class="section-content hidden space-y-6">
 
@@ -1016,6 +1062,9 @@
           }
           if (btn.dataset.section === "advanced" && typeof loadAdvancedTab === "function") {
             loadAdvancedTab();
+          }
+          if (btn.dataset.section === "users" && typeof loadUsersTab === "function") {
+            loadUsersTab();
           }
         });
       });
@@ -1763,6 +1812,12 @@
       }
 
       async function initZonesSection() {
+        if (window._lockedBranch) {
+          ["zoneBranchSelect", "zoneReportBranch"].forEach(id => {
+            const sel = document.getElementById(id);
+            if (sel) { sel.value = window._lockedBranch; sel.disabled = true; }
+          });
+        }
         await loadAllLocations();
         await loadZones();
         // Load current threshold from config
@@ -2686,12 +2741,16 @@
       const ipCamMsg = document.getElementById("ipCamMsg");
       const addGroupBtn = document.getElementById("addGroupBtn");
 
-      /* Camera branch state */
-      window._camBranch = localStorage.getItem("camBranch") || "Riyadh";
+      /* Camera branch state — scoped per-username so switching accounts in
+         the same browser doesn't inherit another user's last-picked branch. */
+      const _camBranchStorageKey = "camBranch:" + (window._currentUsername || "");
+      localStorage.removeItem("camBranch"); // stale unscoped key from before per-user scoping
+      window._camBranch = window._lockedBranch || localStorage.getItem(_camBranchStorageKey) || "Riyadh";
 
       function setCamBranch(branch) {
+        if (window._lockedBranch) branch = window._lockedBranch;
         window._camBranch = branch;
-        localStorage.setItem("camBranch", branch);
+        localStorage.setItem(_camBranchStorageKey, branch);
         document.querySelectorAll(".cam-branch-btn").forEach(btn => {
           const active = btn.dataset.camBranch === branch;
           btn.classList.toggle("bg-emerald-600", active);
@@ -3729,6 +3788,176 @@
       msgEl.className = "text-xs text-red-400";
     }
   }
+
+  /* ===================== User Management Tab ===================== */
+  let _users = [];
+
+  async function loadUsersTab() {
+    const msgEl = document.getElementById("usersMsg");
+    const listEl = document.getElementById("usersList");
+    try {
+      const r = await fetch("/api/users");
+      const j = await r.json();
+      if (!j.ok) { msgEl.textContent = j.error || "Failed to load users"; msgEl.className = "text-xs text-red-400"; return; }
+      _users = j.users;
+      renderUsersList();
+    } catch (e) {
+      msgEl.textContent = "Network error";
+      msgEl.className = "text-xs text-red-400";
+    }
+  }
+
+  function renderUsersList() {
+    const listEl = document.getElementById("usersList");
+    if (!_users.length) {
+      listEl.innerHTML = `<div class="text-slate-500 text-xs text-center py-6">No users</div>`;
+      return;
+    }
+    listEl.innerHTML = _users.map(u => `
+      <div class="rounded-lg border border-slate-800 bg-slate-950 px-4 py-3 flex items-center justify-between gap-3 flex-wrap">
+        <div>
+          <div class="text-sm font-medium text-white">${u.username}${u.is_admin ? ' <span class="text-xs font-normal text-emerald-400">(admin)</span>' : ''}</div>
+          <div class="text-xs text-slate-400 mt-0.5">
+            ${u.is_admin ? 'All branches' : `Locked to: ${u.locked_branch || '(none set)'}`}
+            &middot; Add Manual: ${u.can_manual_attendance ? 'allowed' : 'blocked'}
+          </div>
+        </div>
+        <div class="flex gap-2 shrink-0">
+          <button onclick="openEditUserModal('${u.username}')" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300">Edit</button>
+          <button onclick="deleteUser('${u.username}')" class="px-3 py-1.5 rounded-lg bg-red-950/50 hover:bg-red-900/50 border border-red-900/60 text-xs text-red-400">Delete</button>
+        </div>
+      </div>`).join("");
+  }
+
+  function _userModalHtml(existing) {
+    const isEdit = !!existing;
+    const u = existing || {};
+    return `
+      <div id="userModalBackdrop" class="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+        <div class="rounded-xl border border-slate-800 bg-slate-900 w-full max-w-sm p-5">
+          <div class="font-medium text-white mb-4">${isEdit ? "Edit user: " + u.username : "Add User"}</div>
+          <div id="userModalMsg" class="text-xs text-red-400 mb-2"></div>
+          ${isEdit ? "" : `
+          <label class="block text-xs text-slate-400 mb-1">Username</label>
+          <input id="userModalUsername" type="text" class="w-full mb-3 rounded-lg bg-slate-950 border border-slate-700 px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-emerald-500" />
+          `}
+          <label class="block text-xs text-slate-400 mb-1">${isEdit ? "New password (leave blank to keep current)" : "Password"}</label>
+          <input id="userModalPassword" type="text" class="w-full mb-3 rounded-lg bg-slate-950 border border-slate-700 px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-emerald-500" />
+
+          <label class="flex items-center gap-2 mb-3 text-sm text-slate-300">
+            <input id="userModalIsAdmin" type="checkbox" class="accent-emerald-500" ${u.is_admin ? "checked" : ""} onchange="_toggleUserModalBranch()" />
+            Admin (all branches, no restrictions)
+          </label>
+
+          <div id="userModalBranchRow">
+            <label class="block text-xs text-slate-400 mb-1">Locked branch</label>
+            <select id="userModalBranch" class="w-full mb-3 rounded-lg bg-slate-950 border border-slate-700 px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-emerald-500">
+              <option value="Riyadh" ${(u.locked_branch || "Riyadh") === "Riyadh" ? "selected" : ""}>Riyadh</option>
+              <option value="Egypt" ${u.locked_branch === "Egypt" ? "selected" : ""}>Egypt</option>
+            </select>
+          </div>
+
+          <label class="flex items-center gap-2 mb-5 text-sm text-slate-300">
+            <input id="userModalManual" type="checkbox" class="accent-emerald-500" ${(u.can_manual_attendance !== false) ? "checked" : ""} />
+            Allow Add Manual attendance tab
+          </label>
+
+          <div class="flex justify-end gap-2">
+            <button onclick="closeUserModal()" class="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-sm text-slate-300">Cancel</button>
+            <button onclick="${isEdit ? `submitEditUser('${u.username}')` : "submitAddUser()"}" class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium text-white">Save</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function _toggleUserModalBranch() {
+    const isAdmin = document.getElementById("userModalIsAdmin").checked;
+    document.getElementById("userModalBranchRow").classList.toggle("hidden", isAdmin);
+  }
+
+  function openAddUserModal() {
+    document.body.insertAdjacentHTML("beforeend", _userModalHtml(null));
+    _toggleUserModalBranch();
+  }
+
+  function openEditUserModal(username) {
+    const u = _users.find(x => x.username === username);
+    if (!u) return;
+    document.body.insertAdjacentHTML("beforeend", _userModalHtml(u));
+    _toggleUserModalBranch();
+  }
+
+  function closeUserModal() {
+    const el = document.getElementById("userModalBackdrop");
+    if (el) el.remove();
+  }
+
+  async function submitAddUser() {
+    const msgEl = document.getElementById("userModalMsg");
+    const username = document.getElementById("userModalUsername").value.trim();
+    const password = document.getElementById("userModalPassword").value;
+    const isAdmin = document.getElementById("userModalIsAdmin").checked;
+    const branch = document.getElementById("userModalBranch").value;
+    const canManual = document.getElementById("userModalManual").checked;
+    if (!username || !password) { msgEl.textContent = "Username and password are required"; return; }
+    try {
+      const r = await fetch("/api/users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username, password, is_admin: isAdmin,
+          locked_branch: isAdmin ? null : branch,
+          can_manual_attendance: canManual,
+        }),
+      });
+      const j = await r.json();
+      if (!j.ok) { msgEl.textContent = j.error || "Failed to add user"; return; }
+      closeUserModal();
+      loadUsersTab();
+    } catch (e) { msgEl.textContent = "Network error"; }
+  }
+
+  async function submitEditUser(username) {
+    const msgEl = document.getElementById("userModalMsg");
+    const password = document.getElementById("userModalPassword").value;
+    const isAdmin = document.getElementById("userModalIsAdmin").checked;
+    const branch = document.getElementById("userModalBranch").value;
+    const canManual = document.getElementById("userModalManual").checked;
+    const body = {
+      is_admin: isAdmin,
+      locked_branch: isAdmin ? null : branch,
+      can_manual_attendance: canManual,
+    };
+    if (password) body.password = password;
+    try {
+      const r = await fetch(`/api/users/${encodeURIComponent(username)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const j = await r.json();
+      if (!j.ok) { msgEl.textContent = j.error || "Failed to update user"; return; }
+      closeUserModal();
+      loadUsersTab();
+    } catch (e) { msgEl.textContent = "Network error"; }
+  }
+
+  async function deleteUser(username) {
+    if (!confirm(`Delete user "${username}"? This cannot be undone.`)) return;
+    const msgEl = document.getElementById("usersMsg");
+    try {
+      const r = await fetch(`/api/users/${encodeURIComponent(username)}`, { method: "DELETE" });
+      const j = await r.json();
+      if (!j.ok) { msgEl.textContent = j.error || "Failed to delete user"; msgEl.className = "text-xs text-red-400"; return; }
+      msgEl.textContent = "";
+      loadUsersTab();
+    } catch (e) { msgEl.textContent = "Network error"; msgEl.className = "text-xs text-red-400"; }
+  }
+
+  document.addEventListener("DOMContentLoaded", () => {
+    const addBtn = document.getElementById("addUserBtn");
+    if (addBtn) addBtn.addEventListener("click", openAddUserModal);
+  });
 
   /* ===================== Advanced Tab ===================== */
 

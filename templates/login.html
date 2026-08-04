@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 min-h-screen flex items-center justify-center text-slate-200">
+  <div class="w-full max-w-sm">
+    <div class="rounded-xl border border-slate-800 bg-slate-900 p-8 shadow-xl">
+      <h1 class="text-lg font-semibold text-white mb-1">Sign in</h1>
+      <p class="text-sm text-slate-400 mb-6">Face Recognition Attendance System</p>
+
+      {% if error %}
+      <div class="mb-4 rounded-lg border border-red-900 bg-red-950/50 px-3 py-2 text-sm text-red-300">
+        {{ error }}
+      </div>
+      {% endif %}
+
+      <form method="post" action="{{ url_for('login') }}">
+        <input type="hidden" name="next" value="{{ next or '' }}">
+        <label class="block text-xs text-slate-400 mb-1" for="username">Username</label>
+        <input id="username" name="username" type="text" autocomplete="username" required autofocus
+          class="w-full mb-4 rounded-lg bg-slate-950 border border-slate-700 px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-emerald-500" />
+
+        <label class="block text-xs text-slate-400 mb-1" for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required
+          class="w-full mb-6 rounded-lg bg-slate-950 border border-slate-700 px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-emerald-500" />
+
+        <button type="submit"
+          class="w-full rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium py-2.5 transition-colors">
+          Sign in
+        </button>
+      </form>
+    </div>
+  </div>
+</body>
+</html>

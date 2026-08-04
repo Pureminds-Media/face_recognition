@@ -28,8 +28,18 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
     <script src="/static/i18n.js"></script>
     <script>
-    /* Branch state — persisted in localStorage */
-    window._branch = localStorage.getItem("branch") || "Riyadh";
+    /* Branch state — persisted in localStorage, unless the logged-in user
+       is locked to a branch (server also enforces this independently).
+       Scoped to the current username so switching accounts in the same
+       browser doesn't inherit another user's last-picked branch (e.g. a
+       branch-locked user's session leaking its branch into the next
+       person who logs in on the same machine). */
+    window._lockedBranch = {{ (locked_branch or "")|tojson }};
+    window._canManualAttendance = {{ (can_manual_attendance if can_manual_attendance is defined else true)|tojson }};
+    const _currentUsername = {{ (current_username or "")|tojson }};
+    const _branchStorageKey = "branch:" + _currentUsername;
+    window._branch = window._lockedBranch || localStorage.getItem(_branchStorageKey) || "Riyadh";
+    localStorage.removeItem("branch"); // stale unscoped key from before per-user scoping
 
     /* Page-specific applyLang wrapper — reinits flatpickr and rerenders charts */
     function applyLang(lang, rerender) {
@@ -47,8 +57,9 @@
     }
 
     function switchBranch(branch) {
+      if (window._lockedBranch) branch = window._lockedBranch;
       window._branch = branch;
-      localStorage.setItem("branch", branch);
+      localStorage.setItem(_branchStorageKey, branch);
       // Update button styles
       document.querySelectorAll(".branch-btn").forEach(btn => {
         const active = btn.dataset.branch === branch;
@@ -1289,6 +1300,22 @@
       window.addEventListener("DOMContentLoaded", async () => {
         // Initialize branch button states
         switchBranch(window._branch);
+        if (window._lockedBranch) {
+          document.querySelectorAll(".branch-btn").forEach(btn => {
+            if (btn.dataset.branch !== window._lockedBranch) btn.remove();
+            else btn.disabled = true;
+          });
+          const zoneBranchSel = document.getElementById("zonesTabBranchFilter");
+          if (zoneBranchSel) {
+            zoneBranchSel.value = window._lockedBranch;
+            zoneBranchSel.disabled = true;
+          }
+        }
+        if (!window._canManualAttendance) {
+          document.querySelectorAll('.tab-btn[data-tab="manual"]').forEach(btn => btn.remove());
+          const manualTab = document.getElementById("tab-manual");
+          if (manualTab) manualTab.remove();
+        }
         applyLang(window._lang, false);
         try { await loadCameraOptions(); } catch (e) {}
         loadDaily();
@@ -1828,7 +1855,7 @@
       let _zonesRefreshInterval = null;
 
       async function loadZoneStatusTab() {
-        const branch = (document.getElementById("zonesTabBranchFilter") || {}).value || "";
+        const branch = window._lockedBranch || (document.getElementById("zonesTabBranchFilter") || {}).value || "";
         const url = "/api/zones/status" + (branch ? `?branch=${encodeURIComponent(branch)}` : "");
         let rows = [];
         try {

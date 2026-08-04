@@ -18,10 +18,20 @@ import threading
 import time
 import uuid
 
-# Dump a C-level traceback to stderr on SIGSEGV/SIGFPE/SIGBUS.
-# This survives the crash and appears in the parent's log so we can
-# see exactly which thread and C frame caused the segfault.
-faulthandler.enable(file=sys.stderr, all_threads=True)
+# Dump a C-level traceback on SIGSEGV/SIGFPE/SIGBUS/SIGILL/SIGABRT.
+# faulthandler writes directly to a raw file descriptor from the signal
+# handler (async-signal-safe — it can't go through the `logging` module,
+# which isn't safe to call from a signal handler and wouldn't survive a
+# segfault anyway). faulthandler only supports one active output target
+# at a time (a second enable() call replaces, doesn't add to, the first) —
+# it previously targeted sys.stderr only, which is only visible in
+# whatever terminal launched the process and lost once that terminal
+# closes or isn't being watched. Point it at a dedicated file instead so
+# crash dumps persist; check logs/crashes.log after an unexplained
+# restart/gap in logs/app.log.
+os.makedirs("logs", exist_ok=True)
+_crash_log = open("logs/crashes.log", "a", buffering=1)
+faulthandler.enable(file=_crash_log, all_threads=True)
 
 
 def run(conn, state, engine_kwargs, log_level=logging.INFO):

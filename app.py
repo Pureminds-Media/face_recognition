@@ -1,5 +1,6 @@
 import os
 import sys
+import secrets
 # RTSP/HTTP camera tuning for OpenCV's FFmpeg backend.
 # - rtsp_transport=tcp avoids UDP packet loss/NAT issues common on Wi-Fi cams.
 # - stimeout (microseconds) caps socket-level read waits so a dead camera
@@ -31,7 +32,7 @@ import mimetypes
 import subprocess
 from datetime import datetime, date, timezone, timedelta
 from queue import Queue, Empty, Full
-from flask import Flask, Response, render_template, request, jsonify, send_from_directory, stream_with_context
+from flask import Flask, Response, render_template, request, jsonify, send_from_directory, stream_with_context, redirect, url_for, session
 from werkzeug.utils import secure_filename
 import threading
 import cv2
@@ -162,6 +163,260 @@ def _inject_api_key():
     """Make API_KEY available to Jinja templates so the local UI can attach
     it to every fetch() automatically."""
     return {"API_KEY": API_KEY}
+
+
+# --- UI login (session-based) -------------------------------------------------
+# Gates the browser-facing pages/API only — has no effect on the camera
+# engine subprocess, capture, recognition, or footage recording, which run
+# regardless of whether anyone is logged into the web UI.
+#
+# Users can be branch-locked: locked_branch forces every branch-filterable
+# request to that branch server-side (the query/body branch param is
+# overridden, not just hidden in the UI) and blocks manual-attendance
+# entirely. This is enforced in _require_ui_auth / the manual-attendance
+# route, not just hidden client-side, so it can't be bypassed by calling
+# the API directly.
+#
+# Persisted in users.json (Settings → User Management edits this file).
+# Passwords are stored in plaintext, matching how the original hardcoded
+# admin/mustafa credentials worked — fine for this app's threat model
+# (trusted operators, not a public multi-tenant service), but worth
+# hashing if this ever changes.
+_USERS_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.json")
+
+_DEFAULT_USERS = {
+    os.getenv("UI_AUTH_USER", "admin"): {
+        "password": os.getenv("UI_AUTH_PASSWORD", "admin123"),
+        "locked_branch": None,
+        "can_manual_attendance": True,
+        "is_admin": True,
+    },
+    "mustafa": {
+        "password": "mustafa_egypt",
+        "locked_branch": "Egypt",
+        "can_manual_attendance": False,
+        "is_admin": False,
+    },
+}
+
+
+def _load_users():
+    if os.path.exists(_USERS_CONFIG_PATH):
+        try:
+            with open(_USERS_CONFIG_PATH) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    _save_users(_DEFAULT_USERS)
+    return dict(_DEFAULT_USERS)
+
+
+def _save_users(users):
+    with open(_USERS_CONFIG_PATH, "w") as f:
+        json.dump(users, f, indent=2)
+
+
+UI_USERS = _load_users()
+app.secret_key = os.getenv("FLASK_SECRET_KEY") or secrets.token_hex(32)
+
+_UI_AUTH_EXEMPT_PATHS = {"/login", "/logout"}
+
+
+def current_user():
+    """Return the logged-in user's config dict, or None if not logged in."""
+    username = session.get("username")
+    if not username:
+        return None
+    return UI_USERS.get(username)
+
+
+@app.before_request
+def _require_ui_auth():
+    path = request.path or ""
+    if path in _UI_AUTH_EXEMPT_PATHS or path.startswith("/static/"):
+        return None
+    user = current_user()
+    if user is None:
+        if path.startswith("/api/") or path in ("/video", "/footage/"):
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        return redirect(url_for("login", next=request.path))
+
+    if not user.get("can_manual_attendance", True) and path == "/api/attendance/manual":
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+
+    locked_branch = user.get("locked_branch")
+    if locked_branch:
+        # Force the branch server-side for every branch-filterable request —
+        # overriding query args, not just what the UI displays, so a direct
+        # API call can't see or affect another branch's data. Applied even
+        # when no `branch` param was sent at all: several endpoints treat a
+        # missing branch as "no filter" (all branches), which is exactly
+        # the leak this closes — a locked user must never see cross-branch
+        # data by omission either.
+        if request.args.get("branch") != locked_branch:
+            args = request.args.copy()
+            args["branch"] = locked_branch
+            request.args = args
+
+        # IP camera group/camera routes take group_id/camera_id directly in
+        # the URL — block any request touching a group outside the user's
+        # locked branch, regardless of what the group-level list endpoint
+        # would show. Covers view (test), mutate (add/update/delete
+        # cameras), and group update/delete/reorder.
+        if path.startswith("/api/ip_cameras/groups/") or path.startswith("/api/ip_cameras/cameras/"):
+            state = _load_ip_cameras()
+            group = None
+            m = re.match(r"^/api/ip_cameras/groups/([^/]+)", path)
+            if m:
+                group = _find_group(state, m.group(1))
+            else:
+                m = re.match(r"^/api/ip_cameras/cameras/([^/]+)", path)
+                if m:
+                    group, _cam = _find_camera(state, m.group(1))
+            if group is not None and (group.get("branch") or "Riyadh") != locked_branch:
+                return jsonify({"ok": False, "error": "unauthorized"}), 403
+
+        # Same story for zone routes keyed by zone_id — view/assign/unassign/
+        # camera-list/update/delete on a zone outside the locked branch.
+        m = re.match(r"^/api/zones/(\d+)", path)
+        if m and db.is_available():
+            zone = next((z for z in db.get_zones() if str(z.get("id")) == m.group(1)), None)
+            if zone is not None and (zone.get("branch") or "Riyadh") != locked_branch:
+                return jsonify({"ok": False, "error": "unauthorized"}), 403
+    return None
+
+
+@app.context_processor
+def _inject_current_user():
+    user = current_user()
+    return {
+        "current_username": session.get("username"),
+        "locked_branch": (user or {}).get("locked_branch"),
+        "can_manual_attendance": (user or {}).get("can_manual_attendance", True),
+        "is_admin": (user or {}).get("is_admin", False),
+    }
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        user = UI_USERS.get(username)
+        if user and password == user["password"]:
+            session.clear()
+            session["username"] = username
+            session.permanent = True
+            next_url = request.form.get("next") or url_for("index")
+            return redirect(next_url)
+        return render_template("login.html", error="Invalid username or password", next=request.form.get("next", "")), 401
+    return render_template("login.html", next=request.args.get("next", ""))
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+def _require_admin():
+    user = current_user()
+    if not user or not user.get("is_admin"):
+        return jsonify({"ok": False, "error": "admin only"}), 403
+    return None
+
+
+@app.route("/api/users", methods=["GET"])
+def api_users_list():
+    denied = _require_admin()
+    if denied:
+        return denied
+    out = [
+        {
+            "username": name,
+            "locked_branch": u.get("locked_branch"),
+            "can_manual_attendance": u.get("can_manual_attendance", True),
+            "is_admin": u.get("is_admin", False),
+        }
+        for name, u in UI_USERS.items()
+    ]
+    return jsonify({"ok": True, "users": out})
+
+
+@app.route("/api/users", methods=["POST"])
+def api_users_create():
+    denied = _require_admin()
+    if denied:
+        return denied
+    payload = request.get_json(silent=True) or {}
+    username = str(payload.get("username", "")).strip()
+    password = str(payload.get("password", "")).strip()
+    is_admin = bool(payload.get("is_admin", False))
+    locked_branch = None if is_admin else (str(payload.get("locked_branch", "")).strip() or None)
+    can_manual_attendance = bool(payload.get("can_manual_attendance", True))
+
+    if not username or not password:
+        return jsonify({"ok": False, "error": "username and password are required"}), 400
+    if username in UI_USERS:
+        return jsonify({"ok": False, "error": "username already exists"}), 400
+
+    UI_USERS[username] = {
+        "password": password,
+        "locked_branch": locked_branch,
+        "can_manual_attendance": can_manual_attendance,
+        "is_admin": is_admin,
+    }
+    _save_users(UI_USERS)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/users/<username>", methods=["PUT"])
+def api_users_update(username):
+    denied = _require_admin()
+    if denied:
+        return denied
+    if username not in UI_USERS:
+        return jsonify({"ok": False, "error": "user not found"}), 404
+
+    payload = request.get_json(silent=True) or {}
+    u = UI_USERS[username]
+    is_admin = bool(payload.get("is_admin", u.get("is_admin", False)))
+
+    # Never let the last admin account get demoted/locked out — otherwise
+    # nobody could reach User Management to fix it.
+    if not is_admin and u.get("is_admin"):
+        remaining_admins = sum(
+            1 for n, other in UI_USERS.items() if n != username and other.get("is_admin")
+        )
+        if remaining_admins == 0:
+            return jsonify({"ok": False, "error": "cannot demote the only admin account"}), 400
+
+    if "password" in payload and str(payload["password"]).strip():
+        u["password"] = str(payload["password"]).strip()
+    u["is_admin"] = is_admin
+    u["locked_branch"] = None if is_admin else (str(payload.get("locked_branch", u.get("locked_branch") or "")).strip() or None)
+    if "can_manual_attendance" in payload:
+        u["can_manual_attendance"] = bool(payload["can_manual_attendance"])
+    _save_users(UI_USERS)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/users/<username>", methods=["DELETE"])
+def api_users_delete(username):
+    denied = _require_admin()
+    if denied:
+        return denied
+    if username not in UI_USERS:
+        return jsonify({"ok": False, "error": "user not found"}), 404
+    if UI_USERS[username].get("is_admin"):
+        remaining_admins = sum(1 for n, u in UI_USERS.items() if n != username and u.get("is_admin"))
+        if remaining_admins == 0:
+            return jsonify({"ok": False, "error": "cannot delete the only admin account"}), 400
+    if username == session.get("username"):
+        return jsonify({"ok": False, "error": "cannot delete the account you're logged in as"}), 400
+    del UI_USERS[username]
+    _save_users(UI_USERS)
+    return jsonify({"ok": True})
 
 ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 FACES_DIR = "faces"
@@ -1973,6 +2228,23 @@ def api_zones_list():
     return jsonify({"ok": True, "zones": db.get_zones(branch=branch)})
 
 
+def _zone_branch_denied(zone_id=None, requested_branch=None):
+    """Enforce a branch-locked user's zone access: they may only create/
+    edit/delete zones in their own branch, and can't set a zone's branch
+    to anything else. Returns a Flask response to short-circuit on, or
+    None if the request is allowed."""
+    locked_branch = (current_user() or {}).get("locked_branch")
+    if not locked_branch:
+        return None
+    if requested_branch and requested_branch != locked_branch:
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+    if zone_id is not None:
+        existing = next((z for z in db.get_zones() if z.get("id") == zone_id), None)
+        if existing and (existing.get("branch") or "Riyadh") != locked_branch:
+            return jsonify({"ok": False, "error": "unauthorized"}), 403
+    return None
+
+
 @app.route("/api/zones", methods=["POST"])
 def api_zones_create():
     _require_api_key()
@@ -1984,6 +2256,9 @@ def api_zones_create():
         return jsonify({"ok": False, "error": "name is required"}), 400
     description = (data.get("description") or "").strip()
     branch = (data.get("branch") or "Riyadh").strip()
+    locked_branch = (current_user() or {}).get("locked_branch")
+    if locked_branch:
+        branch = locked_branch
     try:
         zone_id = db.create_zone(name, description, branch)
     except Exception as e:
@@ -1997,6 +2272,9 @@ def api_zones_update(zone_id):
     if not db.is_available():
         return jsonify({"ok": False, "error": "DB unavailable"}), 503
     data = request.get_json(silent=True) or {}
+    denied = _zone_branch_denied(zone_id=zone_id, requested_branch=data.get("branch"))
+    if denied:
+        return denied
     db.update_zone(zone_id, name=data.get("name"), description=data.get("description"), branch=data.get("branch"))
     return jsonify({"ok": True})
 
@@ -2006,6 +2284,9 @@ def api_zones_delete(zone_id):
     _require_api_key()
     if not db.is_available():
         return jsonify({"ok": False, "error": "DB unavailable"}), 503
+    denied = _zone_branch_denied(zone_id=zone_id)
+    if denied:
+        return denied
     db.delete_zone(zone_id)
     return jsonify({"ok": True})
 
@@ -2623,6 +2904,16 @@ def api_status():
     })
 
 
+def _filter_devices_for_current_user(devices):
+    """Drop devices from another branch when the logged-in user is
+    branch-locked, so a direct API call can't reveal them either."""
+    user = current_user()
+    locked_branch = (user or {}).get("locked_branch")
+    if not locked_branch:
+        return devices
+    return [d for d in devices if not d.get("branch") or d.get("branch") == locked_branch]
+
+
 @app.route("/api/camera", methods=["GET"])
 def api_camera_get():
     # Determine which camera indices the engine currently holds open
@@ -2640,7 +2931,7 @@ def api_camera_get():
         {
             "running": engine.is_running(),
             "camera_source": _camera_source_to_text(engine.cam_index),
-            "devices": _list_camera_devices(),
+            "devices": _filter_devices_for_current_user(_list_camera_devices()),
             "active_cameras": active_cams,
             "viewer_mode": engine.viewer_mode,
             "viewer_source": engine.viewer_source,
@@ -2832,7 +3123,12 @@ def _all_resolved_urls(state, exclude_camera_id=None):
 
 @app.route("/api/ip_cameras", methods=["GET"])
 def api_ip_cameras_list():
-    return jsonify({"ok": True, **_serialize_state(_load_ip_cameras())})
+    result = _serialize_state(_load_ip_cameras())
+    user = current_user()
+    locked_branch = (user or {}).get("locked_branch")
+    if locked_branch:
+        result["groups"] = [g for g in result["groups"] if g.get("branch") == locked_branch]
+    return jsonify({"ok": True, **result})
 
 
 @app.route("/api/ip_cameras/groups", methods=["POST"])
@@ -2841,6 +3137,9 @@ def api_ip_cameras_group_add():
     name = str(payload.get("name", "")).strip() or "Group"
     base_url = str(payload.get("base_url", "")).strip()
     branch = str(payload.get("branch", "Riyadh")).strip() or "Riyadh"
+    locked_branch = (current_user() or {}).get("locked_branch")
+    if locked_branch:
+        branch = locked_branch
     with _ip_cameras_lock:
         state = _load_ip_cameras()
         group = {"id": _new_id(), "name": name, "base_url": base_url, "branch": branch, "cameras": []}
@@ -2855,6 +3154,7 @@ def api_ip_cameras_group_update(group_id):
     new_name = payload.get("name")
     new_base = payload.get("base_url")
     new_branch = payload.get("branch")
+    locked_branch = (current_user() or {}).get("locked_branch")
     with _ip_cameras_lock:
         state = _load_ip_cameras()
         g = _find_group(state, group_id)
@@ -2866,7 +3166,7 @@ def api_ip_cameras_group_update(group_id):
                 g["name"] = n
         if new_base is not None:
             g["base_url"] = str(new_base).strip()
-        if new_branch is not None:
+        if new_branch is not None and not locked_branch:
             b = str(new_branch).strip()
             if b:
                 g["branch"] = b
@@ -3357,9 +3657,12 @@ def api_history_locations():
     """List all known locations."""
     if not db.is_available():
         return jsonify({"ok": False, "error": "database not available"}), 503
+    branch = request.args.get("branch") or None
     locs = db.get_locations()
     for l in locs:
         l["display_name"] = _resolve_camera_display_name(l.get("camera_source"))
+    if branch:
+        locs = [l for l in locs if _get_camera_branch(l.get("camera_source")) == branch]
     return jsonify({"ok": True, "locations": locs})
 
 

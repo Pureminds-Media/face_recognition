@@ -1,0 +1,14 @@
+{
+  "admin": {
+    "password": "admin123",
+    "locked_branch": null,
+    "can_manual_attendance": true,
+    "is_admin": true
+  },
+  "mustafa": {
+    "password": "mustafa_egypt",
+    "locked_branch": "Egypt",
+    "can_manual_attendance": false,
+    "is_admin": false
+  }
+}
