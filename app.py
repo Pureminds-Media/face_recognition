@@ -2594,8 +2594,9 @@ def api_delete_person(name):
     # Remove face images
     shutil.rmtree(person_dir)
 
-    # Delete visits and metadata from DB
+    # Delete visits, gate events, and metadata from DB
     deleted_visits = db.delete_person_visits(person)
+    db.delete_person_gate_events(person)
     db.delete_person_meta(person)
 
     # Reload face embeddings
@@ -2855,13 +2856,21 @@ def api_merge_people():
         except Exception:
             pass
 
-    # Reassign visit history rows from each source to the target so that
-    # historical visits appear under the merged identity.
+    # Reassign visit history and gate events from each source to the target
+    # so that historical visits/reports appear under the merged identity.
     rows_updated = 0
     if db.is_available():
         for src in sources:
             try:
                 rows_updated += int(db.rename_person(src, target_name) or 0)
+            except Exception:
+                pass
+            try:
+                db.rename_person_gate_events(src, target_name)
+            except Exception:
+                pass
+            try:
+                db.delete_person_meta(src)
             except Exception:
                 pass
 

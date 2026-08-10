@@ -111,6 +111,15 @@
           };
           window.EventSource.prototype = OrigES.prototype;
         }
+        // XHR isn't used on this page currently, but patch it too so any
+        // future XHR-based call (e.g. upload progress tracking) doesn't
+        // silently miss the key the way fetch()-only patching would.
+        const origXhrOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function (...args) {
+          const result = origXhrOpen.apply(this, args);
+          try { this.setRequestHeader("X-API-Key", KEY); } catch (e) {}
+          return result;
+        };
         // <img>/<video>/<source> can't carry headers; append api_key as query.
         const PROTECTED = /^\/(?:video|screenshots|footage|faces)(?:\/|$|\?)/;
         function patchSrc(proto) {

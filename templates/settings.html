@@ -59,6 +59,18 @@
           };
           window.EventSource.prototype = OrigES.prototype;
         }
+        // XHR-based uploads (upload_face, bulk_upload_faces) use
+        // XMLHttpRequest directly for progress events, which fetch's patch
+        // above doesn't cover — attach the key here too so they work over
+        // any non-localhost origin (API_KEY is only enforced externally).
+        // setRequestHeader must be called after open() but before send(),
+        // so it's set directly here rather than in a send()-time listener.
+        const origXhrOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function (...args) {
+          const result = origXhrOpen.apply(this, args);
+          try { this.setRequestHeader("X-API-Key", KEY); } catch (e) {}
+          return result;
+        };
         const PROTECTED = /^\/(?:video|screenshots|footage|faces)(?:\/|$|\?)/;
         function patchSrc(proto) {
           const desc = Object.getOwnPropertyDescriptor(proto, "src");

@@ -1031,6 +1031,24 @@ def delete_person_visits(person_name):
         return cur.rowcount
 
 
+def delete_person_gate_events(person_name):
+    """Delete all gate_events for a person. Returns number of rows deleted."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    sql = _param(f"DELETE FROM gate_events WHERE person_name = {ph}")
+    with _cursor(commit=True) as cur:
+        cur.execute(sql, (person_name,))
+        return cur.rowcount
+
+
+def rename_person_gate_events(old_name, new_name):
+    """Reassign gate_events from old_name to new_name. Returns rows updated."""
+    ph = "?" if _backend == "sqlite" else "%s"
+    sql = _param(f"UPDATE gate_events SET person_name = {ph} WHERE person_name = {ph}")
+    with _cursor(commit=True) as cur:
+        cur.execute(sql, (new_name, old_name))
+        return cur.rowcount
+
+
 def clear_all_data():
     """Delete all visits and sessions. Locations are kept (they map to cameras).
 
