@@ -208,6 +208,9 @@ screenshots/
 # Visit footage clips
 footage/
 
+# Tracker screenshots
+static/tracker_snapshots/
+
 # Cached ONNX models (auto-downloaded on first run)
 models/
 

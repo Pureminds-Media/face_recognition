@@ -613,6 +613,8 @@ def _serialize_state(state):
                 "channel": c.get("channel") or "",
                 "url": c.get("url") or "",
                 "resolved_url": _resolved_camera_url(c, base),
+                "motion_gate_enabled": c.get("motion_gate_enabled"),
+                "motion_threshold": c.get("motion_threshold"),
             })
         out["groups"].append({
             "id": g.get("id"),
@@ -801,8 +803,14 @@ def _engine_watchdog():
 
                 # Swap the connection on the existing EngineClient so all
                 # existing route handlers pick it up without a restart.
-                object.__setattr__(engine, "_conn", new_conn)
-                object.__setattr__(engine, "_lock", threading.Lock())
+                # Goes through _swap_connection() (holds the client's one
+                # lock) rather than replacing the lock itself — swapping
+                # the lock let an in-flight call on the old lock race a
+                # new call on the new lock, both touching the same pipe
+                # with no mutual exclusion, occasionally handing one
+                # caller another caller's response (e.g. manual_detect
+                # receiving a stop_footage tuple).
+                engine._swap_connection(new_conn)
 
                 # Wait for the new process to publish its state
                 t0 = time.time()
@@ -894,6 +902,7 @@ def _bootstrap_post_engine():
             log.info("High-priority gate cameras registered: %s", _hp)
     except Exception as _e:
         log.warning("Could not set high_priority_sources: %s", _e)
+    _push_motion_gate_overrides()
     try:
         _tc = _load_tracker_config()
         if _tc["cameras"]:
@@ -1339,6 +1348,23 @@ def _get_gate_cameras():
 _gate_camera_cache = {"arrival": "", "exit": "", "t": 0.0}
 
 
+GATE_ARRIVAL_ANY_CAMERA = "__any__"
+
+
+def _gate_camera_display_name(arrival_cam, exit_cam):
+    """Resolve a human-readable label for the report header's camera_name
+    field. arrival_cam may be the "any camera" sentinel, which has no
+    matching row in the locations table."""
+    if arrival_cam == GATE_ARRIVAL_ANY_CAMERA:
+        if not exit_cam:
+            return "Any camera"
+        exit_loc = db.get_location_by_source(exit_cam)
+        exit_name = exit_loc["name"] if exit_loc else exit_cam
+        return f"Any camera / {exit_name}"
+    loc = db.get_location_by_source(arrival_cam or exit_cam)
+    return loc["name"] if loc else (arrival_cam or exit_cam)
+
+
 def _handle_gate_event(person_name, camera_source):
     """Called on every new visit / camera transition. Writes to gate_events."""
     if not db.is_available():
@@ -1346,9 +1372,12 @@ def _handle_gate_event(person_name, camera_source):
     try:
         arrival_cam, exit_cam = _get_gate_cameras()
         now_dt = datetime.now(timezone.utc)
+        is_arrival_cam = arrival_cam and (
+            arrival_cam == GATE_ARRIVAL_ANY_CAMERA or camera_source == arrival_cam
+        )
         if exit_cam and camera_source == exit_cam:
             db.open_gate_exit(person_name, now_dt)
-        elif arrival_cam and camera_source == arrival_cam:
+        elif is_arrival_cam:
             # Try to close an open exit event (normal two-camera flow).
             closed = db.close_gate_entry(person_name, now_dt)
             if closed is None:
@@ -2615,10 +2644,12 @@ def api_person_images(name):
     if not os.path.isdir(person_dir):
         return jsonify({"ok": False, "error": f"Person '{person}' not found"}), 404
 
-    imgs = []
-    for f in sorted(os.listdir(person_dir)):
-        if os.path.splitext(f)[1].lower() in ALLOWED_EXTS:
-            imgs.append({"filename": f, "url": f"/faces/{person}/{f}"})
+    filenames = [f for f in os.listdir(person_dir) if os.path.splitext(f)[1].lower() in ALLOWED_EXTS]
+    # Numeric-aware sort — must match list_people()'s thumbnail ordering
+    # (imgs[0] there) exactly, or the gallery's starred/thumbnail image
+    # wouldn't correspond to what actually shows as the person's thumbnail.
+    filenames.sort(key=lambda x: (int(os.path.splitext(x)[0]) if os.path.splitext(x)[0].isdigit() else 10**9, x))
+    imgs = [{"filename": f, "url": f"/faces/{person}/{f}"} for f in filenames]
 
     return jsonify({"ok": True, "person": person, "images": imgs})
 
@@ -2651,6 +2682,53 @@ def api_delete_person_image(name, filename):
 
     _reload_faces_async()
     return jsonify({"ok": True, "person_removed": person_removed})
+
+@app.route("/api/person/<name>/image/<filename>/set_thumbnail", methods=["POST"])
+def api_set_person_thumbnail(name, filename):
+    """Make *filename* the person's gallery thumbnail.
+
+    list_people() always uses the numerically-lowest image as the
+    thumbnail, so this swaps filename's number with whichever number is
+    currently lowest — no separate "thumbnail" field/DB column needed.
+    Uses a temp name for the swap so two files never collide mid-rename.
+    """
+    person = safe_person_name(name)
+    if not person:
+        return jsonify({"ok": False, "error": "Invalid person name"}), 400
+
+    filename = secure_filename(filename)
+    if not filename:
+        return jsonify({"ok": False, "error": "Invalid filename"}), 400
+
+    person_dir = os.path.join(FACES_DIR, person)
+    target_path = os.path.join(person_dir, filename)
+    if not os.path.isfile(target_path):
+        return jsonify({"ok": False, "error": "Image not found"}), 404
+
+    imgs = [f for f in os.listdir(person_dir) if os.path.splitext(f)[1].lower() in ALLOWED_EXTS]
+    imgs.sort(key=lambda x: (int(os.path.splitext(x)[0]) if os.path.splitext(x)[0].isdigit() else 10**9, x))
+    if not imgs or imgs[0] == filename:
+        return jsonify({"ok": True, "already_thumbnail": True})
+
+    current_first = imgs[0]
+    first_num = os.path.splitext(current_first)[0]
+    target_num = os.path.splitext(filename)[0]
+    ext_target = os.path.splitext(filename)[1]
+    ext_first = os.path.splitext(current_first)[1]
+    first_path = os.path.join(person_dir, current_first)
+
+    new_target_name = f"{first_num}{ext_target}"   # filename takes the lowest slot
+    new_first_name = f"{target_num}{ext_first}"    # old first takes filename's old slot
+
+    tmp_path = os.path.join(person_dir, f".swap_{uuid.uuid4().hex}{ext_target}")
+    os.rename(target_path, tmp_path)
+    os.rename(first_path, os.path.join(person_dir, new_first_name))
+    os.rename(tmp_path, os.path.join(person_dir, new_target_name))
+
+    with _people_cache_lock:
+        _people_cache["sig"] = None
+    return jsonify({"ok": True, "thumbnail": new_target_name})
+
 
 @app.route("/api/person/<name>/image/<filename>/transfer", methods=["POST"])
 def api_transfer_person_image(name, filename):
@@ -2985,6 +3063,27 @@ def _refresh_source_name_map():
     }
 
 
+def _push_motion_gate_overrides():
+    """Rebuild per-camera motion-gate overrides from ip_cameras.json and
+    push them to the engine. A camera only gets an override entry if it
+    explicitly sets motion_gate_enabled and/or motion_threshold — cameras
+    without either field fall back to the engine-wide motion_gate/
+    motion_thresh setting (see FaceEngine.set_config)."""
+    overrides = {}
+    for _, cam, url in _expanded_cameras(_load_ip_cameras()):
+        entry = {}
+        if "motion_gate_enabled" in cam:
+            entry["enabled"] = bool(cam["motion_gate_enabled"])
+        if "motion_threshold" in cam:
+            entry["threshold"] = int(cam["motion_threshold"])
+        if entry:
+            overrides[url] = entry
+    try:
+        engine.set_config({"motion_gate_overrides": overrides})
+    except Exception as e:
+        log.warning("Could not push motion_gate_overrides: %s", e)
+
+
 @app.route("/api/camera", methods=["POST"])
 def api_camera_set():
     """Update *viewer* state. Does not stop or restart the engine —
@@ -3118,6 +3217,147 @@ def api_camera_reconnect():
     if not found:
         return jsonify({"ok": False, "error": "camera not found in active grid"}), 404
     return jsonify({"ok": True})
+
+
+@app.route("/api/camera/manual_detect", methods=["POST"])
+def api_camera_manual_detect():
+    """Freeze the current frame for one camera and run face + head
+    detection immediately, independent of AUTO_CAPTURE_ENABLED. Known
+    faces are reported as matches; unrecognised faces are saved as a new
+    unknown_N right away — a manual click already expresses the "capture
+    this" intent that the automatic pipeline otherwise waits several
+    seconds to infer from continuous tracking.
+
+    Every matched (or newly captured) face also marks attendance for that
+    person via the same _update_attendance_from_tracks() path the live
+    detection loop uses — opening/updating a visit, firing gate events,
+    etc. — so a manual Detect has the same real-world effect as being
+    seen by the automatic pipeline, not just a passive lookup.
+
+    Body: {"source": "<rtsp url or camera source string>"}
+    """
+    data = request.get_json(silent=True) or {}
+    source = (data.get("source") or "").strip()
+    if not source:
+        return jsonify({"ok": False, "error": "source required"}), 400
+    try:
+        result = engine.manual_detect(source)
+    except RuntimeError as e:
+        return jsonify({"ok": False, "error": str(e)}), 503
+    if not isinstance(result, dict):
+        log.warning("manual_detect returned unexpected result: %r", result)
+        return jsonify({"ok": False, "error": "detection failed unexpectedly — try again"}), 500
+
+    if result.get("ok") and result.get("faces"):
+        now_mono = time.monotonic()
+        fake_tracks = [
+            {
+                "name": f["name"],
+                "camera_source": source,
+                "best": f.get("confidence"),
+                "last_detect_t": now_mono,
+                "last_head_t": now_mono,
+            }
+            for f in result["faces"]
+            if f.get("name") and f["name"] != "unknown"
+        ]
+        if fake_tracks:
+            try:
+                _update_attendance_from_tracks(fake_tracks)
+            except Exception as e:
+                log.warning("manual_detect: failed to mark attendance: %s", e)
+
+    status = 200 if result.get("ok") else 404
+    return jsonify(result), status
+
+
+_TRACKER_SNAPSHOTS_PREFIX = "static/tracker_snapshots/"
+
+
+def _validate_manual_detect_frame_path(frame_path):
+    """frame_path must be one manual_detect() generated itself — reject
+    anything that doesn't stay inside the snapshot directory, so this
+    can't be used to read arbitrary files off disk. Returns an error
+    string, or None if valid."""
+    base = os.path.basename(frame_path)
+    expected = os.path.join(_TRACKER_SNAPSHOTS_PREFIX, base)
+    if (not frame_path.startswith(_TRACKER_SNAPSHOTS_PREFIX)
+            or frame_path != expected
+            or not base.startswith("manual_detect_")):
+        return "invalid frame_path"
+    if not os.path.isfile(frame_path):
+        return "frozen frame not found — please Detect again"
+    return None
+
+
+@app.route("/api/camera/manual_detect_region", methods=["POST"])
+def api_camera_manual_detect_region():
+    """Re-run detection on a cropped region of an already-frozen
+    manual-detect frame (see /api/camera/manual_detect). Lets the UI zoom
+    into a spot the full-frame pass missed by clicking on the image.
+
+    Body: {"frame_path": "static/tracker_snapshots/....jpg",
+           "x": int, "y": int, "w": int, "h": int}
+    """
+    data = request.get_json(silent=True) or {}
+    frame_path = str(data.get("frame_path") or "")
+    err = _validate_manual_detect_frame_path(frame_path)
+    if err:
+        return jsonify({"ok": False, "error": err}), 400 if err == "invalid frame_path" else 404
+
+    try:
+        x, y, w, h = (int(data.get(k, 0)) for k in ("x", "y", "w", "h"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "x, y, w, h must be integers"}), 400
+    if w <= 0 or h <= 0:
+        return jsonify({"ok": False, "error": "w and h must be positive"}), 400
+
+    try:
+        result = engine.manual_detect_region(frame_path, x, y, w, h)
+    except RuntimeError as e:
+        return jsonify({"ok": False, "error": str(e)}), 503
+    if not isinstance(result, dict):
+        log.warning("manual_detect_region returned unexpected result: %r", result)
+        return jsonify({"ok": False, "error": "detection failed unexpectedly — try again"}), 500
+    status = 200 if result.get("ok") else 404
+    return jsonify(result), status
+
+
+@app.route("/api/camera/assign_head_crop", methods=["POST"])
+def api_camera_assign_head_crop():
+    """Manually assign a head-only detection (no face was found) to a
+    person, saving the head crop as a reference image in their faces/
+    folder. Does not contribute a face embedding — see
+    FaceEngine.assign_head_crop for why.
+
+    Body: {"frame_path": "static/tracker_snapshots/....jpg",
+           "x": int, "y": int, "w": int, "h": int, "person_name": str}
+    """
+    data = request.get_json(silent=True) or {}
+    frame_path = str(data.get("frame_path") or "")
+    err = _validate_manual_detect_frame_path(frame_path)
+    if err:
+        return jsonify({"ok": False, "error": err}), 400 if err == "invalid frame_path" else 404
+
+    person_name = safe_person_name(data.get("person_name", ""))
+    if not person_name:
+        return jsonify({"ok": False, "error": "person_name is required"}), 400
+
+    try:
+        x, y, w, h = (int(data.get(k, 0)) for k in ("x", "y", "w", "h"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "x, y, w, h must be integers"}), 400
+    if w <= 0 or h <= 0:
+        return jsonify({"ok": False, "error": "w and h must be positive"}), 400
+
+    try:
+        result = engine.assign_head_crop(frame_path, x, y, w, h, person_name)
+    except RuntimeError as e:
+        return jsonify({"ok": False, "error": str(e)}), 503
+    if not isinstance(result, dict):
+        return jsonify({"ok": False, "error": "assign failed unexpectedly — try again"}), 500
+    return jsonify(result), (200 if result.get("ok") else 400)
+
 
 def _all_resolved_urls(state, exclude_camera_id=None):
     """Return a set of resolved URLs across all groups, optionally
@@ -3263,12 +3503,21 @@ def api_ip_cameras_camera_update(camera_id):
             else:
                 cam.pop("channel", None)
 
+        if "motion_gate_enabled" in payload:
+            cam["motion_gate_enabled"] = bool(payload["motion_gate_enabled"])
+        if "motion_threshold" in payload:
+            try:
+                cam["motion_threshold"] = max(1, int(payload["motion_threshold"]))
+            except (TypeError, ValueError):
+                pass
+
         # Duplicate URL check across all groups (excluding this camera)
         resolved = _resolved_camera_url(cam, group.get("base_url", ""))
         if resolved and resolved in _all_resolved_urls(state, exclude_camera_id=camera_id):
             return jsonify({"ok": False, "error": "another camera with this URL already exists"}), 400
 
         _save_ip_cameras(state)
+    _push_motion_gate_overrides()
     return jsonify({"ok": True, "camera": {**cam, "resolved_url": resolved}})
 
 
@@ -3962,9 +4211,17 @@ def api_analytics_summary():
             GROUP BY hr ORDER BY cnt DESC LIMIT 1
         """
 
-    # People present today — distinct known persons seen today
+    # People present today — distinct known persons seen today. Fetches
+    # names (not just a COUNT) because a plain count can include stale
+    # visits.person_name values left over from a rename/merge that no
+    # longer match any real enrolled folder/branch member — inflating
+    # present_today and, via the enrolled_known - present_today
+    # subtraction below, silently undercounting absent_today. Intersecting
+    # with the real enrolled set (same approach the present/absent list
+    # endpoint already uses) keeps this tile's count consistent with that
+    # modal's list.
     present_sql = f"""
-        SELECT COUNT(DISTINCT person_name) as cnt FROM visits
+        SELECT DISTINCT person_name FROM visits
         WHERE first_seen >= {ph} AND first_seen < {ph}
           AND person_name NOT LIKE 'unknown_%'
           {branch_clause}
@@ -3979,7 +4236,7 @@ def api_analytics_summary():
         hour_row = db._row_to_dict(cur.fetchone())
 
         cur.execute(present_sql, params)
-        present_row = db._row_to_dict(cur.fetchone())
+        present_names = {r["person_name"] for r in db._rows_to_dicts(cur.fetchall())}
 
     # Count unknowns from faces/ folder
     known_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "faces")
@@ -3990,19 +4247,19 @@ def api_analytics_summary():
             if os.path.isdir(os.path.join(known_dir, d)) and _re.match(r'^unknown_\d+$', d):
                 unknowns_count += 1
 
-    present_today = int(present_row["cnt"]) if present_row else 0
-
     # Absent = people assigned to this branch in the people table minus present today.
     # Without branch filter, fall back to total enrolled known folders.
     if branch:
-        enrolled_known = len(db.get_branch_members(branch))
+        enrolled_set = set(db.get_branch_members(branch))
     else:
-        enrolled_known = 0
+        enrolled_set = set()
         if os.path.isdir(known_dir):
             for d in os.listdir(known_dir):
                 if os.path.isdir(os.path.join(known_dir, d)) and not _re.match(r'^unknown_\d+$', d):
-                    enrolled_known += 1
+                    enrolled_set.add(d)
 
+    present_today = len(present_names & enrolled_set)
+    enrolled_known = len(enrolled_set)
     absent_today = max(0, enrolled_known - present_today)
 
     peak_hour = None
@@ -4400,8 +4657,13 @@ def _generate_gate_report(arrival_camera, exit_camera, date_from, date_to,
     date_from_str = date_from.astimezone().strftime("%Y-%m-%d")
     date_to_str = (date_to - timedelta(seconds=1)).astimezone().strftime("%Y-%m-%d")
 
-    # Raw gate events for the date range
-    raw_events = db.get_gate_events_range(date_from_str, date_to_str)
+    # Raw gate events for the date range — exclude unknown_N: they're
+    # auto-captured, unidentified tracks, not something worth tracking
+    # attendance/gate activity for in this report.
+    raw_events = [
+        ev for ev in db.get_gate_events_range(date_from_str, date_to_str)
+        if not re.match(r"^unknown_\d+$", ev.get("person_name") or "")
+    ]
 
     # Arrival times: earliest visit on ANY camera per person per day
     arrival_map = defaultdict(dict)  # person → {date_str → HH:MM}
@@ -4425,7 +4687,7 @@ def _generate_gate_report(arrival_camera, exit_camera, date_from, date_to,
                 day = fs.astimezone().strftime("%Y-%m-%d")
                 arrival_map[row["person_name"]][day] = fs.astimezone().strftime("%H:%M")
 
-    all_meta = db.get_all_people_meta()
+    all_meta = [m for m in db.get_all_people_meta() if not re.match(r"^unknown_\d+$", m.get("name") or "")]
     meta_map = {m["name"]: m.get("arabic_name", "") for m in all_meta}
     shift_map = {m["name"]: (m.get("shift") or "morning") for m in all_meta}
     all_people = {m["name"] for m in all_meta}
@@ -4484,6 +4746,14 @@ def _generate_gate_report(arrival_camera, exit_camera, date_from, date_to,
                 entry_t = ev.get("entry_time")
                 dur = ev.get("duration_minutes")
                 still_out = entry_t is None
+
+                # write_arrival_event() writes standalone-arrival rows with
+                # exit_time == entry_time (no exit camera event exists — it
+                # just records "seen at this time" so the report still has
+                # an arrival). These aren't real exits and shouldn't render
+                # as one, or they show up as bogus "0 minute" exit/returns.
+                if entry_t is not None and str(exit_t) == str(entry_t):
+                    continue
 
                 # Format timestamps to HH:MM
                 def _fmt_ts(ts):
@@ -4767,8 +5037,7 @@ def api_reports_gate():
 
     records = _generate_gate_report(arrival_cam, exit_cam, date_from, date_to, late_threshold, work_start,
                                     night_shift_enabled, night_work_start, night_late_threshold)
-    loc = db.get_location_by_source(arrival_cam or exit_cam)
-    camera_name = loc["name"] if loc else (arrival_cam or exit_cam)
+    camera_name = _gate_camera_display_name(arrival_cam, exit_cam)
 
     return jsonify({
         "ok": True,
@@ -4816,8 +5085,7 @@ def api_reports_export():
 
     records = _generate_gate_report(arrival_cam, exit_cam, date_from, date_to, late_threshold, work_start,
                                     night_shift_enabled, night_work_start, night_late_threshold)
-    loc = db.get_location_by_source(arrival_cam or exit_cam)
-    camera_name = loc["name"] if loc else (arrival_cam or exit_cam)
+    camera_name = _gate_camera_display_name(arrival_cam, exit_cam)
     date_label = f"آخر {n} يوم" if n > 1 else datetime.now().strftime("%Y-%m-%d")
 
     xlsx_bytes = _build_report_excel(records, date_label, camera_name, work_start, late_threshold)
@@ -4865,8 +5133,7 @@ def _send_report_email(records, cfg, report_date, send_cc=True):
 
     arrival_cam = cfg.get("arrival_camera", "")
     exit_cam = cfg.get("exit_camera", "")
-    loc = db.get_location_by_source(arrival_cam or exit_cam)
-    camera_name = loc["name"] if loc else (arrival_cam or exit_cam)
+    camera_name = _gate_camera_display_name(arrival_cam, exit_cam)
 
     xlsx_bytes = _build_report_excel(records, report_date, camera_name, work_start, late_threshold)
 

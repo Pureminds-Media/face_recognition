@@ -6,6 +6,8 @@ import struct
 import subprocess
 import threading
 import collections
+import uuid
+import logging
 from queue import Queue, Empty, Full
 import cv2
 import numpy as np
@@ -364,6 +366,10 @@ class FaceEngine:
         self.viewer_jpeg_quality = viewer_jpeg_quality
         self.motion_gate = bool(motion_gate)
         self.motion_thresh = int(motion_thresh)
+        # Per-camera overrides of motion_gate/motion_thresh, keyed by camera
+        # source string. Falls back to the engine-wide motion_gate/
+        # motion_thresh above when a camera has no override entry.
+        self.motion_gate_overrides = {}
         self.min_face_size = int(min_face_size)
         self.high_priority_sources = set()  # always full-res, no motion gate
         self._last_viewer_req_t = 0.0
@@ -1034,6 +1040,7 @@ class FaceEngine:
             "viewer_jpeg_quality": self.viewer_jpeg_quality,
             "motion_gate": self.motion_gate,
             "motion_thresh": self.motion_thresh,
+            "motion_gate_overrides": dict(self.motion_gate_overrides),
             "min_face_size": self.min_face_size,
             "high_priority_sources": list(self.high_priority_sources),
         }
@@ -1051,6 +1058,19 @@ class FaceEngine:
             self.motion_gate = bool(d["motion_gate"])
         if "motion_thresh" in d:
             self.motion_thresh = max(1, int(d["motion_thresh"]))
+        if "motion_gate_overrides" in d:
+            _new_overrides = {}
+            for _src, _cfg in (d.get("motion_gate_overrides") or {}).items():
+                if not isinstance(_cfg, dict):
+                    continue
+                _entry = {}
+                if "enabled" in _cfg:
+                    _entry["enabled"] = bool(_cfg["enabled"])
+                if "threshold" in _cfg:
+                    _entry["threshold"] = max(1, int(_cfg["threshold"]))
+                if _entry:
+                    _new_overrides[str(_src)] = _entry
+            self.motion_gate_overrides = _new_overrides
         if "min_face_size" in d:
             self.min_face_size = max(1, int(d["min_face_size"]))
         if "high_priority_sources" in d:
@@ -1854,7 +1874,12 @@ class FaceEngine:
             return []
         try:
             return self._head_detector.detect(frame)
-        except Exception:
+        except Exception as e:
+            if not getattr(self, "_head_detect_warned", False):
+                self._head_detect_warned = True
+                logging.getLogger(__name__).warning(
+                    "Head detector unavailable (model missing or failed to load): %s", e
+                )
             return []
 
     @staticmethod
@@ -2069,6 +2094,213 @@ class FaceEngine:
         # Cleanup
         pending.pop(tid, None)
         return next_name
+
+    def manual_detect(self, camera_source):
+        """One-shot manual detection triggered from the UI's "Detect" button.
+
+        Freezes the current frame for *camera_source*, runs face detection
+        (matched against known people) and head detection, and returns a
+        summary. Unlike the continuous auto-capture pipeline, this does NOT
+        require ``auto_capture_enabled`` and does not wait for a person to
+        be tracked for several seconds — an unrecognised face is saved as a
+        new ``unknown_N`` immediately, since a manual click is itself the
+        "this is worth capturing" signal a human would otherwise wait for.
+
+        Returns a dict: {"ok", "error", "faces": [...], "heads": [...],
+        "heads_detected": int, "frame_path": str | None, "frame_width",
+        "frame_height"}. Each face entry is {"bbox": [x,y,w,h], "name",
+        "confidence", "captured"}; each head entry is {"bbox", "confidence"}.
+        frame_path is a server-relative path (under static/) to the frame
+        that was analyzed, so the UI can render it with detection boxes
+        drawn on top.
+        """
+        with self._grid_workers_lock:
+            worker = self._grid_workers.get(str(camera_source))
+        if worker is None:
+            return {"ok": False, "error": "camera not found", "faces": [], "heads_detected": 0}
+
+        with worker["lock"]:
+            raw_frame = worker.get("latest_raw_frame")
+        if raw_frame is None:
+            return {"ok": False, "error": "no frame available for this camera yet", "faces": [], "heads_detected": 0}
+        frame = raw_frame.copy()
+
+        detections = self._detect_and_match_faces(frame, min_face_size=self.min_face_size, force_full_res=True)
+        head_bboxes = self._run_head_detection(frame)
+
+        faces_out = []
+        for (x, y, w, h, name, confidence) in detections:
+            entry = {"bbox": [x, y, w, h], "name": name, "confidence": round(float(confidence), 4), "captured": False}
+            if name == "unknown":
+                saved_name = self._save_manual_unknown(frame, (x, y, w, h))
+                if saved_name:
+                    entry["name"] = saved_name
+                    entry["captured"] = True
+            faces_out.append(entry)
+
+        heads_out = [{"bbox": [int(hx), int(hy), int(hw), int(hh)], "confidence": round(float(hc), 4)}
+                     for (hx, hy, hw, hh, hc) in head_bboxes]
+
+        # Save the frozen frame to disk and return a path rather than a
+        # base64 blob over the multiprocessing.Pipe — a 4K JPEG can be
+        # several hundred KB to a few MB as base64, and one bad multi-MB
+        # message on the pipe was intermittently coming back as a `None`
+        # result on the Flask side (a pipe-level issue, not an exception —
+        # nothing was logged in the engine subprocess either). The tracker
+        # snapshot feature uses the same disk-handoff pattern for the same
+        # reason.
+        _snap_dir = os.path.join("static", "tracker_snapshots")
+        os.makedirs(_snap_dir, exist_ok=True)
+        _fname = f"manual_detect_{uuid.uuid4().hex}.jpg"
+        _fpath = os.path.join(_snap_dir, _fname)
+        frame_path = None
+        try:
+            if cv2.imwrite(_fpath, frame, [cv2.IMWRITE_JPEG_QUALITY, 85]):
+                frame_path = f"{_snap_dir}/{_fname}"
+        except Exception:
+            pass
+
+        return {
+            "ok": True, "error": None,
+            "faces": faces_out, "heads": heads_out,
+            "heads_detected": len(heads_out),
+            "frame_path": frame_path,
+            "frame_width": frame.shape[1], "frame_height": frame.shape[0],
+        }
+
+    def manual_detect_region(self, frame_path, x, y, w, h):
+        """Re-run face + head detection on a cropped region of an already-
+        frozen manual-detect frame (see manual_detect). Used when the UI's
+        full-frame pass misses someone — the user clicks a spot on the
+        image and this zooms into just that area, which often finds faces
+        the full-frame detector missed (small/distant faces benefit from
+        being examined at effectively higher relative resolution).
+
+        (x, y, w, h) are in full-frame pixel coordinates, defining the
+        region of interest; a padding margin is added automatically so a
+        face near the edge of the requested box isn't cut off.
+
+        Returns the same shape as manual_detect(), with face/head bboxes
+        translated back into full-frame coordinates.
+        """
+        frame = cv2.imread(frame_path)
+        if frame is None:
+            return {"ok": False, "error": "frozen frame not found — please Detect again", "faces": [], "heads": [], "heads_detected": 0}
+
+        H, W = frame.shape[:2]
+        pad_x, pad_y = int(w * 0.5), int(h * 0.5)
+        cx1 = max(0, int(x) - pad_x)
+        cy1 = max(0, int(y) - pad_y)
+        cx2 = min(W, int(x + w) + pad_x)
+        cy2 = min(H, int(y + h) + pad_y)
+        if cx2 <= cx1 or cy2 <= cy1:
+            return {"ok": False, "error": "invalid region", "faces": [], "heads": [], "heads_detected": 0}
+        crop = frame[cy1:cy2, cx1:cx2]
+
+        # Smaller min_face_size than the full-frame pass — the whole point
+        # of zooming into a region is to catch faces too small to clear
+        # the normal threshold at full-frame scale.
+        detections = self._detect_and_match_faces(crop, min_face_size=max(8, self.min_face_size // 2), force_full_res=True)
+        head_bboxes = self._run_head_detection(crop)
+
+        faces_out = []
+        for (fx, fy, fw, fh, name, confidence) in detections:
+            abs_bbox = (cx1 + fx, cy1 + fy, fw, fh)
+            entry = {"bbox": list(abs_bbox), "name": name, "confidence": round(float(confidence), 4), "captured": False}
+            if name == "unknown":
+                saved_name = self._save_manual_unknown(frame, abs_bbox)
+                if saved_name:
+                    entry["name"] = saved_name
+                    entry["captured"] = True
+            faces_out.append(entry)
+
+        heads_out = [
+            {"bbox": [cx1 + int(hx), cy1 + int(hy), int(hw), int(hh)], "confidence": round(float(hc), 4)}
+            for (hx, hy, hw, hh, hc) in head_bboxes
+        ]
+
+        return {
+            "ok": True, "error": None,
+            "faces": faces_out, "heads": heads_out,
+            "heads_detected": len(heads_out),
+        }
+
+    def _save_manual_unknown(self, frame, bbox):
+        """Immediately save a new unknown_N enrollment from a manual-detect
+        click. Same crop/padding/size-gate logic as the auto-capture path
+        (_try_capture_unknown) but skips the multi-second accumulation
+        window and the auto_capture_enabled gate, since a manual click
+        already represents deliberate human intent to capture."""
+        next_name, existing_count = self._next_unknown_name()
+        if existing_count >= self._unknown_max_auto:
+            return None
+
+        fx, fy, fw, fh = bbox
+        H, W = frame.shape[:2]
+        pad_w, pad_h = fw, fh
+        cx1 = max(0, fx - pad_w)
+        cy1 = max(0, fy - pad_h)
+        cx2 = min(W, fx + fw + pad_w)
+        cy2 = min(H, fy + fh + pad_h)
+        crop = frame[cy1:cy2, cx1:cx2]
+        if crop.size == 0 or crop.shape[0] < 64 or crop.shape[1] < 64:
+            return None
+
+        person_dir = os.path.join(self.known_dir, next_name)
+        os.makedirs(person_dir, exist_ok=True)
+        save_path = os.path.join(person_dir, "1.jpg")
+        cv2.imwrite(save_path, crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+        def _bg_reload():
+            try:
+                self.reload_faces()
+            except Exception:
+                pass
+        threading.Thread(target=_bg_reload, daemon=True).start()
+        return next_name
+
+    def assign_head_crop(self, frame_path, x, y, w, h, person_name):
+        """Manually assign a head-only detection (no face was found, e.g.
+        the person is facing away) to a person, by saving the head crop as
+        a reference image in their faces/ folder.
+
+        This does NOT contribute a face embedding — InsightFace can't
+        extract one from a head with no visible face, so reload_faces()
+        will just skip the image during matching, exactly like it already
+        skips any other unembeddable photo. It exists purely so a human
+        who can identify someone from body/position/context (something no
+        model here does) has a way to record that identification, and so
+        the image shows up in that person's gallery in Settings.
+        """
+        person = str(person_name).strip()
+        if not person:
+            return {"ok": False, "error": "person_name is required"}
+
+        frame = cv2.imread(frame_path)
+        if frame is None:
+            return {"ok": False, "error": "frozen frame not found — please Detect again"}
+
+        H, W = frame.shape[:2]
+        pad_w, pad_h = int(w * 0.3), int(h * 0.3)
+        cx1 = max(0, int(x) - pad_w)
+        cy1 = max(0, int(y) - pad_h)
+        cx2 = min(W, int(x + w) + pad_w)
+        cy2 = min(H, int(y + h) + pad_h)
+        crop = frame[cy1:cy2, cx1:cx2]
+        if crop.size == 0 or crop.shape[0] < 32 or crop.shape[1] < 32:
+            return {"ok": False, "error": "crop region too small"}
+
+        person_dir = os.path.join(self.known_dir, person)
+        os.makedirs(person_dir, exist_ok=True)
+        existing = [f for f in os.listdir(person_dir) if os.path.splitext(f)[1].lower() in (".jpg", ".jpeg", ".png", ".webp")]
+        next_n = 1
+        while f"{next_n}.jpg" in existing:
+            next_n += 1
+        save_path = os.path.join(person_dir, f"{next_n}.jpg")
+        if not cv2.imwrite(save_path, crop, [cv2.IMWRITE_JPEG_QUALITY, 95]):
+            return {"ok": False, "error": "failed to save image"}
+
+        return {"ok": True, "person": person}
 
     def _try_capture_more_for_known(self, track, crop_frame, crop_bbox, now, camera_source=None):
         """Save additional sample images for an already-recognised person
@@ -3153,8 +3385,13 @@ class FaceEngine:
             # always run at full resolution for maximum accuracy.
             _is_high_priority = str(worker.get("source", "")) in self.high_priority_sources
 
-            # Motion gate: skip GPU inference on static scenes.
-            if self.motion_gate and not _is_high_priority:
+            # Motion gate: skip GPU inference on static scenes. Per-camera
+            # overrides (Settings → Camera) take precedence over the
+            # engine-wide motion_gate/motion_thresh when set for this source.
+            _cam_override = self.motion_gate_overrides.get(str(worker.get("source", "")), {})
+            _motion_gate_active = _cam_override.get("enabled", self.motion_gate)
+            _motion_thresh_active = _cam_override.get("threshold", self.motion_thresh)
+            if _motion_gate_active and not _is_high_priority:
                 _curr_gray = cv2.cvtColor(
                     cv2.resize(raw_frame, (160, 90)), cv2.COLOR_BGR2GRAY
                 )
@@ -3162,7 +3399,7 @@ class FaceEngine:
                     _diff_score = int(np.count_nonzero(
                         cv2.absdiff(_prev_motion_gray, _curr_gray) > 15
                     ))
-                    _has_motion = _diff_score > self.motion_thresh
+                    _has_motion = _diff_score > _motion_thresh_active
                 else:
                     _has_motion = True
                 _prev_motion_gray = _curr_gray

@@ -35,11 +35,39 @@ class EngineClient:
 
     # ---------- low-level ----------
     def _call(self, op, *args, timeout=12, **kwargs):
-        """Send a command and block until the engine acknowledges."""
+        """Send a command and block until the engine acknowledges.
+
+        self._lock is created once in __init__ and never replaced — every
+        caller, past and future, serializes on the exact same lock object.
+        (Previously the watchdog replaced both _conn and _lock after
+        respawning a crashed engine subprocess; a request thread already
+        blocked inside `with self._lock:` on the OLD lock had no mutual
+        exclusion against a new request that read the NEW lock, so two
+        threads could send/recv on the pipe concurrently and receive each
+        other's responses — e.g. a manual_detect call receiving a
+        stop_footage tuple. See _swap_connection() for the respawn path,
+        which now takes this same lock before touching self._conn.)
+
+        On timeout, the engine is still processing the original command
+        and WILL eventually send a response — if we just raise here without
+        reading it, that response sits in the pipe and gets handed to
+        whatever unrelated _call() happens to run next (e.g. manual_detect
+        times out, then manual_detect_region's recv() pops manual_detect's
+        stale response instead of its own). We hold the lock a bit longer
+        and wait for the orphaned response so the pipe is back in sync
+        before any other caller can send the next command.
+        """
         try:
             with self._lock:
                 self._conn.send((op, args, kwargs))
                 if not self._conn.poll(timeout):
+                    # Drain the response that will eventually arrive so the
+                    # NEXT caller's recv() doesn't pop this stale one.
+                    if self._conn.poll(30):
+                        try:
+                            self._conn.recv()
+                        except Exception:
+                            pass
                     raise RuntimeError(f"Engine timed out on command {op!r}")
                 ok, val = self._conn.recv()
         except (BrokenPipeError, EOFError, OSError) as exc:
@@ -47,6 +75,15 @@ class EngineClient:
         if not ok:
             raise val
         return val
+
+    def _swap_connection(self, new_conn):
+        """Atomically replace the pipe connection after the engine
+        subprocess is respawned (see app.py's watchdog). Takes the same
+        lock _call() uses, so this can't interleave with an in-flight
+        call — either a call fully completes on the old connection before
+        the swap, or it hasn't started yet and will see the new one."""
+        with self._lock:
+            object.__setattr__(self, "_conn", new_conn)
 
     # ---------- lifecycle ----------
     def start(self): return self._call("start")
@@ -68,6 +105,11 @@ class EngineClient:
     # ---------- recognition / faces ----------
     def reload_faces(self): return self._call("reload_faces")
     def force_reconnect_camera(self, source): return self._call("force_reconnect_camera", source)
+    def manual_detect(self, camera_source): return self._call("manual_detect", camera_source, timeout=20)
+    def manual_detect_region(self, frame_path, x, y, w, h):
+        return self._call("manual_detect_region", frame_path, x, y, w, h, timeout=15)
+    def assign_head_crop(self, frame_path, x, y, w, h, person_name):
+        return self._call("assign_head_crop", frame_path, x, y, w, h, person_name, timeout=10)
     def get_camera_statuses(self): return self._call("get_camera_statuses")
 
     @property

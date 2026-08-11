@@ -513,6 +513,7 @@
                   <label class="text-xs text-slate-400" data-i18n="reports_arrival_camera">Arrival Camera (Entry — Cam 15)</label>
                   <select id="reportArrivalCamera" class="w-full rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 text-sm">
                     <option value="">— select camera —</option>
+                    <option value="__any__">All cameras (any camera counts as arrival)</option>
                   </select>
                 </div>
                 <div class="space-y-1">
@@ -596,10 +597,21 @@
                   <div class="font-medium">Report History</div>
                   <div class="text-xs text-slate-400">Saved daily snapshots — auto-saved at your configured send time</div>
                 </div>
-                <button onclick="loadReportHistory()" class="px-3 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-600 text-xs font-medium">Refresh</button>
+                <button onclick="openReportHistoryListModal()" class="px-3 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-600 text-xs font-medium">View</button>
               </div>
-              <div id="reportHistoryList" class="divide-y divide-slate-800">
-                <div class="px-4 py-6 text-center text-slate-500 text-sm">Click Refresh to load history</div>
+            </div>
+
+            <!-- Report History LIST modal — the full "Report History" list
+                 (all saved snapshots), opened via the View button above. -->
+            <div id="reportHistoryListModal" class="hidden fixed inset-0 z-50 flex items-start justify-center bg-black/70 backdrop-blur-sm p-4 overflow-y-auto" onclick="if(event.target===this) closeReportHistoryListModal()">
+              <div class="w-full max-w-4xl my-8 rounded-xl border border-slate-700 bg-slate-900 shadow-2xl">
+                <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+                  <div class="font-medium">Report History</div>
+                  <button onclick="closeReportHistoryListModal()" class="text-slate-400 hover:text-white text-xl">&times;</button>
+                </div>
+                <div id="reportHistoryList" class="divide-y divide-slate-800 max-h-[75vh] overflow-y-auto">
+                  <div class="px-4 py-6 text-center text-slate-500 text-sm">Loading…</div>
+                </div>
               </div>
             </div>
 
@@ -657,6 +669,19 @@
                     <tr><td colspan="8" class="px-4 py-8 text-center text-slate-500">No data</td></tr>
                   </tbody>
                 </table>
+              </div>
+            </div>
+
+            <!-- Report History viewer modal — re-parents #reportResultsCard
+                 into here while open, then back into the page on close, so
+                 the table/filter/sort/export code is shared with live
+                 report generation instead of duplicated. -->
+            <div id="reportHistoryModal" class="hidden fixed inset-0 z-50 flex items-start justify-center bg-black/70 backdrop-blur-sm p-4 overflow-y-auto" onclick="if(event.target===this) closeHistoryReportModal()">
+              <div class="w-full max-w-6xl my-8">
+                <div class="flex justify-end mb-2">
+                  <button onclick="closeHistoryReportModal()" class="text-white hover:text-red-400 text-2xl font-bold transition-colors">&times;</button>
+                </div>
+                <div id="reportHistoryModalSlot"></div>
               </div>
             </div>
 
@@ -2095,11 +2120,20 @@
             return;
           }
 
-          document.getElementById("galleryImages").innerHTML = data.images.map(img => `
+          document.getElementById("galleryImages").innerHTML = data.images.map((img, idx) => `
             <div data-img-card="${img.filename}" class="rounded-lg overflow-hidden border border-slate-700 group relative">
               <label class="absolute top-1 left-1 z-10 bg-slate-900/80 rounded px-1 py-0.5 cursor-pointer">
                 <input type="checkbox" onchange="_toggleGallerySel('${img.filename}')" class="align-middle" />
               </label>
+              <button
+                onclick="setPersonThumbnail('${name}', '${img.filename}')"
+                class="absolute top-1 right-1 z-10 bg-slate-900/80 rounded p-1 hover:bg-slate-800 transition-colors"
+                title="${idx === 0 ? 'This is the gallery thumbnail' : 'Make this the gallery thumbnail'}"
+              >
+                <svg class="w-4 h-4 ${idx === 0 ? 'text-amber-400' : 'text-slate-400 hover:text-amber-300'}" viewBox="0 0 24 24" fill="${idx === 0 ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2">
+                  <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+                </svg>
+              </button>
               <img src="${img.url}?t=${Date.now()}" alt="${img.filename}"
                    onclick="_toggleGallerySel('${img.filename}')"
                    class="w-full h-40 object-cover bg-slate-800 cursor-pointer" />
@@ -2128,6 +2162,24 @@
           document.getElementById("galleryImages").innerHTML = `
             <div class="col-span-full text-center text-red-400 py-8">Failed to load images</div>
           `;
+        }
+      }
+
+      async function setPersonThumbnail(name, filename) {
+        try {
+          const r = await fetch(`/api/person/${encodeURIComponent(name)}/image/${encodeURIComponent(filename)}/set_thumbnail`, {
+            method: "POST",
+          });
+          const j = await r.json();
+          if (!j.ok) {
+            toast(j.error || "Failed to set thumbnail", "error");
+            return;
+          }
+          await refreshGallery(name);
+          if (typeof loadPeople === "function") loadPeople();
+          toast("Gallery thumbnail updated", "success");
+        } catch (e) {
+          toast("Network error", "error");
         }
       }
 
@@ -2921,6 +2973,18 @@
               value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}"
               class="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-sm font-mono" />
           </td>
+          <td class="px-2 py-1">
+            <label class="flex items-center gap-1 text-xs text-slate-400 whitespace-nowrap" title="Skip face detection until motion is detected on this camera">
+              <input type="checkbox" data-cam-motion-field="motion_gate_enabled"
+                ${c.motion_gate_enabled ? "checked" : ""}
+                class="accent-emerald-500" />
+              Motion
+            </label>
+            ${c.motion_gate_enabled ? `<input type="number" min="1" data-cam-motion-field="motion_threshold"
+                value="${c.motion_threshold || 1000}" placeholder="1000"
+                title="Higher = less sensitive (fewer pixels must change to trigger detection)"
+                class="mt-1 w-20 bg-slate-950 border border-slate-800 rounded px-2 py-0.5 text-xs font-mono" />` : ""}
+          </td>
           <td class="px-2 py-1 text-right whitespace-nowrap">
             ${_saveIndicator(`cam:${c.id}`)}
             <button type="button" data-cam-action="reconnect"
@@ -2992,6 +3056,9 @@
           if (tr && j.camera && typeof j.camera.resolved_url === "string") {
             tr.setAttribute("data-resolved", j.camera.resolved_url);
           }
+          if (Object.prototype.hasOwnProperty.call(payload, "motion_gate_enabled")) {
+            await loadIpCameras();
+          }
           setTimeout(() => _setSaveIndicator(key, ""), 1200);
         } catch (_) {
           _setSaveIndicator(key, "Network error", "error");
@@ -2999,6 +3066,20 @@
       }
 
       function _onAutoSaveInput(e) {
+        const motionInp = e.target.closest("[data-cam-motion-field]");
+        if (motionInp) {
+          const tr = motionInp.closest("tr[data-camera-id]");
+          if (!tr) return;
+          const camId = tr.getAttribute("data-camera-id");
+          const field = motionInp.dataset.camMotionField;
+          const key = `cam:${camId}:${field}`;
+          const value = field === "motion_gate_enabled" ? motionInp.checked : (parseInt(motionInp.value, 10) || 1);
+          _scheduleSave(key, field === "motion_gate_enabled" ? 0 : 600, () => {
+            _saveTimers.delete(key);
+            _saveCamera(camId, { [field]: value });
+          });
+          return;
+        }
         const inp = e.target.closest("input[data-key]");
         if (!inp) return;
         const key = inp.dataset.key;
@@ -3390,7 +3471,9 @@
     await _loadReportCameraOptions(saved.arrival_camera, saved.exit_camera);
     const today = new Date().toISOString().slice(0, 10);
     document.getElementById("reportDate").value = today;
-    loadReportHistory();
+    // Report History list loads lazily when its View button opens the
+    // modal (openReportHistoryListModal), not here — no need to fetch it
+    // before the user has asked to see it.
   }
 
   async function _loadReportConfig() {
@@ -3412,7 +3495,11 @@
       const j = await r.json();
       const selA = document.getElementById("reportArrivalCamera");
       const selE = document.getElementById("reportExitCamera");
-      for (const sel of [selA, selE]) while (sel.options.length > 1) sel.remove(1);
+      // Keep the first option ("— select camera —") and, on the arrival
+      // dropdown only, the static "__any__" (All cameras) option — both
+      // are hardcoded in the template, not populated from ip_cameras.
+      while (selA.options.length > 2) selA.remove(2);
+      while (selE.options.length > 1) selE.remove(1);
 
       const addOpt = (sel, value, label) => {
         const opt = document.createElement("option");
@@ -3562,8 +3649,9 @@
         status = statusParts.join("، ") || "في الوقت";
         statusCls = hasIssue ? "bg-red-900/60 text-red-300" : "bg-emerald-900/60 text-emerald-300";
       }
-      const exitsHtml = r.exits && r.exits.length
-        ? r.exits.map(e => {
+      const visibleExits = (r.exits || []).filter(e => e.still_out || e.duration_minutes !== 0);
+      const exitsHtml = visibleExits.length
+        ? visibleExits.map(e => {
             const durLabel = e.duration_minutes != null ? `${e.duration_minutes}د` : '...';
             const cls = e.still_out ? 'bg-blue-900 text-blue-200' : e.late ? 'bg-red-900 text-red-200' : 'bg-slate-700 text-slate-300';
             return `<span class="inline-flex items-center gap-1 mr-1 mb-1 px-1.5 py-0.5 rounded text-xs ${cls}">
@@ -3579,7 +3667,7 @@
         <td class="px-4 py-3 text-xs font-medium ${shiftCls}">${shiftLabel}</td>
         <td class="px-4 py-3 text-xs font-medium">${r.arrival}</td>
         <td class="px-4 py-3 text-xs text-slate-300">${r.last_exit || '—'}</td>
-        <td class="px-4 py-3 max-w-xs">${exitsHtml}</td>
+        <td class="px-4 py-3 max-w-xs whitespace-normal">${exitsHtml}</td>
         <td class="px-4 py-3 text-xs font-medium ${r.total_outside_minutes > 0 ? 'text-amber-400' : 'text-slate-500'}">
           ${r.total_outside_minutes > 0 ? r.total_outside_minutes + 'د' : '—'}
         </td>
@@ -3738,6 +3826,15 @@
     setTimeout(() => { msgEl.textContent = ""; }, 4000);
   }
 
+  function openReportHistoryListModal() {
+    document.getElementById("reportHistoryListModal").classList.remove("hidden");
+    loadReportHistory();
+  }
+
+  function closeReportHistoryListModal() {
+    document.getElementById("reportHistoryListModal").classList.add("hidden");
+  }
+
   async function loadReportHistory() {
     const el = document.getElementById("reportHistoryList");
     el.innerHTML = '<div class="px-4 py-4 text-center text-slate-500 text-sm">Loading…</div>';
@@ -3774,6 +3871,11 @@
     }
   }
 
+  // Where #reportResultsCard normally lives on the page, so we can put it
+  // back when the history modal closes.
+  let _reportResultsHomeParent = null;
+  let _reportResultsHomeNextSibling = null;
+
   async function viewHistoryReport(date) {
     const msgEl = document.getElementById("reportActionMsg");
     msgEl.textContent = "Loading…";
@@ -3793,11 +3895,28 @@
         late_exits: j.report.late_exits,
       });
       _renderReportTable();
-      document.getElementById("reportResultsCard").classList.remove("hidden");
-      document.getElementById("reportResultsCard").scrollIntoView({ behavior: "smooth" });
+
+      const card = document.getElementById("reportResultsCard");
+      _reportResultsHomeParent = card.parentElement;
+      _reportResultsHomeNextSibling = card.nextElementSibling;
+      document.getElementById("reportHistoryModalSlot").appendChild(card);
+      card.classList.remove("hidden");
+      document.getElementById("reportHistoryModal").classList.remove("hidden");
     } catch(_) {
       msgEl.textContent = "Network error";
       msgEl.className = "text-xs text-red-400";
+    }
+  }
+
+  function closeHistoryReportModal() {
+    const modal = document.getElementById("reportHistoryModal");
+    modal.classList.add("hidden");
+    const card = document.getElementById("reportResultsCard");
+    card.classList.add("hidden");
+    if (_reportResultsHomeParent) {
+      _reportResultsHomeParent.insertBefore(card, _reportResultsHomeNextSibling);
+      _reportResultsHomeParent = null;
+      _reportResultsHomeNextSibling = null;
     }
   }
 

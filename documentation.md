@@ -24,6 +24,8 @@ A comprehensive reference for the Face Recognition Attendance System — archite
 16. [Analytics & Reports](#16-analytics--reports)
 17. [Camera Tracker (Line-Crossing)](#17-camera-tracker-line-crossing)
 18. [Manual Attendance](#18-manual-attendance)
+19. [UI Login & User Management](#19-ui-login--user-management)
+20. [Manual Detect](#20-manual-detect)
 
 ---
 
@@ -82,6 +84,13 @@ Both `app.py` and `engine_runner.py` install a `threading.excepthook` and `sys.e
 | `multiprocessing.Pipe` | bidirectional | Commands (Flask → engine) and responses |
 | `multiprocessing.Manager` dict | engine writes, Flask reads | Live JPEG, tracks, status, fps |
 
+### `EngineClient` concurrency (`engine_client.py`)
+
+Multiple Flask request threads can call into the engine concurrently, all serialized through one `multiprocessing.Pipe`, so `EngineClient._call()` has to guarantee that a thread's `send()` is matched with *its own* `recv()` and not another thread's. Two real bugs were found and fixed here:
+
+- **Lock-swap race during watchdog respawn.** When the watchdog (`_watchdog_loop` in `app.py`) detects the engine subprocess has died and respawns it, the `EngineClient` needs a new `Pipe` connection. Previously the respawn path replaced both `self._conn` and `self._lock` with new objects. A request thread already blocked inside `with self._lock:` on the *old* lock object had no mutual exclusion against a new request that read `self._lock` *after* the swap and acquired the *new* lock — so two threads could `send()`/`recv()` on the pipe at the same time and each could receive the other's response (e.g. a `manual_detect` call receiving a `stop_footage` tuple). Fixed by never replacing `self._lock` — it's created once in `__init__` and every caller, past and future, serializes on the exact same lock object. The respawn path now goes through `EngineClient._swap_connection(new_conn)`, which takes that same lock before touching `self._conn`, so a swap can't interleave with an in-flight call.
+- **Timeout-orphaned response desync.** If `_call()` times out waiting for `self._conn.poll(timeout)`, the engine is typically still processing the original command and will eventually send a response anyway. Previously, timing out just raised immediately without reading that eventual response — it would sit in the pipe and get handed to whichever unrelated `_call()` happened to `recv()` next (e.g. `manual_detect` times out, then a later `manual_detect_region` call's `recv()` pops `manual_detect`'s stale response instead of its own). Fixed by draining the late response (`self._conn.poll(30)` + `recv()`, discarded) before raising the timeout error, while still holding the lock — so the pipe is back in sync before any other caller can send its next command.
+
 ---
 
 ## 3. Detection & Recognition Pipeline
@@ -109,6 +118,10 @@ Both `app.py` and `engine_runner.py` install a `threading.excepthook` and `sys.e
 ### Motion gating
 
 Before calling InsightFace, each detect thread runs a fast CPU motion check: the current frame is downscaled to 160×90 grayscale and compared against the previous processed frame using `cv2.absdiff`. GPU inference is skipped if the number of changed pixels (diff > 15) is below `motion_thresh` (default **500**). Controlled by `motion_gate` (default **true**). Reduces GPU utilisation by 60–80% on static scenes.
+
+### Per-camera motion gate override
+
+The global `motion_gate` / `motion_thresh` settings can be overridden per camera. Each camera entry in `ip_cameras.json` may carry `motion_gate_enabled` (bool) and `motion_threshold` (int) fields, set from **Settings → Camera** (a checkbox + a threshold number input per camera row). Whenever these are saved, `app.py`'s `_push_motion_gate_overrides()` builds a `{camera_source: {"enabled": bool, "threshold": int}}` dict from every camera that has explicitly set one or both fields, and pushes it to the engine via `FaceEngine.set_config({"motion_gate_overrides": {...}})`. `FaceEngine` stores this as `self.motion_gate_overrides` and, in the grid detect loop, looks up the current camera's source in that dict before falling back to the engine-wide `motion_gate`/`motion_thresh` values. Cameras with no override entry behave exactly as before (governed by the global setting).
 
 ### High-priority cameras
 
@@ -657,6 +670,7 @@ The settings page is organised into tabs:
 - Rename (moves `faces/` directory and updates all `visits.person_name` rows and the `people` row).
 - Delete (removes `faces/` directory and all visit and people rows).
 - View individual face images; delete single images; transfer images between persons.
+- **Set gallery thumbnail**: a star button on each image in the Face Images modal makes that image the person's thumbnail. Implemented in `POST /api/person/<name>/image/<filename>/set_thumbnail` by swapping filenames so the chosen image occupies the lowest numeric slot (`list_people()` always uses the numerically-lowest image as the thumbnail) — no separate thumbnail field or DB column. `GET /api/person/<name>/images` uses the same numeric-aware sort as `list_people()` so the starred image in the gallery always matches what actually renders as the thumbnail.
 - Bulk delete / bulk transfer.
 - Merge multiple persons into one.
 
@@ -683,6 +697,10 @@ If the camera is the **arrival camera**: `db.close_gate_entry()` finds the most-
 
 The gate camera URLs are cached for 60 seconds (`_gate_camera_cache`) to avoid re-reading `reports_config.json` on every visit transition.
 
+### "Any camera" arrival trigger (`GATE_ARRIVAL_ANY_CAMERA`)
+
+`reports_config.json`'s `arrival_camera` can be set to the sentinel value `"__any__"` (constant `GATE_ARRIVAL_ANY_CAMERA` in `app.py`) instead of a single camera's RTSP URL. When set, `_handle_gate_event()` treats detection on **any** camera as a valid arrival trigger for closing an open exit event — useful when there's no single fixed entry point a person always passes through. Settings → Reports exposes this as an "All cameras (any camera counts as arrival)" option in the Arrival Camera dropdown. `_gate_camera_display_name()` resolves the report header's camera-name label for this case (`"Any camera"`, or `"Any camera / <exit camera name>"` when an exit camera is also configured), since the sentinel has no matching row in the `locations` table to look up a display name from.
+
 ### Daily report
 
 `_daily_report_scheduler_loop()` runs as a background thread and saves the gate report at **23:00** local time every day. The report is persisted to the `daily_reports` table.
@@ -690,6 +708,10 @@ The gate camera URLs are cached for 60 seconds (`_gate_camera_cache`) to avoid r
 ### Gate report content
 
 `_generate_gate_report()` returns one row per enrolled person per day, including absent people. Columns: `name`, `arrival` (earliest visit on ANY camera), `exits` (list of exit/entry pairs from `gate_events`), `status` (on time / late / absent).
+
+`unknown_N` auto-captured persons are excluded entirely from the report — both from the raw `gate_events` query and from the people-meta query used to build the absent list — since they're unidentified tracks, not real employees worth reporting on.
+
+Standalone-arrival rows (written by `write_arrival_event()` when there's no open exit event to pair with, where `exit_time == entry_time`) are filtered out of the report's exit-events list. They aren't real exits and previously rendered as bogus "0-minute" exit/return pairs; the arrival time they carry still surfaces via the separate arrival-time lookup (earliest visit on any camera), so no information is lost by dropping them from the exits list.
 
 ---
 
@@ -753,6 +775,10 @@ The **Reports** tab in Settings can export the currently displayed gate report:
 - **PDF** (`exportReportPDF()`): renders an HTML table into a new browser tab/window and calls `window.print()`, so the "export" is really "print to PDF" via the browser's print dialog.
 
 Both respect whatever filter (`present`/`absent`/`late`/`ontime`) and shift filter are currently applied to the report table — they do not re-fetch, they export what's on screen.
+
+### Report History modal
+
+The **Report History** section in Settings → Reports no longer has a manual refresh button. Its **View** button opens a modal (`openReportHistoryListModal()`) that lazy-loads the saved-report list from `GET /api/reports/history` only when opened, rather than fetching on every page load. Each row in that list has its own **View** button which fetches `GET /api/reports/history/<date>` and opens a second modal, re-parenting the existing report-results card into a modal container (`reportHistoryModalSlot`) to render that date's full detail report without duplicating the rendering logic.
 
 ---
 

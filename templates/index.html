@@ -210,6 +210,13 @@
                     </svg>
                   </button>
                 </div>
+                <button id="manualDetectBtn" type="button" title="Freeze the current frame and run face/head detection now"
+                  class="flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border border-slate-700 bg-slate-800 hover:bg-emerald-700 transition-colors">
+                  <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M9 3H5a2 2 0 0 0-2 2v4M15 3h4a2 2 0 0 1 2 2v4M9 21H5a2 2 0 0 1-2-2v-4M15 21h4a2 2 0 0 0 2-2v-4"/>
+                  </svg>
+                  Detect
+                </button>
                 <!-- Single / Multi cam mode selector
                      Hidden: the UI is single-mode-only. Cameras still all run
                      in grid analysis mode in the engine; users just cycle
@@ -644,6 +651,40 @@
       <div class="relative max-w-3xl w-full mx-4" onclick="event.stopPropagation()">
         <button onclick="closeVideoModal()" class="absolute -top-10 right-0 text-white hover:text-red-400 text-2xl font-bold transition-colors">&times;</button>
         <video id="modalVideo" class="w-full rounded-xl border border-slate-700 shadow-2xl" controls autoplay loop muted></video>
+      </div>
+    </div>
+
+    <!-- Manual Detect Result Modal -->
+    <div id="detectModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4" onclick="closeDetectModal()">
+      <div class="relative max-w-4xl w-full max-h-[90vh] flex flex-col" onclick="event.stopPropagation()">
+        <button onclick="closeDetectModal()" class="absolute -top-10 right-0 text-white hover:text-red-400 text-2xl font-bold transition-colors">&times;</button>
+        <div class="rounded-xl border border-slate-700 bg-slate-900 shadow-2xl overflow-y-auto">
+          <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+            <div class="font-medium text-white">Detection Result</div>
+            <div id="detectModalSummary" class="text-xs text-slate-400"></div>
+          </div>
+          <div class="relative bg-black flex items-center justify-center" style="max-height:70vh">
+            <img id="detectModalImg" class="max-w-full max-h-[70vh] object-contain" />
+            <canvas id="detectModalCanvas" class="absolute top-0 left-0 max-w-full max-h-[70vh]"></canvas>
+          </div>
+          <div id="detectModalList" class="p-4 space-y-2 max-h-48 overflow-y-auto"></div>
+          <div id="detectAssignPanel" class="hidden border-t border-slate-800 p-4 bg-slate-950/50">
+            <div class="flex items-center justify-between mb-2">
+              <div class="text-sm font-medium text-white">Assign <span id="detectAssignTarget"></span></div>
+              <button onclick="closeAssignPanel()" class="text-slate-500 hover:text-slate-300 text-sm">&times;</button>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <select id="detectAssignSelect" class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm min-w-48">
+                <option value="">Select existing person…</option>
+              </select>
+              <span class="text-xs text-slate-500">or</span>
+              <input id="detectAssignNewName" type="text" placeholder="New person name"
+                class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-sm flex-1 min-w-40" />
+              <button id="detectAssignSubmit" class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium text-white">Assign</button>
+            </div>
+            <div id="detectAssignMsg" class="text-xs mt-2"></div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -2285,6 +2326,459 @@
       };
       _bindZoomBtns(inlinePZ, "zoomOutBtn", "zoomInBtn", "zoomResetBtn");
       _bindZoomBtns(fsPZ, "fsZoomOutBtn", "fsZoomInBtn", "fsZoomResetBtn");
+
+      const manualDetectBtn = document.getElementById("manualDetectBtn");
+      if (manualDetectBtn) {
+        manualDetectBtn.addEventListener("click", async () => {
+          if (!_currentViewerSource) {
+            toast("No camera selected", "error");
+            return;
+          }
+          manualDetectBtn.disabled = true;
+          const origHtml = manualDetectBtn.innerHTML;
+          manualDetectBtn.innerHTML = "Detecting…";
+          try {
+            const r = await fetch("/api/camera/manual_detect", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ source: _currentViewerSource }),
+            });
+            const j = await r.json();
+            if (!j.ok) {
+              toast(j.error || "Detection failed", "error");
+              return;
+            }
+            openDetectModal(j);
+          } catch (e) {
+            toast("Network error", "error");
+          } finally {
+            manualDetectBtn.disabled = false;
+            manualDetectBtn.innerHTML = origHtml;
+          }
+        });
+      }
+
+      let _detectResult = null;
+      let _detectRedraw = null;
+
+      // Rebuild the modal's summary line and list of detections from the
+      // current result. Called both on open and after a region re-detection
+      // merges new boxes into _detectResult.
+      function renderDetectModalList(result) {
+        const summary = document.getElementById("detectModalSummary");
+        const list = document.getElementById("detectModalList");
+        const nFaces = result.faces.length;
+        const nHeads = result.heads_detected;
+        summary.textContent = `${nFaces} face${nFaces === 1 ? "" : "s"}, ${nHeads} head${nHeads === 1 ? "" : "s"}`;
+
+        list.innerHTML = "";
+        if (!nFaces && !nHeads) {
+          list.innerHTML = `<div class="text-sm text-slate-500 text-center py-4">Nothing detected in this frame.</div>`;
+        } else {
+          result.faces.forEach((f, idx) => {
+            let label, cls;
+            if (f.captured) {
+              label = `New person captured as ${fmtName(f.name)}`;
+              cls = "text-emerald-400";
+            } else if (f.name === "unknown") {
+              label = "Unknown face (too small/low quality to capture)";
+              cls = "text-amber-400";
+            } else {
+              label = `Matched: ${fmtName(f.name)} (distance ${f.confidence.toFixed(2)}, lower = better match)`;
+              cls = "text-emerald-400";
+            }
+            list.innerHTML += `<div class="text-sm ${cls} flex items-center gap-2">
+              <span class="inline-block w-3 h-3 rounded-sm bg-emerald-500 shrink-0"></span>${label}
+            </div>`;
+          });
+          const unmatchedHeads = nHeads - nFaces;
+          if (unmatchedHeads > 0) {
+            list.innerHTML += `<div class="text-sm text-slate-400 flex items-center gap-2">
+              <span class="inline-block w-3 h-3 rounded-sm bg-blue-500 shrink-0"></span>${unmatchedHeads} head${unmatchedHeads === 1 ? "" : "s"} detected without a matching face (can't be identified from head alone)
+            </div>`;
+          }
+        }
+      }
+
+      function openDetectModal(result) {
+        _detectResult = result;
+        closeAssignPanel();
+        const modal = document.getElementById("detectModal");
+        const img = document.getElementById("detectModalImg");
+        const canvas = document.getElementById("detectModalCanvas");
+
+        renderDetectModalList(result);
+
+        let _hoveredFaceIdx = -1;
+        let _hoveredHeadIdx = -1;
+
+        const draw = () => {
+          const w = result.frame_width, h = result.frame_height;
+          canvas.width = w;
+          canvas.height = h;
+          canvas.style.width = img.clientWidth + "px";
+          canvas.style.height = img.clientHeight + "px";
+          const ctx = canvas.getContext("2d");
+          ctx.clearRect(0, 0, w, h);
+          ctx.lineWidth = Math.max(2, w / 400);
+          ctx.font = `${Math.max(14, w / 60)}px sans-serif`;
+          ctx.textBaseline = "top";
+
+          result.heads.forEach((head, idx) => {
+            const [x, y, bw, bh] = head.bbox;
+            const hovered = idx === _hoveredHeadIdx;
+            ctx.strokeStyle = hovered ? "#fbbf24" : "#3b82f6";
+            ctx.lineWidth = hovered ? Math.max(3, w / 250) : Math.max(2, w / 400);
+            ctx.strokeRect(x, y, bw, bh);
+            if (hovered) {
+              ctx.fillStyle = "rgba(251, 191, 36, 0.15)";
+              ctx.fillRect(x, y, bw, bh);
+            }
+          });
+          result.faces.forEach((f, idx) => {
+            const [x, y, bw, bh] = f.bbox;
+            const hovered = idx === _hoveredFaceIdx;
+            ctx.strokeStyle = hovered ? "#fbbf24" : "#10b981";
+            ctx.lineWidth = hovered ? Math.max(3, w / 250) : Math.max(2, w / 400);
+            ctx.strokeRect(x, y, bw, bh);
+            if (hovered) {
+              ctx.fillStyle = "rgba(251, 191, 36, 0.15)";
+              ctx.fillRect(x, y, bw, bh);
+            }
+            const label = f.captured ? `NEW: ${fmtName(f.name)}` : fmtName(f.name);
+            const textW = ctx.measureText(label).width;
+            ctx.fillStyle = hovered ? "#fbbf24" : "#10b981";
+            ctx.fillRect(x, Math.max(0, y - 20), textW + 8, 20);
+            ctx.fillStyle = "#0a0f1a";
+            ctx.fillText(label, x + 4, Math.max(0, y - 19));
+          });
+        };
+
+        // Map a mouse event's CSS-space position to native frame-space
+        // coordinates (canvas.width/height are native; the element's
+        // on-screen size is scaled down via CSS).
+        const nativePointAtEvent = (ev) => {
+          const rect = canvas.getBoundingClientRect();
+          if (!rect.width || !rect.height) return null;
+          const sx = canvas.width / rect.width;
+          const sy = canvas.height / rect.height;
+          return [(ev.clientX - rect.left) * sx, (ev.clientY - rect.top) * sy];
+        };
+
+        const faceIdxAtEvent = (ev) => {
+          const pt = nativePointAtEvent(ev);
+          if (!pt) return -1;
+          const [px, py] = pt;
+          for (let i = 0; i < result.faces.length; i++) {
+            const [x, y, bw, bh] = result.faces[i].bbox;
+            if (px >= x && px <= x + bw && py >= y && py <= y + bh) return i;
+          }
+          return -1;
+        };
+
+        const headIdxAtEvent = (ev) => {
+          const pt = nativePointAtEvent(ev);
+          if (!pt) return -1;
+          const [px, py] = pt;
+          for (let i = 0; i < result.heads.length; i++) {
+            const [x, y, bw, bh] = result.heads[i].bbox;
+            if (px >= x && px <= x + bw && py >= y && py <= y + bh) return i;
+          }
+          return -1;
+        };
+
+        canvas.onmousemove = (ev) => {
+          const fidx = faceIdxAtEvent(ev);
+          const hidx = fidx >= 0 ? -1 : headIdxAtEvent(ev);
+          canvas.style.cursor = (fidx >= 0 || hidx >= 0) ? "pointer" : "default";
+          if (fidx !== _hoveredFaceIdx || hidx !== _hoveredHeadIdx) {
+            _hoveredFaceIdx = fidx;
+            _hoveredHeadIdx = hidx;
+            draw();
+          }
+        };
+        canvas.onmouseleave = () => {
+          if (_hoveredFaceIdx !== -1 || _hoveredHeadIdx !== -1) {
+            _hoveredFaceIdx = -1;
+            _hoveredHeadIdx = -1;
+            draw();
+          }
+        };
+        canvas.onclick = (ev) => {
+          const fidx = faceIdxAtEvent(ev);
+          if (fidx >= 0) {
+            openAssignPanel(fidx);
+            return;
+          }
+          const hidx = headIdxAtEvent(ev);
+          if (hidx >= 0) {
+            runHeadAssign(hidx);
+            return;
+          }
+          const pt = nativePointAtEvent(ev);
+          if (pt) runRegionDetect(pt[0], pt[1]);
+        };
+
+        // Show the modal BEFORE drawing — img.clientWidth is 0 while the
+        // modal is display:none, which previously made the canvas collapse
+        // to zero width and scattered the boxes to the wrong positions.
+        modal.classList.remove("hidden");
+
+        if (result.frame_path) {
+          img.onload = () => requestAnimationFrame(draw);
+          img.src = "/" + result.frame_path + "?t=" + Date.now();
+          if (img.complete) requestAnimationFrame(draw);
+        } else {
+          img.removeAttribute("src");
+        }
+
+        window._detectModalResizeHandler = draw;
+        window.addEventListener("resize", draw);
+        _detectRedraw = draw;
+      }
+
+      // Click-to-inspect: clicking empty space on the frozen frame re-runs
+      // face + head detection on a fixed-size region around the click point,
+      // then merges any newly-found boxes into the current result. This
+      // catches faces/heads the full-frame pass missed (small or distant
+      // ones benefit from the effective resolution boost of a zoomed crop).
+      async function runRegionDetect(px, py) {
+        const res = _detectResult;
+        if (!res || !res.frame_path) return false;
+
+        const base = Math.min(res.frame_width, res.frame_height);
+        const size = Math.max(160, Math.min(600, Math.round(base * 0.15)));
+        let x = Math.round(px - size / 2);
+        let y = Math.round(py - size / 2);
+        let w = size;
+        let h = size;
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+        if (x + w > res.frame_width) w = res.frame_width - x;
+        if (y + h > res.frame_height) h = res.frame_height - y;
+        if (w < 32 || h < 32) return;
+
+        const canvas = document.getElementById("detectModalCanvas");
+        canvas.style.cursor = "wait";
+        try {
+          const r = await fetch("/api/camera/manual_detect_region", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ frame_path: res.frame_path, x, y, w, h }),
+          });
+          const j = await r.json();
+          if (!j.ok) {
+            toast(j.error || "Region detection failed", "error");
+            return false;
+          }
+
+          const overlaps = (a, b) => {
+            const ix = Math.min(a[0] + a[2], b[0] + b[2]) - Math.max(a[0], b[0]);
+            const iy = Math.min(a[1] + a[3], b[1] + b[3]) - Math.max(a[1], b[1]);
+            return ix > 0 && iy > 0;
+          };
+
+          let added = 0;
+          for (const f of j.faces || []) {
+            if (!res.faces.some(e => overlaps(e.bbox, f.bbox))) {
+              res.faces.push(f);
+              added++;
+            }
+          }
+          for (const hd of j.heads || []) {
+            if (!res.heads.some(e => overlaps(e.bbox, hd.bbox))) {
+              res.heads.push(hd);
+              added++;
+            }
+          }
+          res.heads_detected = res.heads.length;
+
+          if (added) {
+            toast(`Region: found ${added} more`, "success");
+            renderDetectModalList(res);
+            if (_detectRedraw) _detectRedraw();
+          } else {
+            toast("Nothing new found in that region", "info");
+          }
+        } catch (e) {
+          toast("Network error", "error");
+          return false;
+        } finally {
+          canvas.style.cursor = "default";
+        }
+        return true;
+      }
+
+      // Click-to-assign for heads: heads are identity-less boxes, so clicking
+      // one re-runs region detection around the head to surface the face
+      // inside it, then opens the assign panel for that face.
+      async function runHeadAssign(headIdx) {
+        const res = _detectResult;
+        if (!res || !res.frame_path) return;
+        const head = res.heads[headIdx];
+        if (!head) return;
+        const [hx, hy, hw, hh] = head.bbox;
+        const px = Math.round(hx + hw / 2);
+        const py = Math.round(hy + hh / 2);
+
+        const ok = await runRegionDetect(px, py);
+        if (ok) {
+          const overlaps = (a, b) => {
+            const ix = Math.min(a[0] + a[2], b[0] + b[2]) - Math.max(a[0], b[0]);
+            const iy = Math.min(a[1] + a[3], b[1] + b[3]) - Math.max(a[1], b[1]);
+            return ix > 0 && iy > 0;
+          };
+          const faceIdx = res.faces.findIndex(f => overlaps(f.bbox, head.bbox));
+          if (faceIdx >= 0) {
+            openAssignPanel(faceIdx);
+            return;
+          }
+        }
+        // Still no face (facing away, too blurry, etc.) — offer to assign
+        // the head crop itself as a reference image instead.
+        openAssignPanel(headIdx, "head");
+      }
+
+      function closeDetectModal() {
+        const modal = document.getElementById("detectModal");
+        modal.classList.add("hidden");
+        if (window._detectModalResizeHandler) {
+          window.removeEventListener("resize", window._detectModalResizeHandler);
+          window._detectModalResizeHandler = null;
+        }
+        _detectRedraw = null;
+        closeAssignPanel();
+        _detectResult = null;
+      }
+
+      let _assignFaceIdx = null;
+      let _assignMode = "face"; // "face" | "head"
+
+      async function openAssignPanel(idx, mode = "face") {
+        if (!_detectResult) return;
+        const item = mode === "head" ? _detectResult.heads[idx] : _detectResult.faces[idx];
+        if (!item) return;
+        _assignFaceIdx = idx;
+        _assignMode = mode;
+
+        const panel = document.getElementById("detectAssignPanel");
+        const target = document.getElementById("detectAssignTarget");
+        const select = document.getElementById("detectAssignSelect");
+        const newNameInput = document.getElementById("detectAssignNewName");
+        const msg = document.getElementById("detectAssignMsg");
+
+        target.textContent = mode === "head" ? "head (no face detected)" : fmtName(item.name);
+        newNameInput.value = "";
+        msg.textContent = mode === "head"
+          ? "No face was found here — this saves the head crop as a reference photo only, not for automatic recognition."
+          : "";
+        msg.className = "text-xs mt-2 text-slate-500";
+        select.innerHTML = `<option value="">Select existing person…</option>`;
+        panel.classList.remove("hidden");
+
+        try {
+          const r = await fetch("/api/people");
+          const j = await r.json();
+          const excludeName = mode === "face" ? item.name : null;
+          const people = (j.people || [])
+            .filter(p => p.name !== excludeName)
+            .sort((a, b) => fmtName(a.name).localeCompare(fmtName(b.name)));
+          select.innerHTML += people.map(p =>
+            `<option value="${p.name}">${fmtName(p.name)} (${p.count})</option>`
+          ).join("");
+        } catch (e) {
+          msg.textContent = "Failed to load people list";
+          msg.className = "text-xs mt-2 text-red-400";
+        }
+
+        panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
+
+      function closeAssignPanel() {
+        const panel = document.getElementById("detectAssignPanel");
+        if (panel) panel.classList.add("hidden");
+        _assignFaceIdx = null;
+        _assignMode = "face";
+      }
+
+      const detectAssignSubmit = document.getElementById("detectAssignSubmit");
+      if (detectAssignSubmit) {
+        detectAssignSubmit.addEventListener("click", async () => {
+          if (_assignFaceIdx === null || !_detectResult) return;
+          const select = document.getElementById("detectAssignSelect");
+          const newNameInput = document.getElementById("detectAssignNewName");
+          const msg = document.getElementById("detectAssignMsg");
+
+          const targetName = (newNameInput.value.trim() || select.value).trim();
+          if (!targetName) {
+            msg.textContent = "Pick an existing person or type a new name";
+            msg.className = "text-xs mt-2 text-red-400";
+            return;
+          }
+
+          if (_assignMode === "head") {
+            const head = _detectResult.heads[_assignFaceIdx];
+            const [x, y, w, h] = head.bbox;
+            detectAssignSubmit.disabled = true;
+            msg.textContent = "Saving…";
+            msg.className = "text-xs mt-2 text-slate-400";
+            try {
+              const r = await fetch("/api/camera/assign_head_crop", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ frame_path: _detectResult.frame_path, x, y, w, h, person_name: targetName }),
+              });
+              const j = await r.json();
+              if (!j.ok) {
+                msg.textContent = j.error || "Assign failed";
+                msg.className = "text-xs mt-2 text-red-400";
+                return;
+              }
+              toast(`Saved as a reference photo for ${fmtName(j.person)}`, "success");
+              closeAssignPanel();
+            } catch (e) {
+              msg.textContent = "Network error";
+              msg.className = "text-xs mt-2 text-red-400";
+            } finally {
+              detectAssignSubmit.disabled = false;
+            }
+            return;
+          }
+
+          const face = _detectResult.faces[_assignFaceIdx];
+          if (face.name === "unknown") {
+            msg.textContent = "This face wasn't captured (too small/low quality) — nothing to assign";
+            msg.className = "text-xs mt-2 text-red-400";
+            return;
+          }
+
+          detectAssignSubmit.disabled = true;
+          msg.textContent = "Saving…";
+          msg.className = "text-xs mt-2 text-slate-400";
+          try {
+            const r = await fetch("/api/rename_person", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ old_name: face.name, new_name: targetName }),
+            });
+            const j = await r.json();
+            if (!j.ok) {
+              msg.textContent = j.error || "Assign failed";
+              msg.className = "text-xs mt-2 text-red-400";
+              return;
+            }
+            face.name = j.person;
+            face.captured = false;
+            toast(`Assigned to ${fmtName(j.person)}`, "success");
+            openDetectModal(_detectResult);
+          } catch (e) {
+            msg.textContent = "Network error";
+            msg.className = "text-xs mt-2 text-red-400";
+          } finally {
+            detectAssignSubmit.disabled = false;
+          }
+        });
+      }
 
       // Re-clamp on viewport changes so the image doesn't get stranded
       // outside the container after resize.
