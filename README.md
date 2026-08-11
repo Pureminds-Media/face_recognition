@@ -29,6 +29,9 @@ Uses InsightFace (RetinaFace + ArcFace, ONNX Runtime GPU) for face detection and
 - **History dashboard** — Visit history across four views: Attendance (first/last seen per person per day), Daily Summary, Per Person, and Per Location — all with footage playback. All date pickers display as dd-mm-yyyy.
 - **Analytics dashboard** — Top 10 Earliest Arrivals (by day), Top 10 Latest Arrivals (by day), and Top 10 Longest Working shown as an interactive horizontal bar chart (hover for duration tooltip), all filterable by period.
 - **Manual attendance** — "Add Manual" tab lets an admin backfill a person's attendance for a day (arrival/departure time) without a camera detection.
+- **Manual Detect** — a "Detect" button on the live feed freezes the current frame and runs face/head detection immediately, bypassing `AUTO_CAPTURE_ENABLED` and the normal auto-capture accumulation window. Opens a modal to assign detected faces to a person or capture a head-only crop as a reference photo. See [documentation.md](documentation.md#20-manual-detect).
+- **UI login & user management** — session-based login (`/login`) gates the browser UI, separate from the `API_KEY` external API gate. Users can be locked to a single branch (enforced server-side) and/or blocked from manual attendance. Admins manage accounts from Settings → User Management. See [documentation.md](documentation.md#19-ui-login--user-management).
+- **Per-camera motion gate override** — Settings → Camera lets each camera override the engine-wide motion gate on/off and threshold, for cameras that need different sensitivity than the rest.
 - **Camera Tracker** — Separate `/tracker` page for counting line-crossings on up to 4 pinned cameras, independent of visit tracking. See [documentation.md](documentation.md#17-camera-tracker-line-crossing) for setup details.
 - **Gate report export** — Excel (CSV) and print-to-PDF export buttons for the daily gate report in Settings → Reports.
 - **SSE attendance stream** — Real-time attendance events via Server-Sent Events
@@ -124,6 +127,9 @@ Key settings in `.env`:
 | `FOOTAGE_DIR` | *(required)* | Directory where footage `.mp4` files are written. Set to a network mount path (e.g. `/mnt/camera_system/footage`) to offload storage to a NAS. Recording is skipped entirely if this path isn't an actual mounted filesystem (prevents silently falling back to local disk if the NAS mount drops) or has less than `FOOTAGE_MIN_FREE_BYTES` free. |
 | `FOOTAGE_MIN_FREE_BYTES` | `1073741824` (1 GiB) | Minimum free bytes required on `FOOTAGE_DIR`'s filesystem before new recordings are allowed. |
 | `FOOTAGE_MAX_HEIGHT` | `720` | Recorded footage is downscaled (preserving aspect ratio) to this max height before encoding. Native 4K camera feeds otherwise cost several CPU cores each to encode in software when many visits record concurrently. |
+| `UI_AUTH_USER` | `admin` | Username for the default admin account seeded into `users.json` on first run. |
+| `UI_AUTH_PASSWORD` | `admin123` | Password for that default admin account. Change this before exposing the UI beyond localhost. |
+| `FLASK_SECRET_KEY` | *(random per-restart)* | Signs the login session cookie. Set this to a fixed value in production so logins survive a server restart; otherwise every restart invalidates existing sessions. |
 
 ### 5) Add face images
 
@@ -240,6 +246,13 @@ See [api.md](api.md) for the full endpoint reference. Summary:
 | `/api/engine/config` | GET/POST | Get or update engine tuning parameters |
 | `/api/advanced/config` | GET/POST | Get or update shift time configuration |
 | `/api/attendance/manual` | POST | Backfill manual attendance for a day |
+| `/api/camera/manual_detect` | POST | Freeze current frame and run immediate face/head detection |
+| `/api/camera/manual_detect_region` | POST | Re-run detection on a cropped region of a frozen manual-detect frame |
+| `/api/camera/assign_head_crop` | POST | Save a head-only crop as a reference photo for a person |
+| `/api/person/<name>/image/<file>/set_thumbnail` | POST | Make an image the person's gallery thumbnail |
+| `/login`, `/logout` | GET/POST, POST | UI session login / logout |
+| `/api/users` | GET/POST | List or create UI login users (admin only) |
+| `/api/users/<username>` | PUT/DELETE | Update or delete a UI login user (admin only) |
 | `/api/tracker/config` | GET/POST | Get or update Camera Tracker cameras/lines/ROIs |
 | `/api/tracker/events` | GET | Paginated tracker crossing-event history |
 | `/api/tracker/stream` | GET | SSE stream of tracker crossing events |

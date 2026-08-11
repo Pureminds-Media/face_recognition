@@ -268,7 +268,8 @@ Some state is stored as files alongside the database:
 
 | File | Contents |
 |------|----------|
-| `ip_cameras.json` | Camera groups, channel numbers, resolved RTSP URLs |
+| `ip_cameras.json` | Camera groups, channel numbers, resolved RTSP URLs. Each camera entry may also carry `motion_gate_enabled` (bool) and `motion_threshold` (int) — a per-camera override of the engine-wide motion gate settings; see [documentation.md §3](documentation.md#per-camera-motion-gate-override). |
+| `users.json` | UI login accounts: `{username: {password, locked_branch, can_manual_attendance, is_admin}}`. Auto-created with default admin/mustafa accounts if missing; see [documentation.md §19](documentation.md#19-ui-login--user-management). |
 | `reports_config.json` | Arrival/exit camera URLs, work hours, email config |
 | `grid_config.json` | Grid layout and slot assignments |
 | `tracker_config.json` | Camera Tracker: assigned cameras, line positions, per-camera pan/zoom/rotate transforms, ROIs |

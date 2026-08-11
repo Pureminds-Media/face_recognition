@@ -128,6 +128,17 @@ Missing or wrong key → `401 {"ok": false, "error": "unauthorized"}`.
 If `API_KEY` is unset (default), no auth is enforced — keep this for local
 development only.
 
+### 2.1 UI login (separate system)
+
+The in-tree browser UI also has its own session-based login (`/login`,
+`/logout`, cookie-based via Flask sessions), independent of `API_KEY`. It
+gates the browser pages and API for interactive users and has nothing to do
+with the `API_KEY` header/query-string scheme above — an external client
+built against this API reference authenticates with `API_KEY` only and
+never needs to log in. See
+[documentation.md §19](documentation.md#19-ui-login--user-management) for
+the full design (branch-locked users, admin-only User Management).
+
 ---
 
 ## 3. Conventions
@@ -144,6 +155,19 @@ development only.
 ---
 
 ## 4. Endpoints
+
+### 4.0 UI login & User Management
+
+Session-based, cookie-authenticated — separate from the `API_KEY` scheme (see §2.1). The `/api/users/*` routes are admin-only (`403 {"ok": false, "error": "admin only"}` for non-admins).
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| GET/POST | `/login` | Login page / form submit. Body (form-encoded): `username`, `password`, `next?`. |
+| POST | `/logout` | Clear the session and redirect to `/login`. |
+| GET | `/api/users` | Admin only. List users: `{users: [{username, locked_branch, can_manual_attendance, is_admin}]}`. |
+| POST | `/api/users` | Admin only. Body: `{username, password, is_admin?, locked_branch?, can_manual_attendance?}`. Create a user. |
+| PUT | `/api/users/<username>` | Admin only. Body: any subset of `{password, is_admin, locked_branch, can_manual_attendance}`. Refuses to demote the last remaining admin. |
+| DELETE | `/api/users/<username>` | Admin only. Refuses to delete the last remaining admin or the account you're logged in as. |
 
 ### 4.1 Engine state
 
@@ -168,6 +192,7 @@ development only.
 | POST   | `/api/person/<name>/image/<file>/transfer`  | Body: `{target}`. Move one image to another person.         |
 | POST   | `/api/person/<name>/images/bulk_delete`     | Body: `{filenames: [...]}`. Bulk delete.                    |
 | POST   | `/api/person/<name>/images/bulk_transfer`   | Body: `{target, filenames: [...]}`. Bulk move.              |
+| POST   | `/api/person/<name>/image/<filename>/set_thumbnail` | Make `filename` the person's gallery thumbnail. Swaps filenames so it occupies the lowest numeric slot — no separate thumbnail field. Returns `{ok: true}` (or `{ok: true, already_thumbnail: true}` if it already was). |
 | POST   | `/api/people/merge`                         | Body: `{sources: [...], target}`. Merge folders + DB visits. |
 | POST   | `/api/reload_faces`                         | Force a synchronous embedding rebuild.                      |
 | GET    | `/api/person/<name>/meta`                   | Returns `{name, section, branch, arabic_name, shift, home_zone_id}` for a person. |
@@ -214,12 +239,15 @@ Zones are named camera zones (e.g. "Floor 1", "Server Room") with an optional br
 | POST   | `/api/camera/reload`                          | Re-probe devices.                                           |
 | GET    | `/api/camera/statuses`                        | Returns live/dead status for all cameras in the active grid. Map of `{source: {ok, last_frame_age_secs, …}}`. |
 | POST   | `/api/camera/reconnect`                       | Body: `{source}`. Bypass the 2-minute reconnect backoff and immediately retry the given camera. |
+| POST   | `/api/camera/manual_detect`                   | Body: `{source}`. Freeze the current frame for that camera and run face+head detection immediately (bypasses `AUTO_CAPTURE_ENABLED` and the auto-capture accumulation window). Matched/newly-captured faces also mark attendance. Returns `{ok, error, faces: [{bbox, name, confidence, captured}], heads: [{bbox, confidence}], heads_detected, frame_path, frame_width, frame_height}`. See [documentation.md §20](documentation.md#20-manual-detect). |
+| POST   | `/api/camera/manual_detect_region`            | Body: `{frame_path, x, y, w, h}`. Re-run detection on a cropped region of an already-frozen `manual_detect` frame (zoom-in retry). `frame_path` must be one `manual_detect` itself returned. Same response shape as `manual_detect` minus `frame_path`/dimensions. |
+| POST   | `/api/camera/assign_head_crop`                | Body: `{frame_path, x, y, w, h, person_name}`. Save a head-only crop (no matched face) as a reference photo for `person_name`. Does not contribute a face embedding. Returns `{ok, person}` or `{ok: false, error}`. |
 | GET    | `/api/ip_cameras`                             | Configured IP-camera groups + cameras.                      |
 | POST   | `/api/ip_cameras/groups`                      | Body: `{name, base_url?}`. Create group.                    |
 | PUT    | `/api/ip_cameras/groups/<group_id>`           | Body: `{name?, base_url?}`. Update group.                   |
 | DELETE | `/api/ip_cameras/groups/<group_id>`           | Delete group + cameras.                                     |
 | POST   | `/api/ip_cameras/groups/<group_id>/cameras`   | Body: `{name, channel?}` or `{name, url}`. Add camera.      |
-| PUT    | `/api/ip_cameras/cameras/<camera_id>`         | Body: `{name?, channel?, url?}`.                            |
+| PUT    | `/api/ip_cameras/cameras/<camera_id>`         | Body: `{name?, channel?, url?, motion_gate_enabled?, motion_threshold?}`. `motion_gate_enabled`/`motion_threshold` set a per-camera override of the engine-wide motion gate settings, pushed live to the engine. |
 | DELETE | `/api/ip_cameras/cameras/<camera_id>`         | Delete one IP camera.                                       |
 | POST   | `/api/ip_cameras/cameras/<camera_id>/test`    | Probe RTSP and return resolution / error.                   |
 | POST   | `/api/ip_cameras/groups/<group_id>/reorder`   | Body: `{order: ["cam_id", ...]}`. Reorder cameras within a group. Cameras not in the list keep their relative order after those that are. |
@@ -266,6 +294,8 @@ All analytics endpoints accept an optional `?branch=<name>` query parameter. Whe
 | GET | `/api/engine/config` | Returns current engine tuning: `{detect_every, motion_gate, motion_thresh, viewer_jpeg_quality, out_fps, high_priority_sources}`. |
 | POST | `/api/engine/config` | Body: any subset of the above keys. Updates live without restart. `high_priority_sources` is an array of RTSP URL strings. |
 
+Per-camera motion gate overrides (`motion_gate_enabled`, `motion_threshold`) are set per camera via the IP camera update route (`PUT /api/ip_cameras/cameras/<camera_id>`), not through this endpoint — see [documentation.md §3](documentation.md#per-camera-motion-gate-override).
+
 ### 4.5.2 Settings — Advanced (Shift Times)
 
 | Method | Path | Description |
@@ -277,7 +307,7 @@ All analytics endpoints accept an optional `?branch=<name>` query parameter. Whe
 
 | Method | Path | Description |
 | ------ | ---- | ----------- |
-| GET | `/api/reports/generate?date=YYYY-MM-DD` | Generate the gate report for a date. Returns `{rows: [{name, arrival, exits, status}]}`. `exits` is a list of `{exit_time, entry_time, duration_minutes}`. |
+| GET | `/api/reports/generate?date=YYYY-MM-DD` | Generate the gate report for a date. Returns `{rows: [{name, arrival, exits, status}]}`. `exits` is a list of `{exit_time, entry_time, duration_minutes}`. `unknown_N` auto-captured persons and standalone-arrival rows (no matching exit event) are excluded. `reports_config.json`'s `arrival_camera` may be the sentinel `"__any__"` to treat any camera as a valid arrival trigger — see [documentation.md §15](documentation.md#any-camera-arrival-trigger-gate_arrival_any_camera). |
 | GET | `/api/reports/history` | List saved daily reports. Returns `{dates: ["YYYY-MM-DD", …]}`. |
 | GET | `/api/reports/history/<date>` | Retrieve a saved report for a specific date. |
 | POST | `/api/reports/history/<date>/save` | Manually save the report for a date to the `daily_reports` table. |

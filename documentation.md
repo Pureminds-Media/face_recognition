@@ -547,6 +547,9 @@ All settings are read from `.env` (loaded by `python-dotenv` on startup). Copy `
 | `FOOTAGE_BITRATE` | *(unset)* | Explicit target video bitrate for the ffmpeg encoder (e.g. `2000000` for 2 Mbps). Unset = let `libx264`'s CRF-equivalent default apply. |
 | `FOOTAGE_RETENTION_DAYS` | `7` | Read by `cleanup_footage.sh` (cron) — footage files older than this are deleted |
 | `API_KEY` | *(unset)* | Shared-secret key for all `/api/*` routes. Unset = no auth (local dev only) |
+| `UI_AUTH_USER` | `admin` | Username for the default admin account seeded into `users.json` on first run (see [UI Login & User Management](#19-ui-login--user-management)) |
+| `UI_AUTH_PASSWORD` | `admin123` | Password for that default admin account |
+| `FLASK_SECRET_KEY` | *(random per-restart)* | Signs the login session cookie. Set a fixed value so sessions survive a server restart |
 
 ### Engine tuning (set in `app.py` at `FaceEngine` instantiation)
 
@@ -569,7 +572,7 @@ These can also be changed at runtime without restart via `POST /api/engine/confi
 
 | Key | Description |
 |-----|-------------|
-| `arrival_camera` | Full RTSP URL of the entry/arrival gate camera (cam 15) |
+| `arrival_camera` | Full RTSP URL of the entry/arrival gate camera (cam 15), or the sentinel `"__any__"` (`GATE_ARRIVAL_ANY_CAMERA`) to treat detection on any camera as a valid arrival trigger — see [Gate Events & Daily Reports](#15-gate-events--daily-reports). |
 | `exit_camera` | Full RTSP URL of the exit gate camera (cam 16) |
 | `manager_email` | Email address for daily report delivery |
 | `work_start` | Morning shift start time in `HH:MM` format (e.g. `"09:00"`) |
@@ -615,6 +618,7 @@ models/
   clip-vit-base-patch32-onnx/ CLIP ViT-B/32 ONNX model (~600 MB)
 
 grid_config.json              Saved grid layout + camera slot assignments
+users.json                    UI login accounts (username, password, locked_branch, can_manual_attendance, is_admin) — auto-created with default admin/mustafa accounts if missing
 face_recognition.db           SQLite database (default, not committed)
 docker-compose.yml            Optional PostgreSQL via Docker
 cleanup_footage.sh            Cron script: deletes footage older than FOOTAGE_RETENTION_DAYS
@@ -858,3 +862,80 @@ An **Add Manual** tab on the main dashboard's Attendance section lets an admin b
 - UI: pick a date, an arrival time (default `09:00`) and a departure time (default `17:00`), then check off any subset of enrolled people from a grid (Select All / Deselect All helpers), and submit.
 - `POST /api/attendance/manual` — body `{date: "YYYY-MM-DD", arrived: "HH:MM", left: "HH:MM", names: [...]}`. For each name, calls `db.insert_manual_visit(name, first_seen, last_seen)`.
 - `db.insert_manual_visit()` inserts a `visits` row directly in the **closed** state (`ended = true`), with `location_id = NULL` (no camera association), `confidence = 1.0`, and `branch` defaulting to `"Riyadh"`. It shows up in history/analytics like any other visit.
+
+---
+
+## 19. UI Login & User Management
+
+Session-based login gates the browser-facing pages and API — it has no effect on the camera engine subprocess itself, which captures, detects, and records footage regardless of whether anyone is logged into the web UI. This is a separate system from the `API_KEY` external-request gating described in [api.md](api.md#2-authentication) — `API_KEY` protects `/api/*` for external/API clients (header or query string), while UI login protects the browser session (cookie-based, via Flask's `session`).
+
+### Users config (`users.json`)
+
+Users are persisted in `users.json` (`_USERS_CONFIG_PATH` in `app.py`), loaded into the in-memory `UI_USERS` dict at startup and rewritten on every change via `_save_users()`. If the file doesn't exist, it's seeded from `_DEFAULT_USERS`: an `admin` account (username/password from `UI_AUTH_USER`/`UI_AUTH_PASSWORD` env vars, defaulting to `admin`/`admin123`) with `is_admin = True`, and a `mustafa` account locked to the `Egypt` branch with `can_manual_attendance = False`. Passwords are stored in **plaintext** in `users.json` — acceptable for this app's threat model (trusted operators, not a public multi-tenant service) but worth revisiting if that changes.
+
+Each user record has:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `password` | string | Plaintext password |
+| `locked_branch` | string or `null` | If set, every branch-filterable request from this user is forced server-side to this branch — see below. `null` for admins and unrestricted users. |
+| `can_manual_attendance` | bool | Whether this user may call `POST /api/attendance/manual`. |
+| `is_admin` | bool | Grants access to `/api/users` (User Management) and forces `locked_branch = null`. |
+
+### Login / logout
+
+- `GET/POST /login` — renders (GET) or processes (POST) the login form. On success, clears and repopulates the Flask `session` with `username` and marks it permanent. Redirects to `next` (or `/`) on success; re-renders the form with an error on failure.
+- `POST /logout` — clears the session and redirects to `/login`.
+
+### `before_request` enforcement (`_require_ui_auth`)
+
+Runs on every request except `/login`, `/logout`, and `/static/*`. If no user is logged in: API/stream routes get a `401 {"ok": false, "error": "unauthorized"}` JSON response, page routes redirect to `/login?next=<path>`.
+
+For a logged-in user:
+
+- If `can_manual_attendance` is `False`, `POST /api/attendance/manual` is rejected with `403`.
+- If `locked_branch` is set, it is enforced in several ways — **server-side, not just hidden in the UI**, so it can't be bypassed by calling the API directly:
+  - Any request's `branch` query parameter is overridden to `locked_branch`, even if the request didn't send one at all (several endpoints treat a missing `branch` as "no filter, all branches" — leaving that case unhandled would leak cross-branch data by omission).
+  - `/api/ip_cameras/groups/<id>...` and `/api/ip_cameras/cameras/<id>...` routes are blocked with `403` if the targeted group's `branch` doesn't match `locked_branch` — covers viewing/testing, mutating cameras, and group update/delete/reorder.
+  - `/api/zones/<id>...` routes are blocked with `403` if the targeted zone's `branch` doesn't match `locked_branch`.
+  - The camera device list (`/api/camera` devices) and IP camera group list (`/api/ip_cameras`) are filtered server-side to only that branch.
+
+### Admin-only User Management API
+
+Gated by `_require_admin()` (checks `current_user().is_admin`), returning `403 {"ok": false, "error": "admin only"}` otherwise.
+
+| Method | Path | Description |
+|--------|------|--------------|
+| GET | `/api/users` | List all users: `{username, locked_branch, can_manual_attendance, is_admin}`. |
+| POST | `/api/users` | Create a user. Body: `{username, password, is_admin?, locked_branch?, can_manual_attendance?}`. `locked_branch` is forced to `null` when `is_admin` is true. 400 if username/password missing or username already exists. |
+| PUT | `/api/users/<username>` | Update a user. Body: any subset of `{password, is_admin, locked_branch, can_manual_attendance}`. Refuses (`400`) to demote the last remaining admin — otherwise nobody could reach User Management to fix it. |
+| DELETE | `/api/users/<username>` | Delete a user. Refuses (`400`) to delete the last remaining admin, or to delete the account you're currently logged in as. |
+
+### Settings → User Management tab
+
+Admin-only tab (hidden entirely for non-admin users, both the sidebar entry and the tab content, gated by the `is_admin` template flag). Lists all users with their branch lock and manual-attendance permission; a modal lets an admin create or edit a user (username, password, admin toggle, locked branch dropdown — disabled when "admin" is checked since admins always see all branches — and a manual-attendance checkbox).
+
+---
+
+## 20. Manual Detect
+
+A **Detect** button on the main dashboard's live feed (`templates/index.html`) lets a user trigger an immediate, one-shot face/head detection pass on the camera currently being viewed — bypassing both `AUTO_CAPTURE_ENABLED` and the normal multi-second auto-capture accumulation window described in [Auto-Capture](#6-auto-capture-unknown-persons). Useful for immediately enrolling or marking attendance for someone on camera right now, without waiting for the automatic pipeline's timing.
+
+### Flow
+
+1. **`POST /api/camera/manual_detect`** (body `{source}`) calls `FaceEngine.manual_detect(camera_source)`, which:
+   - Freezes the camera's `latest_raw_frame` (the same per-worker frame buffer the live grid capture loop maintains).
+   - Runs `_detect_and_match_faces(..., force_full_res=True)` and `_run_head_detection()` on the frozen frame.
+   - For each detected face already matching a known person, reports the match. For an unmatched ("unknown") face, immediately saves it as a new `faces/unknown_N/1.jpg` via `_save_manual_unknown()` — the same crop/padding/size-gate logic as the auto-capture path (`_try_capture_more_for_known`'s sibling), but skipping the multi-second accumulation window and the `auto_capture_enabled` gate, since the manual click itself is the "capture this" signal a human would otherwise have to wait several seconds for the automatic pipeline to infer.
+   - Saves the frozen frame as a JPEG under `static/tracker_snapshots/manual_detect_<uuid>.jpg` and returns its path (see "Frame hand-off" below).
+   - Returns `{ok, error, faces: [{bbox, name, confidence, captured}], heads: [{bbox, confidence}], heads_detected, frame_path, frame_width, frame_height}`.
+   - Back in `app.py`, every matched (or newly-captured) face is also fed through `_update_attendance_from_tracks()` — the same function the live detection loop uses — via synthetic "fake track" dicts, so a manual Detect has the same real-world effect on visits/gate-events as being seen by the automatic pipeline, not just a passive lookup.
+2. The UI opens a modal showing the frozen frame with detection boxes drawn on top: **green** boxes for recognized/captured faces (with a name label), **amber** for the hovered/selected box, **blue** for head-only detections with no matching face.
+3. **Click a face box** → assign it to an existing or a new person via the existing `POST /api/rename_person` route (renames the auto-captured `unknown_N` folder to the chosen name).
+4. **Click a head box with no matching face** → the UI first tries `POST /api/camera/manual_detect_region` (body `{frame_path, x, y, w, h}`), which calls `FaceEngine.manual_detect_region()`: re-runs face + head detection on just that region (with padding and a smaller `min_face_size`) of the already-frozen frame, since a face too small to clear the full-frame detection threshold often clears it once examined at a higher effective resolution. If that still finds no face, the UI falls back to `POST /api/camera/assign_head_crop` (body `{frame_path, x, y, w, h, person_name}`), which calls `FaceEngine.assign_head_crop()` to save the head crop itself as a reference photo in that person's `faces/` folder. This does **not** contribute a face embedding — InsightFace cannot extract one from a crop with no visible face — so `reload_faces()` simply skips the image during matching, exactly as it already skips any other unembeddable photo. It exists purely so a human who can identify someone from body shape/position/context (something no model here does) has a way to record that identification, and so the image shows up in that person's gallery.
+
+### Frame hand-off: saved file, not a Pipe blob
+
+The frozen frame is handed from the engine subprocess to Flask via a file saved under `static/tracker_snapshots/`, with the path returned to the client — not as a base64-encoded blob sent back over the `multiprocessing.Pipe`. A 4K JPEG can be several hundred KB to a few MB as base64, and a real bug was found where one bad multi-MB message on the pipe intermittently came back as a `None` result on the Flask side — a pipe-level issue with no corresponding exception logged in the engine subprocess. The [Camera Tracker](#17-camera-tracker-line-crossing)'s crossing-event snapshots use the same disk-handoff pattern for the same reason.
+
+`_validate_manual_detect_frame_path()` in `app.py` restricts `frame_path` (used by both `manual_detect_region` and `assign_head_crop`) to files directly under `static/tracker_snapshots/` whose basename starts with `manual_detect_`, rejecting anything else — this prevents the endpoint from being used to read arbitrary files off disk via a crafted `frame_path`.
